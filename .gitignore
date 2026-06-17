@@ -1,4 +1,5 @@
 /target
+soroban/target
 **/*.rs.bk
 .env
 .DS_Store
