@@ -86,6 +86,7 @@ impl Factory {
 
         let pool_id: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap();
         let wasm_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
+        let salt = pool_salt(&env, pool_id);
         0
     }
 }
