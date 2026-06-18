@@ -3,7 +3,7 @@
 mod types;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, Address, BytesN, Env};
-use types::{DataKey, PoolRecord};
+use types::{DataKey, FactoryError, PoolRecord};
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
 const TTL_THRESHOLD: u32 = 518_400;
@@ -37,15 +37,22 @@ pub struct Factory;
 
 #[contractimpl]
 impl Factory {
-    /// Initialize the factory. Panics if called more than once.
-    pub fn initialize(env: Env, admin: Address, pool_wasm_hash: BytesN<32>) {
+    /// Initialize the factory. Returns `AlreadyInitialized` if called more than once.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        pool_wasm_hash: BytesN<32>,
+    ) -> Result<(), FactoryError> {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
+            return Err(FactoryError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::WasmHash, &pool_wasm_hash);
+        env.storage()
+            .instance()
+            .set(&DataKey::WasmHash, &pool_wasm_hash);
         env.storage().instance().set(&DataKey::PoolCount, &0u32);
         bump_instance(&env);
+        Ok(())
     }
 
     /// Return the current admin address.
@@ -54,26 +61,60 @@ impl Factory {
         load_admin(&env)
     }
 
+    /// Return the WASM hash of the pool implementation this factory deploys.
+    ///
+    /// Clients can call this to verify which farming-pool build is active before
+    /// trusting a pool address returned by `create_pool`.
+    pub fn pool_wasm_hash(env: Env) -> BytesN<32> {
+        bump_instance(&env);
+        env.storage().instance().get(&DataKey::WasmHash).unwrap()
+    }
+
     /// Return the total number of pools registered by this factory.
     pub fn pool_count(env: Env) -> u32 {
         bump_instance(&env);
-        env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0)
     }
 
-    /// Return the `PoolRecord` for `pool_id`. Panics with "pool not found" if missing.
-    pub fn get_pool(env: Env, pool_id: u32) -> PoolRecord {
+    /// Return the `PoolRecord` for `pool_id`.
+    ///
+    /// Returns `PoolNotFound` if `pool_id` has not been created yet.
+    pub fn get_pool(env: Env, pool_id: u32) -> Result<PoolRecord, FactoryError> {
         bump_instance(&env);
         let key = DataKey::Pool(pool_id);
         match env.storage().persistent().get::<DataKey, PoolRecord>(&key) {
             Some(r) => {
                 bump_pool(&env, pool_id);
-                r
+                Ok(r)
             }
-            None => panic!("pool not found"),
+            None => Err(FactoryError::PoolNotFound),
         }
     }
 
+    /// Transfer admin rights to `new_admin`. Current admin must authorise.
+    ///
+    /// Supports key rotation and future governance handoffs without redeploying
+    /// the factory. Emits a `adm_xfr` event with `(old_admin, new_admin)`.
+    pub fn transfer_admin(env: Env, new_admin: Address) {
+        let current = load_admin(&env);
+        current.require_auth();
+        bump_instance(&env);
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("adm_xfr")),
+            (current, new_admin),
+        );
+    }
+
     /// Create and register a new farming pool. Admin-only.
+    ///
+    /// The `pool_crtd` event now includes `asset`, `daily_rate`, and
+    /// `min_lock_period` alongside `pool_id` and `pool_address` so off-chain
+    /// indexers can reconstruct the full pool state without a follow-up RPC call.
     pub fn create_pool(
         env: Env,
         asset: Address,
@@ -97,7 +138,7 @@ impl Factory {
 
         let record = PoolRecord {
             address: pool_address.clone(),
-            asset,
+            asset: asset.clone(),
             daily_rate,
             min_lock_period,
         };
@@ -109,10 +150,11 @@ impl Factory {
             .instance()
             .set(&DataKey::PoolCount, &(pool_id + 1));
 
+        // Emit enriched event so indexers get the full pool parameters in one shot.
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("factory"), symbol_short!("pool_crtd")),
-            (pool_id, pool_address),
+            (pool_id, pool_address, asset, daily_rate, min_lock_period),
         );
 
         pool_id
