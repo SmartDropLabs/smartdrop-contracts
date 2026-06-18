@@ -45,5 +45,9 @@ impl Factory {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::PoolTemplate, &pool_template);
+        env.storage().instance().set(&DataKey::PoolCount, &0u32);
+        bump_instance(&env);
     }
 }
