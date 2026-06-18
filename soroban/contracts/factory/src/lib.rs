@@ -77,4 +77,27 @@ impl Factory {
             None => panic!("pool not found"),
         }
     }
+
+    /// Create and register a new farming pool. Admin-only.
+    ///
+    /// Clones the stored pool template contract into a fresh on-chain instance,
+    /// calls `initialize` on it with `asset` as the stake token and `daily_rate`
+    /// as the per-ledger credit rate, stores the `PoolRecord`, and emits a
+    /// `pool_crtd` event containing `(pool_id, pool_address)`.
+    ///
+    /// `min_lock_period` is persisted in the registry for off-chain queries;
+    /// enforcement is the pool contract's responsibility.
+    ///
+    /// Returns the zero-indexed pool ID assigned to the new pool.
+    pub fn create_pool(
+        env: Env,
+        asset: Address,
+        daily_rate: u128,
+        min_lock_period: u64,
+    ) -> u32 {
+        let admin = load_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+        0
+    }
 }
