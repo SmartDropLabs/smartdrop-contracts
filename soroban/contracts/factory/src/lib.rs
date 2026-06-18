@@ -101,13 +101,15 @@ impl Factory {
         bump_instance(&env);
 
         let pool_id: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap();
-        let template: Address = env.storage().instance().get(&DataKey::PoolTemplate).unwrap();
+        let wasm_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
         let salt = pool_salt(&env, pool_id);
 
+        // Deploy a fresh farming-pool instance using the stored WASM hash.
+        // The pool address is deterministic: derived from this factory's address + salt.
         let pool_address = env
             .deployer()
-            .with_address(template, salt)
-            .deploy_v2(());
+            .with_current_contract(salt)
+            .deploy_v2(wasm_hash, ());
 
         // Initialize the freshly deployed pool via cross-contract call.
         // Args: (admin, stake_token, global_multiplier, credit_rate)
@@ -138,6 +140,7 @@ impl Factory {
             .instance()
             .set(&DataKey::PoolCount, &(pool_id + 1));
 
+        #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("factory"), symbol_short!("pool_crtd")),
             (pool_id, pool_address),
