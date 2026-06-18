@@ -42,5 +42,9 @@ impl Factory {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::WasmHash, &pool_wasm_hash);
+        env.storage().instance().set(&DataKey::PoolCount, &0u32);
+        bump_instance(&env);
     }
 }
