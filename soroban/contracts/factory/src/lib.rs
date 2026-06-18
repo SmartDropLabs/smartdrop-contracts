@@ -132,6 +132,10 @@ impl Factory {
         env.storage()
             .persistent()
             .set(&DataKey::Pool(pool_id), &record);
+        bump_pool(&env, pool_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolCount, &(pool_id + 1));
         0
     }
 }
