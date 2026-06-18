@@ -50,4 +50,10 @@ impl Factory {
         env.storage().instance().set(&DataKey::PoolCount, &0u32);
         bump_instance(&env);
     }
+
+    /// Return the current admin address.
+    pub fn admin(env: Env) -> Address {
+        bump_instance(&env);
+        load_admin(&env)
+    }
 }
