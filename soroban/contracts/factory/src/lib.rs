@@ -53,4 +53,10 @@ impl Factory {
         bump_instance(&env);
         load_admin(&env)
     }
+
+    /// Return the total number of pools registered by this factory.
+    pub fn pool_count(env: Env) -> u32 {
+        bump_instance(&env);
+        env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0)
+    }
 }
