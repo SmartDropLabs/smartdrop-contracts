@@ -31,3 +31,15 @@ fn setup() -> TestEnv {
 
     TestEnv { env, client, admin, wasm_hash }
 }
+
+#[test]
+fn test_initialize_sets_admin() {
+    let t = setup();
+    assert_eq!(t.client.admin(), t.admin);
+}
+
+#[test]
+fn test_admin_getter_returns_stored_address() {
+    let t = setup();
+    assert_eq!(t.client.admin(), t.admin);
+}
