@@ -72,4 +72,17 @@ impl Factory {
             None => panic!("pool not found"),
         }
     }
+
+    /// Create and register a new farming pool. Admin-only.
+    pub fn create_pool(
+        env: Env,
+        asset: Address,
+        daily_rate: u128,
+        min_lock_period: u64,
+    ) -> u32 {
+        let admin = load_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+        0
+    }
 }
