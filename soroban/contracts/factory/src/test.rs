@@ -43,3 +43,16 @@ fn test_admin_getter_returns_stored_address() {
     let t = setup();
     assert_eq!(t.client.admin(), t.admin);
 }
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn test_double_initialize_panics() {
+    let t = setup();
+    t.client.initialize(&t.admin, &t.wasm_hash);
+}
+
+#[test]
+fn test_pool_count_zero_after_initialize() {
+    let t = setup();
+    assert_eq!(t.client.pool_count(), 0);
+}
