@@ -24,3 +24,10 @@ fn bump_pool(env: &Env, pool_id: u32) {
 fn load_admin(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::Admin).unwrap()
 }
+
+/// Build a 32-byte salt from a pool ID so each pool gets a unique, reproducible address.
+fn pool_salt(env: &Env, pool_id: u32) -> BytesN<32> {
+    let mut bytes = [0u8; 32];
+    bytes[28..].copy_from_slice(&pool_id.to_be_bytes());
+    BytesN::from_array(env, &bytes)
+}
