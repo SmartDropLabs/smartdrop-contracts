@@ -107,6 +107,21 @@ impl Factory {
             .deployer()
             .with_address(template, salt)
             .deploy_v2(());
+
+        // Initialize the freshly deployed pool via cross-contract call.
+        // Args: (admin, stake_token, global_multiplier, credit_rate)
+        let init_args: soroban_sdk::Vec<Val> = (
+            admin.clone(),
+            asset.clone(),
+            1u32,
+            daily_rate as i128,
+        )
+            .into_val(&env);
+        env.invoke_contract::<()>(
+            &pool_address,
+            &Symbol::new(&env, "initialize"),
+            init_args,
+        );
         0
     }
 }
