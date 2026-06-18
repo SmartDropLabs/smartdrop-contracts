@@ -101,6 +101,7 @@ impl Factory {
 
         let pool_id: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap();
         let template: Address = env.storage().instance().get(&DataKey::PoolTemplate).unwrap();
+        let salt = pool_salt(&env, pool_id);
         0
     }
 }
