@@ -108,6 +108,15 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::PoolCount, &(pool_id + 1));
-        0
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("pool_crtd")),
+            (pool_id, pool_address),
+        );
+
+        pool_id
     }
 }
+
+mod test;
