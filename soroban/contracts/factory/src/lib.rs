@@ -94,6 +94,16 @@ impl Factory {
             .deployer()
             .with_current_contract(salt)
             .deploy_v2(wasm_hash, ());
+
+        let record = PoolRecord {
+            address: pool_address.clone(),
+            asset,
+            daily_rate,
+            min_lock_period,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pool(pool_id), &record);
         0
     }
 }
