@@ -34,3 +34,13 @@ fn pool_salt(env: &Env, pool_id: u32) -> BytesN<32> {
 
 #[contract]
 pub struct Factory;
+
+#[contractimpl]
+impl Factory {
+    /// Initialize the factory. Panics if called more than once.
+    pub fn initialize(env: Env, admin: Address, pool_wasm_hash: BytesN<32>) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+    }
+}
