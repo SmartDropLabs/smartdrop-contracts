@@ -14,3 +14,9 @@ fn bump_instance(env: &Env) {
         .instance()
         .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 }
+
+fn bump_pool(env: &Env, pool_id: u32) {
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::Pool(pool_id), TTL_THRESHOLD, TTL_EXTEND_TO);
+}
