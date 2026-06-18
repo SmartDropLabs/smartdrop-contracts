@@ -55,3 +55,19 @@ fn test_admin_getter_returns_stored_address() {
     let returned = t.client.admin();
     assert_eq!(returned, t.admin);
 }
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn test_double_initialize_panics() {
+    let t = setup();
+    // Second initialize call must be rejected regardless of caller.
+    t.client.initialize(&t.admin, &t.wasm_hash);
+}
+
+// ── pool_count ────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_pool_count_zero_after_initialize() {
+    let t = setup();
+    assert_eq!(t.client.pool_count(), 0);
+}
