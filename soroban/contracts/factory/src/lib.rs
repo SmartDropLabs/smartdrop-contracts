@@ -22,3 +22,7 @@ fn bump_pool(env: &Env, pool_id: u32) {
         .persistent()
         .extend_ttl(&DataKey::Pool(pool_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 }
+
+fn load_admin(env: &Env) -> Address {
+    env.storage().instance().get(&DataKey::Admin).unwrap()
+}
