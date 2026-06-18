@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracterror, contracttype, Address};
 
 /// Storage keys used by the factory contract.
 #[contracttype]
@@ -25,4 +25,21 @@ pub struct PoolRecord {
     pub daily_rate: u128,
     /// Minimum number of ledgers a stake must be held before withdrawal.
     pub min_lock_period: u64,
+}
+
+/// Typed errors returned by the factory contract.
+///
+/// Using `#[contracterror]` exposes these as a stable on-chain error code so
+/// clients and indexers can match on the specific failure rather than parsing
+/// a panic message string.
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(u32)]
+pub enum FactoryError {
+    /// `initialize` was called on an already-initialised factory.
+    AlreadyInitialized = 1,
+    /// `get_pool` was called with a pool ID that has not been created yet.
+    PoolNotFound = 2,
+    /// `transfer_admin` was called by an address that is not the current admin.
+    Unauthorized = 3,
 }
