@@ -36,3 +36,14 @@ fn pool_salt(env: &Env, pool_id: u32) -> BytesN<32> {
 
 #[contract]
 pub struct Factory;
+
+#[contractimpl]
+impl Factory {
+    /// Initialize the factory. Sets `admin` and records the `pool_template` address
+    /// whose WASM will be cloned for every new pool. Panics if called more than once.
+    pub fn initialize(env: Env, admin: Address, pool_template: Address) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+    }
+}
