@@ -87,6 +87,13 @@ impl Factory {
         let pool_id: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap();
         let wasm_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
         let salt = pool_salt(&env, pool_id);
+
+        // Deploy a fresh farming-pool instance. The resulting address is
+        // deterministic: keccak256(factory_address || salt).
+        let pool_address = env
+            .deployer()
+            .with_current_contract(salt)
+            .deploy_v2(wasm_hash, ());
         0
     }
 }
