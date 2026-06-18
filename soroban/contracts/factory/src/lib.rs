@@ -2,9 +2,7 @@
 
 mod types;
 
-use soroban_sdk::{
-    contract, contractimpl, symbol_short, Address, BytesN, Env, IntoVal, Symbol, Val,
-};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, BytesN, Env};
 use types::{DataKey, PoolRecord};
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
@@ -81,15 +79,18 @@ impl Factory {
 
     /// Create and register a new farming pool. Admin-only.
     ///
-    /// Clones the stored pool template contract into a fresh on-chain instance,
-    /// calls `initialize` on it with `asset` as the stake token and `daily_rate`
-    /// as the per-ledger credit rate, stores the `PoolRecord`, and emits a
-    /// `pool_crtd` event containing `(pool_id, pool_address)`.
+    /// Deploys a fresh farming-pool contract using the stored WASM hash. The pool
+    /// address is deterministic and derived from this factory's address and a
+    /// per-pool salt so it is reproducible off-chain.
     ///
-    /// `min_lock_period` is persisted in the registry for off-chain queries;
-    /// enforcement is the pool contract's responsibility.
+    /// After deployment the admin should call `initialize` on the returned pool
+    /// address to configure the stake token and credit rate before opening the pool.
     ///
-    /// Returns the zero-indexed pool ID assigned to the new pool.
+    /// `min_lock_period` is stored in the factory registry as metadata for
+    /// off-chain indexers; enforcement is the pool contract's responsibility.
+    ///
+    /// Emits a `pool_crtd` event with `(pool_id, pool_address)` and returns the
+    /// zero-indexed pool ID assigned to the new pool.
     pub fn create_pool(
         env: Env,
         asset: Address,
@@ -104,27 +105,12 @@ impl Factory {
         let wasm_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
         let salt = pool_salt(&env, pool_id);
 
-        // Deploy a fresh farming-pool instance using the stored WASM hash.
-        // The pool address is deterministic: derived from this factory's address + salt.
+        // Deploy a fresh farming-pool instance. The resulting address is
+        // deterministic: keccak256(factory_address || salt).
         let pool_address = env
             .deployer()
             .with_current_contract(salt)
             .deploy_v2(wasm_hash, ());
-
-        // Initialize the freshly deployed pool via cross-contract call.
-        // Args: (admin, stake_token, global_multiplier, credit_rate)
-        let init_args: soroban_sdk::Vec<Val> = (
-            admin.clone(),
-            asset.clone(),
-            1u32,
-            daily_rate as i128,
-        )
-            .into_val(&env);
-        env.invoke_contract::<()>(
-            &pool_address,
-            &Symbol::new(&env, "initialize"),
-            init_args,
-        );
 
         let record = PoolRecord {
             address: pool_address.clone(),
