@@ -62,4 +62,19 @@ impl Factory {
         bump_instance(&env);
         env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0)
     }
+
+    /// Return the `PoolRecord` for `pool_id`.
+    ///
+    /// Panics with `"pool not found"` if `pool_id` has not been created yet.
+    pub fn get_pool(env: Env, pool_id: u32) -> PoolRecord {
+        bump_instance(&env);
+        let key = DataKey::Pool(pool_id);
+        match env.storage().persistent().get::<DataKey, PoolRecord>(&key) {
+            Some(r) => {
+                bump_pool(&env, pool_id);
+                r
+            }
+            None => panic!("pool not found"),
+        }
+    }
 }
