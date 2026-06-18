@@ -39,14 +39,15 @@ pub struct Factory;
 
 #[contractimpl]
 impl Factory {
-    /// Initialize the factory. Sets `admin` and records the `pool_template` address
-    /// whose WASM will be cloned for every new pool. Panics if called more than once.
-    pub fn initialize(env: Env, admin: Address, pool_template: Address) {
+    /// Initialize the factory. Sets `admin` and stores the `pool_wasm_hash` of the
+    /// uploaded farming-pool WASM that will be deployed for every new pool.
+    /// Panics if called more than once.
+    pub fn initialize(env: Env, admin: Address, pool_wasm_hash: BytesN<32>) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::PoolTemplate, &pool_template);
+        env.storage().instance().set(&DataKey::WasmHash, &pool_wasm_hash);
         env.storage().instance().set(&DataKey::PoolCount, &0u32);
         bump_instance(&env);
     }
