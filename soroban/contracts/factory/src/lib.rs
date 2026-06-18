@@ -122,6 +122,16 @@ impl Factory {
             &Symbol::new(&env, "initialize"),
             init_args,
         );
+
+        let record = PoolRecord {
+            address: pool_address.clone(),
+            asset,
+            daily_rate,
+            min_lock_period,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pool(pool_id), &record);
         0
     }
 }
