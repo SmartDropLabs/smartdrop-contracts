@@ -56,3 +56,10 @@ fn test_pool_count_zero_after_initialize() {
     let t = setup();
     assert_eq!(t.client.pool_count(), 0);
 }
+
+#[test]
+#[should_panic(expected = "pool not found")]
+fn test_get_pool_panics_on_missing_id() {
+    let t = setup();
+    t.client.get_pool(&0u32);
+}
