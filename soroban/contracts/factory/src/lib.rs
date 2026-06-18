@@ -33,3 +33,6 @@ fn pool_salt(env: &Env, pool_id: u32) -> BytesN<32> {
     bytes[28..].copy_from_slice(&pool_id.to_be_bytes());
     BytesN::from_array(env, &bytes)
 }
+
+#[contract]
+pub struct Factory;
