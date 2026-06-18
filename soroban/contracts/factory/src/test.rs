@@ -63,3 +63,26 @@ fn test_get_pool_panics_on_missing_id() {
     let t = setup();
     t.client.get_pool(&0u32);
 }
+
+#[test]
+fn test_create_pool_non_admin_rejected() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let wasm_hash = BytesN::from_array(&env, &[0xABu8; 32]);
+    let factory_addr = env.register(Factory, ());
+    let client = FactoryClient::new(&env, &factory_addr);
+
+    env.mock_all_auths();
+    client.initialize(&admin, &wasm_hash);
+
+    let env2 = Env::default();
+    let factory_addr2 = env2.register(Factory, ());
+    let client2 = FactoryClient::new(&env2, &factory_addr2);
+    let wasm_hash2 = BytesN::from_array(&env2, &[0xABu8; 32]);
+    env2.mock_all_auths();
+    client2.initialize(&admin, &wasm_hash2);
+
+    let asset = Address::generate(&env2);
+    let result = client2.try_create_pool(&asset, &1_000u128, &86_400u64);
+    assert!(result.is_err(), "non-admin create_pool must be rejected");
+}
