@@ -83,6 +83,9 @@ impl Factory {
         let admin = load_admin(&env);
         admin.require_auth();
         bump_instance(&env);
+
+        let pool_id: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap();
+        let wasm_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
         0
     }
 }
