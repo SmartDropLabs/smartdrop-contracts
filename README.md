@@ -1,5 +1,7 @@
 # SmartDrop contracts
 
+[![CI](https://github.com/SmartDropLabs/smartdrop-contracts/actions/workflows/ci.yml/badge.svg)](https://github.com/SmartDropLabs/smartdrop-contracts/actions/workflows/ci.yml)
+
 **Soroban (Rust)** smart contracts and design notes for [**SmartDrop**](https://github.com/SmartDropLabs/SmartDrop) on **Stellar**.
 
 ## Related repositories
