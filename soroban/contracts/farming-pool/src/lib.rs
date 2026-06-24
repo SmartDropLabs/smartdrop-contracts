@@ -5,7 +5,7 @@ mod types;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, Env,
 };
-use types::{BoostConfig, DataKey, UserStake};
+use types::{BoostConfig, DataKey, Position, UserStake};
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5s/ledger).
 const USER_TTL_THRESHOLD: u32 = 518_400;
@@ -47,6 +47,20 @@ fn get_stake_token(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::StakeToken).unwrap()
 }
 
+fn get_min_lock_period(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MinLockPeriod)
+        .unwrap_or(0)
+}
+
+fn pool_is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+}
+
 fn get_user_boost(env: &Env, user: &Address) -> Option<u32> {
     let key = DataKey::UserBoost(user.clone());
     let val: Option<u32> = env.storage().persistent().get(&key);
@@ -75,6 +89,27 @@ fn remove_user_stake(env: &Env, user: &Address) {
     env.storage()
         .persistent()
         .remove(&DataKey::UserStake(user.clone()));
+}
+
+fn get_position(env: &Env, user: &Address) -> Option<Position> {
+    let key = DataKey::UserPosition(user.clone());
+    let val: Option<Position> = env.storage().persistent().get(&key);
+    if val.is_some() {
+        bump_user(env, &key);
+    }
+    val
+}
+
+fn set_position(env: &Env, user: &Address, pos: &Position) {
+    let key = DataKey::UserPosition(user.clone());
+    env.storage().persistent().set(&key, pos);
+    bump_user(env, &key);
+}
+
+fn remove_position(env: &Env, user: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::UserPosition(user.clone()));
 }
 
 // ── Boost calculation ─────────────────────────────────────────────────────────
@@ -118,6 +153,15 @@ fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) {
     stake.start_ledger = current;
 }
 
+/// Checkpoint a position's earned credits and advance the checkpoint ledger.
+fn checkpoint_position(env: &Env, pos: &mut Position) {
+    let rate = get_credit_rate(env);
+    let current = env.ledger().sequence();
+    let elapsed = current.saturating_sub(pos.checkpoint_ledger);
+    pos.total_credits += pos.amount * rate * elapsed as i128;
+    pos.checkpoint_ledger = current;
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -129,12 +173,14 @@ impl FarmingPool {
     ///
     /// - `global_multiplier`: initial boost multiplier (≥ 1). E.g. `2` = 2× boosted virtual stake.
     /// - `credit_rate`: credits accrued per unit of effective stake per ledger.
+    /// - `min_lock_period`: minimum number of ledgers a position must be locked before unlock.
     pub fn initialize(
         env: Env,
         admin: Address,
         stake_token: Address,
         global_multiplier: u32,
         credit_rate: i128,
+        min_lock_period: u32,
     ) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
@@ -146,8 +192,139 @@ impl FarmingPool {
         env.storage().instance().set(&DataKey::StakeToken, &stake_token);
         env.storage().instance().set(&DataKey::GlobalMultiplier, &global_multiplier);
         env.storage().instance().set(&DataKey::CreditRate, &credit_rate);
+        env.storage().instance().set(&DataKey::MinLockPeriod, &min_lock_period);
         bump_instance(&env);
     }
+
+    // ── Lock / Unlock system ─────────────────────────────────────────────────
+
+    /// Lock `amount` tokens for the caller. If a prior position exists, credits are
+    /// checkpointed first and the new amount is added to the existing position.
+    ///
+    /// Emits a `("pool", "locked")` event with `(user, amount)`.
+    pub fn lock_assets(env: Env, user: Address, amount: i128) {
+        user.require_auth();
+        assert!(!pool_is_paused(&env), "pool is paused");
+        assert!(amount > 0, "amount must be positive");
+        bump_instance(&env);
+
+        let current = env.ledger().sequence();
+        let pos = if let Some(mut existing) = get_position(&env, &user) {
+            checkpoint_position(&env, &mut existing);
+            existing.amount += amount;
+            existing
+        } else {
+            Position {
+                amount,
+                lock_ledger: current,
+                checkpoint_ledger: current,
+                total_credits: 0,
+            }
+        };
+
+        token::TokenClient::new(&env, &get_stake_token(&env))
+            .transfer(&user, &env.current_contract_address(), &amount);
+
+        set_position(&env, &user, &pos);
+
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("locked")),
+            (user, amount),
+        );
+    }
+
+    /// Unlock `amount` tokens for the caller. The minimum lock period (in ledgers) must
+    /// have elapsed since the position was created. Partial unlocks are supported; the
+    /// remaining balance stays locked.
+    ///
+    /// Emits a `("pool", "unlocked")` event with `(user, amount, total_credits)`.
+    pub fn unlock_assets(env: Env, user: Address, amount: i128) {
+        user.require_auth();
+        assert!(!pool_is_paused(&env), "pool is paused");
+        assert!(amount > 0, "amount must be positive");
+        bump_instance(&env);
+
+        let mut pos = get_position(&env, &user).expect("no active position");
+        assert!(amount <= pos.amount, "insufficient locked balance");
+
+        let current = env.ledger().sequence();
+        let min_lock = get_min_lock_period(&env);
+        assert!(
+            current >= pos.lock_ledger.saturating_add(min_lock),
+            "minimum lock period not elapsed"
+        );
+
+        checkpoint_position(&env, &mut pos);
+        let total_credits = pos.total_credits;
+        pos.amount -= amount;
+
+        token::TokenClient::new(&env, &get_stake_token(&env))
+            .transfer(&env.current_contract_address(), &user, &amount);
+
+        if pos.amount == 0 {
+            remove_position(&env, &user);
+        } else {
+            set_position(&env, &user, &pos);
+        }
+
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("unlocked")),
+            (user, amount, total_credits),
+        );
+    }
+
+    /// Return total credits for `user` (banked + currently accruing). Returns 0 if no position.
+    pub fn calculate_credits(env: Env, user: Address) -> i128 {
+        bump_instance(&env);
+        let Some(pos) = get_position(&env, &user) else {
+            return 0;
+        };
+        let rate = get_credit_rate(&env);
+        let elapsed = env.ledger().sequence().saturating_sub(pos.checkpoint_ledger);
+        pos.total_credits + pos.amount * rate * elapsed as i128
+    }
+
+    /// Return the current position for `user`, or `None` if no position exists.
+    pub fn get_user_position(env: Env, user: Address) -> Option<Position> {
+        bump_instance(&env);
+        get_position(&env, &user)
+    }
+
+    // ── Pause / Unpause ───────────────────────────────────────────────────────
+
+    /// Admin: pause the pool. While paused, `lock_assets` and `unlock_assets` are blocked.
+    ///
+    /// Emits a `("pool", "paused")` event.
+    pub fn pause(env: Env) {
+        get_admin(&env).require_auth();
+        bump_instance(&env);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("paused")),
+            (),
+        );
+    }
+
+    /// Admin: unpause the pool, restoring normal operation.
+    ///
+    /// Emits a `("pool", "unpaused")` event.
+    pub fn unpause(env: Env) {
+        get_admin(&env).require_auth();
+        bump_instance(&env);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("unpaused")),
+            (),
+        );
+    }
+
+    /// Return whether the pool is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        bump_instance(&env);
+        pool_is_paused(&env)
+    }
+
+    // ── Boost / Stake system (unchanged) ─────────────────────────────────────
 
     /// Stake `amount` tokens. If a prior stake exists, earned credits are checkpointed first.
     pub fn stake(env: Env, from: Address, amount: i128) {
@@ -253,7 +430,7 @@ impl FarmingPool {
         );
     }
 
-    /// Return total credits for `user` (banked + currently accruing).
+    /// Return total credits for `user` in the boost/stake system (banked + currently accruing).
     pub fn get_credits(env: Env, user: Address) -> i128 {
         bump_instance(&env);
         let Some(stake) = get_user_stake(&env, &user) else {
