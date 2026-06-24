@@ -11,6 +11,7 @@ use soroban_sdk::{
 struct TestEnv {
     env: Env,
     client: FactoryClient<'static>,
+    factory_addr: Address,
     admin: Address,
     wasm_hash: BytesN<32>,
 }
@@ -33,13 +34,40 @@ fn setup() -> TestEnv {
 
     let factory_addr = env.register(Factory, ());
     let client = FactoryClient::new(&env, &factory_addr);
-    client.initialize(&admin, &wasm_hash).unwrap();
+    client.initialize(&admin, &wasm_hash);
 
-    let client = unsafe {
-        core::mem::transmute::<FactoryClient<'_>, FactoryClient<'static>>(client)
-    };
+    let client =
+        unsafe { core::mem::transmute::<FactoryClient<'_>, FactoryClient<'static>>(client) };
 
-    TestEnv { env, client, admin, wasm_hash }
+    TestEnv {
+        env,
+        client,
+        factory_addr,
+        admin,
+        wasm_hash,
+    }
+}
+
+fn setup_with_pool_records(count: u32) -> TestEnv {
+    let t = setup();
+
+    t.env.as_contract(&t.factory_addr, || {
+        for pool_id in 0..count {
+            let record = PoolRecord {
+                address: Address::generate(&t.env),
+                asset: Address::generate(&t.env),
+                daily_rate: 100 + pool_id as u128,
+                min_lock_period: 10 + pool_id as u64,
+            };
+            t.env
+                .storage()
+                .persistent()
+                .set(&DataKey::Pool(pool_id), &record);
+        }
+        t.env.storage().instance().set(&DataKey::PoolCount, &count);
+    });
+
+    t
 }
 
 // ── initialize ────────────────────────────────────────────────────────────────
@@ -60,7 +88,10 @@ fn test_admin_getter_returns_stored_address() {
 fn test_double_initialize_returns_error() {
     let t = setup();
     let result = t.client.try_initialize(&t.admin, &t.wasm_hash);
-    assert!(result.is_err(), "second initialize must return AlreadyInitialized error");
+    assert!(
+        result.is_err(),
+        "second initialize must return AlreadyInitialized error"
+    );
 }
 
 // ── pool_wasm_hash ────────────────────────────────────────────────────────────
@@ -85,7 +116,72 @@ fn test_pool_count_zero_after_initialize() {
 fn test_get_pool_returns_error_on_missing_id() {
     let t = setup();
     let result = t.client.try_get_pool(&0u32);
-    assert!(result.is_err(), "get_pool must return PoolNotFound for unknown id");
+    assert!(
+        result.is_err(),
+        "get_pool must return PoolNotFound for unknown id"
+    );
+}
+
+#[test]
+fn test_list_pools_returns_first_page() {
+    let t = setup_with_pool_records(25);
+    let page = t.client.list_pools(&0u32, &10u32);
+
+    assert_eq!(page.records.len(), 10);
+    assert_eq!(page.next_start_id, 10);
+    assert_eq!(page.total, 25);
+
+    let first = page.records.get(0).unwrap();
+    let last = page.records.get(9).unwrap();
+    assert_eq!(first.0, 0);
+    assert_eq!(first.1.daily_rate, 100);
+    assert_eq!(last.0, 9);
+    assert_eq!(last.1.daily_rate, 109);
+}
+
+#[test]
+fn test_list_pools_returns_second_page() {
+    let t = setup_with_pool_records(25);
+    let page = t.client.list_pools(&10u32, &10u32);
+
+    assert_eq!(page.records.len(), 10);
+    assert_eq!(page.next_start_id, 20);
+    assert_eq!(page.total, 25);
+    assert_eq!(page.records.get(0).unwrap().0, 10);
+    assert_eq!(page.records.get(9).unwrap().0, 19);
+}
+
+#[test]
+fn test_list_pools_returns_partial_last_page() {
+    let t = setup_with_pool_records(25);
+    let page = t.client.list_pools(&20u32, &10u32);
+
+    assert_eq!(page.records.len(), 5);
+    assert_eq!(page.next_start_id, 25);
+    assert_eq!(page.total, 25);
+    assert_eq!(page.records.get(0).unwrap().0, 20);
+    assert_eq!(page.records.get(4).unwrap().0, 24);
+}
+
+#[test]
+fn test_list_pools_returns_empty_when_start_is_beyond_count() {
+    let t = setup_with_pool_records(3);
+    let page = t.client.list_pools(&10u32, &5u32);
+
+    assert_eq!(page.records.len(), 0);
+    assert_eq!(page.next_start_id, 3);
+    assert_eq!(page.total, 3);
+}
+
+#[test]
+fn test_list_pools_caps_limit_at_twenty() {
+    let t = setup_with_pool_records(25);
+    let page = t.client.list_pools(&0u32, &100u32);
+
+    assert_eq!(page.records.len(), 20);
+    assert_eq!(page.next_start_id, 20);
+    assert_eq!(page.total, 25);
+    assert_eq!(page.records.get(19).unwrap().0, 19);
 }
 
 // ── get_pools_by_asset ────────────────────────────────────────────────────────
@@ -113,7 +209,10 @@ fn test_transfer_admin_emits_event() {
     let t = setup();
     let new_admin = Address::generate(&t.env);
     t.client.transfer_admin(&new_admin);
-    assert!(!t.env.events().all().events().is_empty(), "expected adm_xfr event");
+    assert!(
+        !t.env.events().all().events().is_empty(),
+        "expected adm_xfr event"
+    );
 }
 
 // ── create_pool auth gate ─────────────────────────────────────────────────────
@@ -127,7 +226,7 @@ fn test_create_pool_non_admin_rejected() {
     let client = FactoryClient::new(&env, &factory_addr);
 
     env.mock_all_auths();
-    client.initialize(&admin, &wasm_hash).unwrap();
+    client.initialize(&admin, &wasm_hash);
 
     // A fresh env with no mocked auths — require_auth() must reject non-admin callers.
     let env2 = Env::default();
@@ -135,7 +234,7 @@ fn test_create_pool_non_admin_rejected() {
     let client2 = FactoryClient::new(&env2, &factory_addr2);
     let wasm_hash2 = BytesN::from_array(&env2, &[0xABu8; 32]);
     env2.mock_all_auths();
-    client2.initialize(&admin, &wasm_hash2).unwrap();
+    client2.initialize(&admin, &wasm_hash2);
 
     let asset = Address::generate(&env2);
     let result = client2.try_create_pool(&asset, &1_000u128, &86_400u64);
@@ -154,7 +253,7 @@ fn test_create_pool_returns_incrementing_ids() {
     let wasm_hash = env.deployer().upload_contract_wasm(FARMING_POOL_WASM);
     let factory_addr = env.register(Factory, ());
     let client = FactoryClient::new(&env, &factory_addr);
-    client.initialize(&admin, &wasm_hash).unwrap();
+    client.initialize(&admin, &wasm_hash);
 
     let id_a = client.create_pool(&Address::generate(&env), &500u128, &100u64);
     let id_b = client.create_pool(&Address::generate(&env), &1_000u128, &200u64);
@@ -173,11 +272,11 @@ fn test_get_pool_returns_correct_record() {
     let wasm_hash = env.deployer().upload_contract_wasm(FARMING_POOL_WASM);
     let factory_addr = env.register(Factory, ());
     let client = FactoryClient::new(&env, &factory_addr);
-    client.initialize(&admin, &wasm_hash).unwrap();
+    client.initialize(&admin, &wasm_hash);
 
     let asset = Address::generate(&env);
     let id = client.create_pool(&asset, &250u128, &50u64);
-    let record = client.get_pool(&id).unwrap();
+    let record = client.get_pool(&id);
     assert_eq!(record.asset, asset);
     assert_eq!(record.daily_rate, 250u128);
     assert_eq!(record.min_lock_period, 50u64);
@@ -193,7 +292,7 @@ fn test_get_pools_by_asset_returns_matching_ids() {
     let wasm_hash = env.deployer().upload_contract_wasm(FARMING_POOL_WASM);
     let factory_addr = env.register(Factory, ());
     let client = FactoryClient::new(&env, &factory_addr);
-    client.initialize(&admin, &wasm_hash).unwrap();
+    client.initialize(&admin, &wasm_hash);
 
     let asset_a = Address::generate(&env);
     let asset_b = Address::generate(&env);
@@ -222,7 +321,7 @@ fn test_get_pools_by_asset_unknown_asset_returns_empty() {
     let wasm_hash = env.deployer().upload_contract_wasm(FARMING_POOL_WASM);
     let factory_addr = env.register(Factory, ());
     let client = FactoryClient::new(&env, &factory_addr);
-    client.initialize(&admin, &wasm_hash).unwrap();
+    client.initialize(&admin, &wasm_hash);
 
     client.create_pool(&Address::generate(&env), &100u128, &10u64);
     let unknown = Address::generate(&env);
@@ -240,10 +339,13 @@ fn test_create_pool_emits_pool_crtd_event() {
     let wasm_hash = env.deployer().upload_contract_wasm(FARMING_POOL_WASM);
     let factory_addr = env.register(Factory, ());
     let client = FactoryClient::new(&env, &factory_addr);
-    client.initialize(&admin, &wasm_hash).unwrap();
+    client.initialize(&admin, &wasm_hash);
 
     client.create_pool(&Address::generate(&env), &300u128, &30u64);
-    assert!(!env.events().all().events().is_empty(), "expected pool_crtd event");
+    assert!(
+        !env.events().all().events().is_empty(),
+        "expected pool_crtd event"
+    );
 }
 
 #[test]
@@ -256,13 +358,13 @@ fn test_multiple_pools_stored_independently() {
     let wasm_hash = env.deployer().upload_contract_wasm(FARMING_POOL_WASM);
     let factory_addr = env.register(Factory, ());
     let client = FactoryClient::new(&env, &factory_addr);
-    client.initialize(&admin, &wasm_hash).unwrap();
+    client.initialize(&admin, &wasm_hash);
     let asset_a = Address::generate(&env);
     let asset_b = Address::generate(&env);
     let id_a = client.create_pool(&asset_a, &100u128, &10u64);
     let id_b = client.create_pool(&asset_b, &200u128, &20u64);
-    let rec_a = client.get_pool(&id_a).unwrap();
-    let rec_b = client.get_pool(&id_b).unwrap();
+    let rec_a = client.get_pool(&id_a);
+    let rec_b = client.get_pool(&id_b);
     assert_eq!(rec_a.asset, asset_a);
     assert_eq!(rec_b.asset, asset_b);
     assert_ne!(rec_a.address, rec_b.address);
