@@ -2,7 +2,7 @@
 
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, symbol_short, vec, Address, BytesN, Env, Vec};
 use types::{DataKey, FactoryError, PoolRecord};
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
@@ -92,6 +92,35 @@ impl Factory {
             }
             None => Err(FactoryError::PoolNotFound),
         }
+    }
+
+    /// Return all pool IDs whose staking asset matches `asset`.
+    ///
+    /// Scans every registered pool in O(n) and collects matching IDs.
+    /// Useful for frontends that need to surface all pools for a given token
+    /// without an off-chain indexer.
+    pub fn get_pools_by_asset(env: Env, asset: Address) -> Vec<u32> {
+        bump_instance(&env);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
+        let mut matches: Vec<u32> = vec![&env];
+        for pool_id in 0..count {
+            let key = DataKey::Pool(pool_id);
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PoolRecord>(&key)
+            {
+                if record.asset == asset {
+                    bump_pool(&env, pool_id);
+                    matches.push_back(pool_id);
+                }
+            }
+        }
+        matches
     }
 
     /// Transfer admin rights to `new_admin`. Current admin must authorise.
