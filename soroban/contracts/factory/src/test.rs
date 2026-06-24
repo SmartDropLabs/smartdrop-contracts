@@ -51,6 +51,12 @@ fn test_initialize_sets_admin() {
 }
 
 #[test]
+fn test_admin_getter_returns_stored_address() {
+    let t = setup();
+    assert_eq!(t.client.admin(), t.admin);
+}
+
+#[test]
 fn test_double_initialize_returns_error() {
     let t = setup();
     let result = t.client.try_initialize(&t.admin, &t.wasm_hash);
@@ -242,7 +248,7 @@ fn test_create_pool_emits_pool_crtd_event() {
 
 #[test]
 #[ignore = "requires: cargo build -p farming-pool --target wasm32-unknown-unknown --release"]
-fn test_multiple_pools_have_distinct_addresses() {
+fn test_multiple_pools_stored_independently() {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
@@ -251,10 +257,13 @@ fn test_multiple_pools_have_distinct_addresses() {
     let factory_addr = env.register(Factory, ());
     let client = FactoryClient::new(&env, &factory_addr);
     client.initialize(&admin, &wasm_hash).unwrap();
-
-    let id_a = client.create_pool(&Address::generate(&env), &100u128, &10u64);
-    let id_b = client.create_pool(&Address::generate(&env), &200u128, &20u64);
+    let asset_a = Address::generate(&env);
+    let asset_b = Address::generate(&env);
+    let id_a = client.create_pool(&asset_a, &100u128, &10u64);
+    let id_b = client.create_pool(&asset_b, &200u128, &20u64);
     let rec_a = client.get_pool(&id_a).unwrap();
     let rec_b = client.get_pool(&id_b).unwrap();
-    assert_ne!(rec_a.address, rec_b.address, "each pool must have a unique contract address");
+    assert_eq!(rec_a.asset, asset_a);
+    assert_eq!(rec_b.asset, asset_b);
+    assert_ne!(rec_a.address, rec_b.address);
 }

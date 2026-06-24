@@ -37,9 +37,7 @@ pub struct Factory;
 
 #[contractimpl]
 impl Factory {
-    /// Initialize the factory with an admin address and the WASM hash of the
-    /// farming-pool implementation to deploy. Returns `AlreadyInitialized` if
-    /// called more than once.
+    /// Initialize the factory. Returns `AlreadyInitialized` if called more than once.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -128,7 +126,7 @@ impl Factory {
     /// Transfer admin rights to `new_admin`. Current admin must authorise.
     ///
     /// Supports key rotation and future governance handoffs without redeploying
-    /// the factory. Emits an `adm_xfr` event with `(old_admin, new_admin)`.
+    /// the factory. Emits a `adm_xfr` event with `(old_admin, new_admin)`.
     pub fn transfer_admin(env: Env, new_admin: Address) {
         let current = load_admin(&env);
         current.require_auth();
@@ -143,12 +141,9 @@ impl Factory {
 
     /// Create and register a new farming pool. Admin-only.
     ///
-    /// Deploys a fresh farming-pool instance using a deterministic salt derived
-    /// from the pool ID, stores the full `PoolRecord` in persistent storage, and
-    /// emits a `pool_crtd` event containing all pool parameters so off-chain
-    /// indexers can reconstruct state without a follow-up RPC call.
-    ///
-    /// Returns the newly assigned pool ID (monotonically increasing from 0).
+    /// The `pool_crtd` event now includes `asset`, `daily_rate`, and
+    /// `min_lock_period` alongside `pool_id` and `pool_address` so off-chain
+    /// indexers can reconstruct the full pool state without a follow-up RPC call.
     pub fn create_pool(
         env: Env,
         asset: Address,
@@ -164,7 +159,7 @@ impl Factory {
         let salt = pool_salt(&env, pool_id);
 
         // Deploy a fresh farming-pool instance. The resulting address is
-        // deterministic: derived from factory_address and the salt.
+        // deterministic: keccak256(factory_address || salt).
         let pool_address = env
             .deployer()
             .with_current_contract(salt)
