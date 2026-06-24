@@ -1,4 +1,13 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracterror, contracttype, Address};
+
+/// Typed errors returned by the farming pool contract.
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(u32)]
+pub enum PoolError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+}
 
 /// Per-user boost configuration returned by `get_boost_config`.
 /// `multiplier` is the current global multiplier set by the admin.
