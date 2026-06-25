@@ -2,9 +2,9 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger},
+    testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
     token::{StellarAssetClient, TokenClient},
-    Address, Env,
+    Address, Env, IntoVal,
 };
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
@@ -12,6 +12,7 @@ use soroban_sdk::{
 struct TestEnv {
     env: Env,
     client: FarmingPoolClient<'static>,
+    contract_id: Address,
     token: TokenClient<'static>,
     token_sac: StellarAssetClient<'static>,
     admin: Address,
@@ -22,12 +23,16 @@ fn setup(global_multiplier: u32, credit_rate: i128) -> TestEnv {
     setup_with_lock_period(global_multiplier, credit_rate, 0)
 }
 
-fn setup_with_lock_period(global_multiplier: u32, credit_rate: i128, min_lock_period: u32) -> TestEnv {
+fn setup_with_lock_period(
+    global_multiplier: u32,
+    credit_rate: i128,
+    min_lock_period: u32,
+) -> TestEnv {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
-    let user  = Address::generate(&env);
+    let user = Address::generate(&env);
 
     // Deploy a Stellar Asset Contract for the stake token.
     let token_admin = Address::generate(&env);
@@ -37,7 +42,13 @@ fn setup_with_lock_period(global_multiplier: u32, credit_rate: i128, min_lock_pe
 
     let contract_id = env.register(FarmingPool, ());
     let client = FarmingPoolClient::new(&env, &contract_id);
-    client.initialize(&admin, &asset.address(), &global_multiplier, &credit_rate, &min_lock_period);
+    client.initialize(
+        &admin,
+        &asset.address(),
+        &global_multiplier,
+        &credit_rate,
+        &min_lock_period,
+    );
 
     let token = TokenClient::new(&env, &asset.address());
 
@@ -46,14 +57,39 @@ fn setup_with_lock_period(global_multiplier: u32, credit_rate: i128, min_lock_pe
     let client = unsafe {
         core::mem::transmute::<FarmingPoolClient<'_>, FarmingPoolClient<'static>>(client)
     };
-    let token = unsafe {
-        core::mem::transmute::<TokenClient<'_>, TokenClient<'static>>(token)
-    };
+    let token = unsafe { core::mem::transmute::<TokenClient<'_>, TokenClient<'static>>(token) };
     let token_sac = unsafe {
         core::mem::transmute::<StellarAssetClient<'_>, StellarAssetClient<'static>>(token_sac)
     };
 
-    TestEnv { env, client, token, token_sac, admin, user }
+    TestEnv {
+        env,
+        client,
+        contract_id,
+        token,
+        token_sac,
+        admin,
+        user,
+    }
+}
+
+fn setup_without_mocked_auth() -> (Env, Address, FarmingPoolClient<'static>, Address, Address) {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin);
+
+    let contract_id = env.register(FarmingPool, ());
+    let client = FarmingPoolClient::new(&env, &contract_id);
+    client.initialize(&admin, &asset.address(), &2u32, &1i128, &0u32);
+
+    let client = unsafe {
+        core::mem::transmute::<FarmingPoolClient<'_>, FarmingPoolClient<'static>>(client)
+    };
+
+    (env, contract_id, client, admin, user)
 }
 
 fn advance_ledgers(env: &Env, by: u32) {
@@ -107,7 +143,10 @@ fn test_set_boost_and_get_config() {
     t.client.stake(&t.user, &1_000);
     t.client.set_boost(&t.user, &50u32);
 
-    let cfg = t.client.get_boost_config(&t.user).expect("boost config should be set");
+    let cfg = t
+        .client
+        .get_boost_config(&t.user)
+        .expect("boost config should be set");
     assert_eq!(cfg.allocation_pct, 50);
     assert_eq!(cfg.multiplier, 2);
 }
@@ -263,12 +302,133 @@ fn test_get_credits_zero_without_stake() {
 // ── lock_assets tests ─────────────────────────────────────────────────────────
 
 #[test]
+fn test_admin_getter_returns_current_admin() {
+    let t = setup(2, 1);
+    assert_eq!(t.client.admin(), t.admin);
+}
+
+#[test]
+fn test_transfer_admin_changes_admin() {
+    let t = setup(2, 1);
+    let new_admin = Address::generate(&t.env);
+    t.client.transfer_admin(&new_admin);
+    assert_eq!(t.client.admin(), new_admin);
+}
+
+#[test]
+fn test_transfer_admin_emits_event() {
+    let t = setup(2, 1);
+    let new_admin = Address::generate(&t.env);
+    t.client.transfer_admin(&new_admin);
+
+    assert_eq!(
+        t.env.events().all(),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("adm_xfr").into_val(&t.env)
+                ],
+                (t.admin.clone(), new_admin.clone()).into_val(&t.env),
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_transfer_admin_requires_current_admin_auth() {
+    let (env, contract_id, client, admin, user) = setup_without_mocked_auth();
+    let new_admin = Address::generate(&env);
+
+    let result = client
+        .mock_auths(&[MockAuth {
+            address: &user,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "transfer_admin",
+                args: (&new_admin,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_transfer_admin(&new_admin);
+
+    assert!(result.is_err(), "non-admin transfer_admin must be rejected");
+    assert_eq!(client.admin(), admin);
+}
+
+#[test]
+fn test_old_admin_loses_privileges_after_transfer() {
+    let (env, contract_id, client, old_admin, _user) = setup_without_mocked_auth();
+    let new_admin = Address::generate(&env);
+
+    client
+        .mock_auths(&[MockAuth {
+            address: &old_admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "transfer_admin",
+                args: (&new_admin,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .transfer_admin(&new_admin);
+
+    let old_pause = client
+        .mock_auths(&[MockAuth {
+            address: &old_admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "pause",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_pause();
+    assert!(old_pause.is_err(), "old admin must not be able to pause");
+
+    let old_multiplier = client
+        .mock_auths(&[MockAuth {
+            address: &old_admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_global_multiplier",
+                args: (&3u32,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_set_global_multiplier(&3u32);
+    assert!(
+        old_multiplier.is_err(),
+        "old admin must not be able to set global multiplier"
+    );
+
+    client
+        .mock_auths(&[MockAuth {
+            address: &new_admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "pause",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .pause();
+    assert!(client.is_paused(), "new admin should be able to pause");
+}
+
+#[test]
 fn test_lock_assets_creates_position() {
     let t = setup(1, 1);
     let initial_balance = t.token.balance(&t.user);
     t.client.lock_assets(&t.user, &500);
 
-    let pos = t.client.get_user_position(&t.user).expect("position should exist");
+    let pos = t
+        .client
+        .get_user_position(&t.user)
+        .expect("position should exist");
     assert_eq!(pos.amount, 500);
     assert_eq!(pos.total_credits, 0);
     assert_eq!(t.token.balance(&t.user), initial_balance - 500);
@@ -283,7 +443,10 @@ fn test_lock_assets_additional_lock_checkpoints_credits() {
     advance_ledgers(&t.env, 10);
     t.client.lock_assets(&t.user, &500); // triggers checkpoint
 
-    let pos = t.client.get_user_position(&t.user).expect("position should exist");
+    let pos = t
+        .client
+        .get_user_position(&t.user)
+        .expect("position should exist");
     assert_eq!(pos.amount, 1_500);
     assert_eq!(pos.total_credits, 10_000); // 1000 * 10
 }
@@ -304,14 +467,20 @@ fn test_lock_assets_rejects_negative_amount() {
 fn test_lock_assets_rejects_insufficient_balance() {
     let t = setup(1, 1);
     // User only has 1_000_000_000 tokens; try to lock more.
-    assert!(t.client.try_lock_assets(&t.user, &2_000_000_000i128).is_err());
+    assert!(t
+        .client
+        .try_lock_assets(&t.user, &2_000_000_000i128)
+        .is_err());
 }
 
 #[test]
 fn test_lock_assets_emits_event() {
     let t = setup(1, 1);
     t.client.lock_assets(&t.user, &1_000);
-    assert!(!t.env.events().all().events().is_empty(), "lock event not emitted");
+    assert!(
+        !t.env.events().all().events().is_empty(),
+        "lock event not emitted"
+    );
 }
 
 // ── unlock_assets tests ───────────────────────────────────────────────────────
@@ -340,7 +509,10 @@ fn test_unlock_assets_partial_keeps_remaining_position() {
 
     t.client.unlock_assets(&t.user, &400); // partial unlock
 
-    let pos = t.client.get_user_position(&t.user).expect("position should still exist");
+    let pos = t
+        .client
+        .get_user_position(&t.user)
+        .expect("position should still exist");
     assert_eq!(pos.amount, 600);
     // 1000 * 10 = 10000 credits banked during checkpoint
     assert_eq!(pos.total_credits, 10_000);
@@ -373,7 +545,10 @@ fn test_unlock_assets_emits_event() {
     t.client.lock_assets(&t.user, &1_000);
     advance_ledgers(&t.env, 5);
     t.client.unlock_assets(&t.user, &1_000);
-    assert!(!t.env.events().all().events().is_empty(), "unlock event not emitted");
+    assert!(
+        !t.env.events().all().events().is_empty(),
+        "unlock event not emitted"
+    );
 }
 
 // ── minimum lock period tests ─────────────────────────────────────────────────
@@ -390,8 +565,8 @@ fn test_unlock_blocked_before_min_lock_period() {
 fn test_unlock_allowed_after_min_lock_period() {
     let t = setup_with_lock_period(1, 1, 100);
     t.client.lock_assets(&t.user, &1_000);
-    advance_ledgers(&t.env, 100); // exactly at the boundary
-    // Should succeed — no panic.
+    advance_ledgers(&t.env, 100);
+    // Should succeed at exactly the boundary.
     t.client.unlock_assets(&t.user, &1_000);
     assert!(t.client.get_user_position(&t.user).is_none());
 }
@@ -515,7 +690,10 @@ fn test_unpause_restores_operations() {
 fn test_pause_emits_event() {
     let t = setup(1, 1);
     t.client.pause();
-    assert!(!t.env.events().all().events().is_empty(), "pause event not emitted");
+    assert!(
+        !t.env.events().all().events().is_empty(),
+        "pause event not emitted"
+    );
 }
 
 #[test]
@@ -523,7 +701,10 @@ fn test_unpause_emits_event() {
     let t = setup(1, 1);
     t.client.pause();
     t.client.unpause();
-    assert!(!t.env.events().all().events().is_empty(), "unpause event not emitted");
+    assert!(
+        !t.env.events().all().events().is_empty(),
+        "unpause event not emitted"
+    );
 }
 
 // ── multi-user isolation ──────────────────────────────────────────────────────
@@ -540,7 +721,7 @@ fn test_multiple_users_independent_positions() {
 
     // Each user's credits are independent.
     assert_eq!(t.client.calculate_credits(&t.user), 10_000); // 1000 * 10
-    assert_eq!(t.client.calculate_credits(&user2), 20_000);  // 2000 * 10
+    assert_eq!(t.client.calculate_credits(&user2), 20_000); // 2000 * 10
 }
 
 #[test]
@@ -556,6 +737,9 @@ fn test_one_user_unlock_does_not_affect_another() {
     t.client.unlock_assets(&t.user, &1_000);
 
     // user2's position is untouched.
-    let pos2 = t.client.get_user_position(&user2).expect("user2 position should exist");
+    let pos2 = t
+        .client
+        .get_user_position(&user2)
+        .expect("user2 position should exist");
     assert_eq!(pos2.amount, 2_000);
 }

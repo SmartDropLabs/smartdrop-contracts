@@ -2,9 +2,7 @@
 
 mod types;
 
-use soroban_sdk::{
-    contract, contractimpl, symbol_short, token, Address, Env,
-};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
 use types::{BoostConfig, DataKey, Position, UserStake};
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5s/ledger).
@@ -149,7 +147,8 @@ fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) {
     let rate = get_credit_rate(env);
     let current = env.ledger().sequence();
     let elapsed = current.saturating_sub(stake.start_ledger);
-    stake.credits_banked += compute_credits(stake.amount, allocation_pct, multiplier, rate, elapsed);
+    stake.credits_banked +=
+        compute_credits(stake.amount, allocation_pct, multiplier, rate, elapsed);
     stake.start_ledger = current;
 }
 
@@ -189,14 +188,45 @@ impl FarmingPool {
         assert!(credit_rate > 0, "credit_rate must be positive");
 
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::StakeToken, &stake_token);
-        env.storage().instance().set(&DataKey::GlobalMultiplier, &global_multiplier);
-        env.storage().instance().set(&DataKey::CreditRate, &credit_rate);
-        env.storage().instance().set(&DataKey::MinLockPeriod, &min_lock_period);
+        env.storage()
+            .instance()
+            .set(&DataKey::StakeToken, &stake_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalMultiplier, &global_multiplier);
+        env.storage()
+            .instance()
+            .set(&DataKey::CreditRate, &credit_rate);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinLockPeriod, &min_lock_period);
         bump_instance(&env);
     }
 
     // ── Lock / Unlock system ─────────────────────────────────────────────────
+
+    /// Return the current admin address.
+    pub fn admin(env: Env) -> Address {
+        bump_instance(&env);
+        get_admin(&env)
+    }
+
+    /// Admin: transfer admin rights to `new_admin`. Current admin must authorise.
+    ///
+    /// Supports key rotation and governance handoffs without redeploying the pool.
+    /// Emits a `("pool", "adm_xfr")` event with `(old_admin, new_admin)`.
+    pub fn transfer_admin(env: Env, new_admin: Address) {
+        let current = get_admin(&env);
+        current.require_auth();
+        bump_instance(&env);
+
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("adm_xfr")),
+            (current, new_admin),
+        );
+    }
 
     /// Lock `amount` tokens for the caller. If a prior position exists, credits are
     /// checkpointed first and the new amount is added to the existing position.
@@ -222,8 +252,11 @@ impl FarmingPool {
             }
         };
 
-        token::TokenClient::new(&env, &get_stake_token(&env))
-            .transfer(&user, &env.current_contract_address(), &amount);
+        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
+            &user,
+            &env.current_contract_address(),
+            &amount,
+        );
 
         set_position(&env, &user, &pos);
 
@@ -258,8 +291,11 @@ impl FarmingPool {
         let total_credits = pos.total_credits;
         pos.amount -= amount;
 
-        token::TokenClient::new(&env, &get_stake_token(&env))
-            .transfer(&env.current_contract_address(), &user, &amount);
+        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
+            &env.current_contract_address(),
+            &user,
+            &amount,
+        );
 
         if pos.amount == 0 {
             remove_position(&env, &user);
@@ -280,7 +316,10 @@ impl FarmingPool {
             return 0;
         };
         let rate = get_credit_rate(&env);
-        let elapsed = env.ledger().sequence().saturating_sub(pos.checkpoint_ledger);
+        let elapsed = env
+            .ledger()
+            .sequence()
+            .saturating_sub(pos.checkpoint_ledger);
         pos.total_credits + pos.amount * rate * elapsed as i128
     }
 
@@ -299,10 +338,8 @@ impl FarmingPool {
         get_admin(&env).require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Paused, &true);
-        env.events().publish(
-            (symbol_short!("pool"), symbol_short!("paused")),
-            (),
-        );
+        env.events()
+            .publish((symbol_short!("pool"), symbol_short!("paused")), ());
     }
 
     /// Admin: unpause the pool, restoring normal operation.
@@ -312,10 +349,8 @@ impl FarmingPool {
         get_admin(&env).require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Paused, &false);
-        env.events().publish(
-            (symbol_short!("pool"), symbol_short!("unpaused")),
-            (),
-        );
+        env.events()
+            .publish((symbol_short!("pool"), symbol_short!("unpaused")), ());
     }
 
     /// Return whether the pool is currently paused.
@@ -346,8 +381,11 @@ impl FarmingPool {
         };
 
         // Pull tokens from caller into the contract.
-        token::TokenClient::new(&env, &get_stake_token(&env))
-            .transfer(&from, &env.current_contract_address(), &amount);
+        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
+            &from,
+            &env.current_contract_address(),
+            &amount,
+        );
 
         set_user_stake(&env, &from, &new_stake);
     }
@@ -362,8 +400,11 @@ impl FarmingPool {
         let total_credits = stake.credits_banked;
 
         // Return staked tokens to caller.
-        token::TokenClient::new(&env, &get_stake_token(&env))
-            .transfer(&env.current_contract_address(), &from, &stake.amount);
+        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
+            &env.current_contract_address(),
+            &from,
+            &stake.amount,
+        );
 
         remove_user_stake(&env, &from);
         total_credits
@@ -422,7 +463,9 @@ impl FarmingPool {
         assert!(multiplier >= 1, "multiplier must be >= 1");
         bump_instance(&env);
 
-        env.storage().instance().set(&DataKey::GlobalMultiplier, &multiplier);
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalMultiplier, &multiplier);
 
         env.events().publish(
             (symbol_short!("boost"), symbol_short!("mult_set")),
@@ -440,7 +483,8 @@ impl FarmingPool {
         let multiplier = get_global_multiplier(&env);
         let rate = get_credit_rate(&env);
         let elapsed = env.ledger().sequence().saturating_sub(stake.start_ledger);
-        stake.credits_banked + compute_credits(stake.amount, allocation_pct, multiplier, rate, elapsed)
+        stake.credits_banked
+            + compute_credits(stake.amount, allocation_pct, multiplier, rate, elapsed)
     }
 
     /// Return the current stake record for `user`, or `None` if not staked.
