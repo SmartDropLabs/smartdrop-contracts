@@ -17,6 +17,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
 
       - name: Cache cargo registry and build output
         uses: actions/cache@v6
@@ -33,18 +35,13 @@ jobs:
         working-directory: soroban
         run: cargo test --workspace
 
-      - name: Install Soroban WASM toolchain
-        uses: dtolnay/rust-toolchain@1.81.0
-        with:
-          targets: wasm32-unknown-unknown
-
       - name: Build release WASM
         working-directory: soroban
-        run: cargo +1.81.0 build --target wasm32-unknown-unknown --release
+        run: cargo build --target wasm32v1-none --release
 
       - name: Upload WASM artifacts
         uses: actions/upload-artifact@v7
         with:
           name: wasm-${{ github.sha }}
-          path: soroban/target/wasm32-unknown-unknown/release/*.wasm
+          path: soroban/target/wasm32v1-none/release/*.wasm
           if-no-files-found: error
