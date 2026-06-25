@@ -18,9 +18,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.81.0
-        with:
-          targets: wasm32-unknown-unknown
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry and build output
         uses: actions/cache@v6
@@ -37,9 +35,14 @@ jobs:
         working-directory: soroban
         run: cargo test --workspace
 
+      - name: Install Soroban WASM toolchain
+        uses: dtolnay/rust-toolchain@1.81.0
+        with:
+          targets: wasm32-unknown-unknown
+
       - name: Build release WASM
         working-directory: soroban
-        run: cargo build --target wasm32-unknown-unknown --release
+        run: cargo +1.81.0 build --target wasm32-unknown-unknown --release
 
       - name: Generate SHA256 sums
         working-directory: soroban
