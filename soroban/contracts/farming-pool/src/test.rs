@@ -559,3 +559,41 @@ fn test_one_user_unlock_does_not_affect_another() {
     let pos2 = t.client.get_user_position(&user2).expect("user2 position should exist");
     assert_eq!(pos2.amount, 2_000);
 }
+
+// ── emergency_withdraw tests ──────────────────────────────────────────────────
+
+#[test]
+fn test_emergency_withdraw_while_paused() {
+    let t = setup(1, 1);
+    let initial_balance = t.token.balance(&t.user);
+
+    // Lock 500, stake 300, advance 10 ledgers so credits accrue.
+    t.client.lock_assets(&t.user, &500);
+    t.client.stake(&t.user, &300);
+    advance_ledgers(&t.env, 10);
+
+    // Trigger credit checkpoints: second lock banks 500*1*10=5_000 into pos.total_credits;
+    // second stake banks 300*1*10=3_000 into stake.credits_banked.
+    t.client.lock_assets(&t.user, &100);
+    t.client.stake(&t.user, &100);
+
+    t.client.pause();
+    let returned = t.client.emergency_withdraw(&t.user);
+
+    // 600 locked + 400 staked = 1_000 total tokens returned.
+    assert_eq!(returned, 1_000);
+    assert_eq!(t.token.balance(&t.user), initial_balance);
+    assert!(t.client.get_user_position(&t.user).is_none(), "position should be cleared");
+    assert!(t.client.get_stake(&t.user).is_none(), "stake should be cleared");
+    // 5_000 (lock credits) + 3_000 (stake credits) preserved.
+    assert_eq!(t.client.get_banked_credits(&t.user), 8_000);
+}
+
+#[test]
+fn test_emergency_withdraw_while_unpaused_returns_not_paused() {
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &1_000);
+
+    let result = t.client.try_emergency_withdraw(&t.user);
+    assert!(matches!(result, Err(Ok(PoolError::NotPaused))));
+}
