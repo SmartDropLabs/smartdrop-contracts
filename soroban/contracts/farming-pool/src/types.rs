@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracterror, contracttype, Address};
 
 /// Per-user boost configuration returned by `get_boost_config`.
 /// `multiplier` is the current global multiplier set by the admin.
@@ -40,6 +40,16 @@ pub struct Position {
     pub total_credits: i128,
 }
 
+/// Error codes returned by pool operations.
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PoolError {
+    /// Returned by `emergency_withdraw` when the pool is not currently paused.
+    NotPaused     = 13,
+    /// Returned by `emergency_withdraw` when the user has no stake or locked position.
+    NoActiveStake = 14,
+}
+
 /// Storage keys for all persistent and instance data.
 #[contracttype]
 pub enum DataKey {
@@ -58,4 +68,6 @@ pub enum DataKey {
     UserStake(Address),
     /// Per-user locking position (lock/unlock system).
     UserPosition(Address),
+    /// Credits banked for a user after an emergency withdrawal, for future claim.
+    BankedCredits(Address),
 }
