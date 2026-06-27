@@ -526,6 +526,71 @@ fn test_unpause_emits_event() {
     assert!(!t.env.events().all().events().is_empty(), "unpause event not emitted");
 }
 
+#[test]
+fn test_pause_blocks_stake() {
+    let t = setup(1, 1);
+    t.client.pause();
+    assert!(t.client.try_stake(&t.user, &100i128).is_err());
+}
+
+#[test]
+fn test_unpause_restores_stake() {
+    let t = setup(1, 1);
+    t.client.pause();
+    t.client.unpause();
+    t.client.stake(&t.user, &500);
+    assert_eq!(t.client.get_stake(&t.user).unwrap().amount, 500);
+}
+
+#[test]
+fn test_pause_blocks_unstake() {
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.pause();
+    assert!(t.client.try_unstake(&t.user).is_err());
+}
+
+#[test]
+fn test_unpause_restores_unstake() {
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.pause();
+    t.client.unpause();
+    t.client.unstake(&t.user);
+    assert!(t.client.get_stake(&t.user).is_none());
+}
+
+#[test]
+fn test_pause_blocks_set_boost() {
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.pause();
+    assert!(t.client.try_set_boost(&t.user, &50u32).is_err());
+}
+
+#[test]
+fn test_unpause_restores_set_boost() {
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.pause();
+    t.client.unpause();
+    t.client.set_boost(&t.user, &50u32);
+    assert_eq!(
+        t.client.get_boost_config(&t.user).unwrap().allocation_pct,
+        50
+    );
+}
+
+#[test]
+fn test_set_global_multiplier_callable_while_paused() {
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &50u32);
+    t.client.pause();
+    t.client.set_global_multiplier(&3u32);
+    assert_eq!(t.client.get_boost_config(&t.user).unwrap().multiplier, 3);
+}
+
 // ── multi-user isolation ──────────────────────────────────────────────────────
 
 #[test]

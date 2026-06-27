@@ -292,7 +292,8 @@ impl FarmingPool {
 
     // ── Pause / Unpause ───────────────────────────────────────────────────────
 
-    /// Admin: pause the pool. While paused, `lock_assets` and `unlock_assets` are blocked.
+    /// Admin: pause the pool. While paused, `lock_assets`, `unlock_assets`, `stake`,
+    /// `unstake`, and `set_boost` are blocked.
     ///
     /// Emits a `("pool", "paused")` event.
     pub fn pause(env: Env) {
@@ -329,6 +330,7 @@ impl FarmingPool {
     /// Stake `amount` tokens. If a prior stake exists, earned credits are checkpointed first.
     pub fn stake(env: Env, from: Address, amount: i128) {
         from.require_auth();
+        assert!(!pool_is_paused(&env), "pool is paused");
         assert!(amount > 0, "amount must be positive");
         bump_instance(&env);
 
@@ -355,6 +357,7 @@ impl FarmingPool {
     /// Unstake all tokens. Returns the total credits earned.
     pub fn unstake(env: Env, from: Address) -> i128 {
         from.require_auth();
+        assert!(!pool_is_paused(&env), "pool is paused");
         bump_instance(&env);
 
         let mut stake = get_user_stake(&env, &from).expect("no active stake");
@@ -377,6 +380,7 @@ impl FarmingPool {
     /// Emits a `boost_applied` event.
     pub fn set_boost(env: Env, user: Address, allocation_pct: u32) {
         user.require_auth();
+        assert!(!pool_is_paused(&env), "pool is paused");
         assert!(
             allocation_pct >= 1 && allocation_pct <= 100,
             "allocation_pct must be 1–100"
