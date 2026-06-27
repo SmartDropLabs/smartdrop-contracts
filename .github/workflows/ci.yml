@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test-and-build:
+    name: Test and build WASM
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            soroban/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('soroban/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run tests
+        working-directory: soroban
+        run: cargo test --workspace
+
+      - name: Build release WASM
+        working-directory: soroban
+        run: cargo build --target wasm32v1-none --release
+
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: wasm-${{ github.sha }}
+          path: soroban/target/wasm32v1-none/release/*.wasm
+          if-no-files-found: error

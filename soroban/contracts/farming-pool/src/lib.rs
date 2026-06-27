@@ -4,6 +4,11 @@ mod types;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
 use types::{BoostConfig, DataKey, PoolError, Position, UserStake};
+use soroban_sdk::{
+    contract, contractimpl, symbol_short, token, Address, Env,
+};
+use types::{BoostConfig, DataKey, Position, UserStake};
+pub use types::PoolError;
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5s/ledger).
 const USER_TTL_THRESHOLD: u32 = 518_400;
@@ -100,6 +105,12 @@ fn remove_user_stake(env: &Env, user: &Address) {
     env.storage()
         .persistent()
         .remove(&DataKey::UserStake(user.clone()));
+}
+
+fn set_banked_credits(env: &Env, user: &Address, credits: i128) {
+    let key = DataKey::BankedCredits(user.clone());
+    env.storage().persistent().set(&key, &credits);
+    bump_user(env, &key);
 }
 
 fn get_position(env: &Env, user: &Address) -> Option<Position> {
@@ -361,6 +372,64 @@ impl FarmingPool {
         require_initialized(&env)?;
         bump_instance(&env);
         Ok(pool_is_paused(&env))
+    }
+
+    /// Admin: return all tokens for `user` during an emergency.
+    ///
+    /// May only be called while the pool is paused. Banked credits from both the
+    /// lock position and the stake record are summed and written to `BankedCredits`
+    /// storage so a future claim mechanism can recover them. Emits an `emrg_exit`
+    /// event with `(admin, user, amount)`.
+    pub fn emergency_withdraw(env: Env, user: Address) -> Result<i128, PoolError> {
+        get_admin(&env).require_auth();
+        if !pool_is_paused(&env) {
+            return Err(PoolError::NotPaused);
+        }
+        bump_instance(&env);
+
+        let mut total_returned: i128 = 0;
+        let mut banked_credits: i128 = 0;
+        let token = token::TokenClient::new(&env, &get_stake_token(&env));
+
+        if let Some(pos) = get_position(&env, &user) {
+            token.transfer(&env.current_contract_address(), &user, &pos.amount);
+            total_returned += pos.amount;
+            banked_credits += pos.total_credits;
+            remove_position(&env, &user);
+        }
+
+        if let Some(stake) = get_user_stake(&env, &user) {
+            token.transfer(&env.current_contract_address(), &user, &stake.amount);
+            total_returned += stake.amount;
+            banked_credits += stake.credits_banked;
+            remove_user_stake(&env, &user);
+        }
+
+        if total_returned == 0 {
+            return Err(PoolError::NoActiveStake);
+        }
+
+        if banked_credits > 0 {
+            set_banked_credits(&env, &user, banked_credits);
+        }
+
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("emrg_exit")),
+            (get_admin(&env), user, total_returned),
+        );
+        Ok(total_returned)
+    }
+
+    /// Return the credits preserved for `user` by a prior `emergency_withdraw`. Returns 0
+    /// if no emergency withdrawal has occurred for this user.
+    pub fn get_banked_credits(env: Env, user: Address) -> i128 {
+        bump_instance(&env);
+        let key = DataKey::BankedCredits(user);
+        let val: Option<i128> = env.storage().persistent().get(&key);
+        if val.is_some() {
+            bump_user(&env, &key);
+        }
+        val.unwrap_or(0)
     }
 
     // ── Boost / Stake system (unchanged) ─────────────────────────────────────

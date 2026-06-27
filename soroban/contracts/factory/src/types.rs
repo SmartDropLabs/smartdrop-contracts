@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address};
+use soroban_sdk::{contracterror, contracttype, Address, Vec};
 
 /// Storage keys used by the factory contract.
 #[contracttype]
@@ -25,6 +25,18 @@ pub struct PoolRecord {
     pub daily_rate: u128,
     /// Minimum number of ledgers a stake must be held before withdrawal.
     pub min_lock_period: u64,
+}
+
+/// Paginated pool registry response.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListPoolsResponse {
+    /// Pool IDs and records in ascending pool ID order.
+    pub records: Vec<(u32, PoolRecord)>,
+    /// Start ID to use for the next page, or `total` when exhausted.
+    pub next_start_id: u32,
+    /// Total number of pools registered in the factory.
+    pub total: u32,
 }
 
 /// Typed errors returned by the factory contract.

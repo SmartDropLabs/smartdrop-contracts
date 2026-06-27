@@ -3,7 +3,7 @@
 mod types;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, vec, Address, BytesN, Env, Vec};
-use types::{DataKey, FactoryError, PoolRecord};
+use types::{DataKey, FactoryError, ListPoolsResponse, PoolRecord};
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
 const TTL_THRESHOLD: u32 = 518_400;
@@ -94,6 +94,36 @@ impl Factory {
         }
     }
 
+    /// Return a page of pool records in ascending pool ID order.
+    ///
+    /// `limit` is capped at 20 records so callers can page through large
+    /// registries without unbounded contract work.
+    pub fn list_pools(env: Env, start_id: u32, limit: u32) -> ListPoolsResponse {
+        bump_instance(&env);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
+        let capped_limit = limit.min(20);
+        let end = start_id.saturating_add(capped_limit).min(count);
+        let mut records: Vec<(u32, PoolRecord)> = vec![&env];
+
+        for pool_id in start_id..end {
+            let key = DataKey::Pool(pool_id);
+            if let Some(record) = env.storage().persistent().get::<DataKey, PoolRecord>(&key) {
+                bump_pool(&env, pool_id);
+                records.push_back((pool_id, record));
+            }
+        }
+
+        ListPoolsResponse {
+            records,
+            next_start_id: if end < count { end } else { count },
+            total: count,
+        }
+    }
+
     /// Return all pool IDs whose staking asset matches `asset`.
     ///
     /// Scans every registered pool in O(n) and collects matching IDs.
@@ -109,11 +139,7 @@ impl Factory {
         let mut matches: Vec<u32> = vec![&env];
         for pool_id in 0..count {
             let key = DataKey::Pool(pool_id);
-            if let Some(record) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, PoolRecord>(&key)
-            {
+            if let Some(record) = env.storage().persistent().get::<DataKey, PoolRecord>(&key) {
                 if record.asset == asset {
                     bump_pool(&env, pool_id);
                     matches.push_back(pool_id);
@@ -144,12 +170,7 @@ impl Factory {
     /// The `pool_crtd` event now includes `asset`, `daily_rate`, and
     /// `min_lock_period` alongside `pool_id` and `pool_address` so off-chain
     /// indexers can reconstruct the full pool state without a follow-up RPC call.
-    pub fn create_pool(
-        env: Env,
-        asset: Address,
-        daily_rate: u128,
-        min_lock_period: u64,
-    ) -> u32 {
+    pub fn create_pool(env: Env, asset: Address, daily_rate: u128, min_lock_period: u64) -> u32 {
         let admin = load_admin(&env);
         admin.require_auth();
         bump_instance(&env);

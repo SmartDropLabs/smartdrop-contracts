@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish WASM release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            soroban/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('soroban/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run tests
+        working-directory: soroban
+        run: cargo test --workspace
+
+      - name: Build release WASM
+        working-directory: soroban
+        run: cargo build --target wasm32v1-none --release
+
+      - name: Generate SHA256 sums
+        working-directory: soroban
+        run: |
+          cd target/wasm32v1-none/release
+          sha256sum *.wasm > sha256sums.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            soroban/target/wasm32v1-none/release/*.wasm
+            soroban/target/wasm32v1-none/release/sha256sums.txt
