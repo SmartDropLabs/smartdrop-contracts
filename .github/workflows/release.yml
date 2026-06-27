@@ -20,7 +20,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32v1-none
 
       - name: Cache cargo registry and build output
         uses: actions/cache@v6
@@ -39,17 +39,17 @@ jobs:
 
       - name: Build release WASM
         working-directory: soroban
-        run: cargo build --target wasm32-unknown-unknown --release
+        run: cargo build --target wasm32v1-none --release
 
       - name: Generate SHA256 sums
         working-directory: soroban
         run: |
-          cd target/wasm32-unknown-unknown/release
+          cd target/wasm32v1-none/release
           sha256sum *.wasm > sha256sums.txt
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            soroban/target/wasm32-unknown-unknown/release/*.wasm
-            soroban/target/wasm32-unknown-unknown/release/sha256sums.txt
+            soroban/target/wasm32v1-none/release/*.wasm
+            soroban/target/wasm32v1-none/release/sha256sums.txt
