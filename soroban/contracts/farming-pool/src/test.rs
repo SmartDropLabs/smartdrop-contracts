@@ -22,12 +22,31 @@ fn setup(global_multiplier: u32, credit_rate: i128) -> TestEnv {
     setup_with_lock_period(global_multiplier, credit_rate, 0)
 }
 
-fn setup_with_lock_period(global_multiplier: u32, credit_rate: i128, min_lock_period: u32) -> TestEnv {
+fn setup_uninitialized() -> (Env, FarmingPoolClient<'static>, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let contract_id = env.register(FarmingPool, ());
+    let client = FarmingPoolClient::new(&env, &contract_id);
+
+    let client = unsafe {
+        core::mem::transmute::<FarmingPoolClient<'_>, FarmingPoolClient<'static>>(client)
+    };
+
+    (env, client, user)
+}
+
+fn setup_with_lock_period(
+    global_multiplier: u32,
+    credit_rate: i128,
+    min_lock_period: u32,
+) -> TestEnv {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
-    let user  = Address::generate(&env);
+    let user = Address::generate(&env);
 
     // Deploy a Stellar Asset Contract for the stake token.
     let token_admin = Address::generate(&env);
@@ -37,7 +56,13 @@ fn setup_with_lock_period(global_multiplier: u32, credit_rate: i128, min_lock_pe
 
     let contract_id = env.register(FarmingPool, ());
     let client = FarmingPoolClient::new(&env, &contract_id);
-    client.initialize(&admin, &asset.address(), &global_multiplier, &credit_rate, &min_lock_period);
+    client.initialize(
+        &admin,
+        &asset.address(),
+        &global_multiplier,
+        &credit_rate,
+        &min_lock_period,
+    );
 
     let token = TokenClient::new(&env, &asset.address());
 
@@ -46,19 +71,42 @@ fn setup_with_lock_period(global_multiplier: u32, credit_rate: i128, min_lock_pe
     let client = unsafe {
         core::mem::transmute::<FarmingPoolClient<'_>, FarmingPoolClient<'static>>(client)
     };
-    let token = unsafe {
-        core::mem::transmute::<TokenClient<'_>, TokenClient<'static>>(token)
-    };
+    let token = unsafe { core::mem::transmute::<TokenClient<'_>, TokenClient<'static>>(token) };
     let token_sac = unsafe {
         core::mem::transmute::<StellarAssetClient<'_>, StellarAssetClient<'static>>(token_sac)
     };
 
-    TestEnv { env, client, token, token_sac, admin, user }
+    TestEnv {
+        env,
+        client,
+        token,
+        token_sac,
+        admin,
+        user,
+    }
 }
 
 fn advance_ledgers(env: &Env, by: u32) {
     let current = env.ledger().sequence();
     env.ledger().with_mut(|l| l.sequence_number = current + by);
+}
+
+#[test]
+fn test_stake_uninitialized_returns_not_initialized() {
+    let (_env, client, user) = setup_uninitialized();
+    match client.try_stake(&user, &100i128) {
+        Err(Ok(PoolError::NotInitialized)) => {}
+        _ => panic!("expected PoolError::NotInitialized"),
+    }
+}
+
+#[test]
+fn test_pause_uninitialized_returns_not_initialized() {
+    let (_env, client, _user) = setup_uninitialized();
+    match client.try_pause() {
+        Err(Ok(PoolError::NotInitialized)) => {}
+        _ => panic!("expected PoolError::NotInitialized"),
+    }
 }
 
 // ── Boost calculation unit tests ──────────────────────────────────────────────
@@ -107,7 +155,10 @@ fn test_set_boost_and_get_config() {
     t.client.stake(&t.user, &1_000);
     t.client.set_boost(&t.user, &50u32);
 
-    let cfg = t.client.get_boost_config(&t.user).expect("boost config should be set");
+    let cfg = t
+        .client
+        .get_boost_config(&t.user)
+        .expect("boost config should be set");
     assert_eq!(cfg.allocation_pct, 50);
     assert_eq!(cfg.multiplier, 2);
 }
@@ -268,7 +319,10 @@ fn test_lock_assets_creates_position() {
     let initial_balance = t.token.balance(&t.user);
     t.client.lock_assets(&t.user, &500);
 
-    let pos = t.client.get_user_position(&t.user).expect("position should exist");
+    let pos = t
+        .client
+        .get_user_position(&t.user)
+        .expect("position should exist");
     assert_eq!(pos.amount, 500);
     assert_eq!(pos.total_credits, 0);
     assert_eq!(t.token.balance(&t.user), initial_balance - 500);
@@ -283,7 +337,10 @@ fn test_lock_assets_additional_lock_checkpoints_credits() {
     advance_ledgers(&t.env, 10);
     t.client.lock_assets(&t.user, &500); // triggers checkpoint
 
-    let pos = t.client.get_user_position(&t.user).expect("position should exist");
+    let pos = t
+        .client
+        .get_user_position(&t.user)
+        .expect("position should exist");
     assert_eq!(pos.amount, 1_500);
     assert_eq!(pos.total_credits, 10_000); // 1000 * 10
 }
@@ -304,14 +361,20 @@ fn test_lock_assets_rejects_negative_amount() {
 fn test_lock_assets_rejects_insufficient_balance() {
     let t = setup(1, 1);
     // User only has 1_000_000_000 tokens; try to lock more.
-    assert!(t.client.try_lock_assets(&t.user, &2_000_000_000i128).is_err());
+    assert!(t
+        .client
+        .try_lock_assets(&t.user, &2_000_000_000i128)
+        .is_err());
 }
 
 #[test]
 fn test_lock_assets_emits_event() {
     let t = setup(1, 1);
     t.client.lock_assets(&t.user, &1_000);
-    assert!(!t.env.events().all().events().is_empty(), "lock event not emitted");
+    assert!(
+        !t.env.events().all().events().is_empty(),
+        "lock event not emitted"
+    );
 }
 
 // ── unlock_assets tests ───────────────────────────────────────────────────────
@@ -340,7 +403,10 @@ fn test_unlock_assets_partial_keeps_remaining_position() {
 
     t.client.unlock_assets(&t.user, &400); // partial unlock
 
-    let pos = t.client.get_user_position(&t.user).expect("position should still exist");
+    let pos = t
+        .client
+        .get_user_position(&t.user)
+        .expect("position should still exist");
     assert_eq!(pos.amount, 600);
     // 1000 * 10 = 10000 credits banked during checkpoint
     assert_eq!(pos.total_credits, 10_000);
@@ -373,7 +439,10 @@ fn test_unlock_assets_emits_event() {
     t.client.lock_assets(&t.user, &1_000);
     advance_ledgers(&t.env, 5);
     t.client.unlock_assets(&t.user, &1_000);
-    assert!(!t.env.events().all().events().is_empty(), "unlock event not emitted");
+    assert!(
+        !t.env.events().all().events().is_empty(),
+        "unlock event not emitted"
+    );
 }
 
 // ── minimum lock period tests ─────────────────────────────────────────────────
@@ -391,7 +460,7 @@ fn test_unlock_allowed_after_min_lock_period() {
     let t = setup_with_lock_period(1, 1, 100);
     t.client.lock_assets(&t.user, &1_000);
     advance_ledgers(&t.env, 100); // exactly at the boundary
-    // Should succeed — no panic.
+                                  // Should succeed — no panic.
     t.client.unlock_assets(&t.user, &1_000);
     assert!(t.client.get_user_position(&t.user).is_none());
 }
@@ -515,7 +584,10 @@ fn test_unpause_restores_operations() {
 fn test_pause_emits_event() {
     let t = setup(1, 1);
     t.client.pause();
-    assert!(!t.env.events().all().events().is_empty(), "pause event not emitted");
+    assert!(
+        !t.env.events().all().events().is_empty(),
+        "pause event not emitted"
+    );
 }
 
 #[test]
@@ -523,7 +595,10 @@ fn test_unpause_emits_event() {
     let t = setup(1, 1);
     t.client.pause();
     t.client.unpause();
-    assert!(!t.env.events().all().events().is_empty(), "unpause event not emitted");
+    assert!(
+        !t.env.events().all().events().is_empty(),
+        "unpause event not emitted"
+    );
 }
 
 // ── multi-user isolation ──────────────────────────────────────────────────────
@@ -540,7 +615,7 @@ fn test_multiple_users_independent_positions() {
 
     // Each user's credits are independent.
     assert_eq!(t.client.calculate_credits(&t.user), 10_000); // 1000 * 10
-    assert_eq!(t.client.calculate_credits(&user2), 20_000);  // 2000 * 10
+    assert_eq!(t.client.calculate_credits(&user2), 20_000); // 2000 * 10
 }
 
 #[test]
@@ -556,7 +631,10 @@ fn test_one_user_unlock_does_not_affect_another() {
     t.client.unlock_assets(&t.user, &1_000);
 
     // user2's position is untouched.
-    let pos2 = t.client.get_user_position(&user2).expect("user2 position should exist");
+    let pos2 = t
+        .client
+        .get_user_position(&user2)
+        .expect("user2 position should exist");
     assert_eq!(pos2.amount, 2_000);
 }
 
