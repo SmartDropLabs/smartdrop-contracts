@@ -1,5 +1,6 @@
 /target
 soroban/target
+.contract-ids.json
 **/*.rs.bk
 .env
 .DS_Store
