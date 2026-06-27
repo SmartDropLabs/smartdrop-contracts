@@ -230,6 +230,29 @@ impl FarmingPool {
 
     // ── Lock / Unlock system ─────────────────────────────────────────────────
 
+    /// Return the current admin address.
+    pub fn admin(env: Env) -> Address {
+        bump_instance(&env);
+        get_admin(&env)
+    }
+
+    /// Admin: transfer admin rights to `new_admin`. Current admin must authorise.
+    ///
+    /// Supports key rotation and governance handoffs without redeploying the pool.
+    /// Emits a `("pool", "adm_xfr")` event with `(old_admin, new_admin)`.
+    pub fn transfer_admin(env: Env, new_admin: Address) {
+        let current = get_admin(&env);
+        current.require_auth();
+        bump_instance(&env);
+
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("adm_xfr")),
+            (current, new_admin),
+        );
+    }
+
     /// Lock `amount` tokens for the caller. If a prior position exists, credits are
     /// checkpointed first and the new amount is added to the existing position.
     ///
@@ -255,6 +278,7 @@ impl FarmingPool {
             }
         };
 
+        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &user,
@@ -297,6 +321,7 @@ impl FarmingPool {
         let total_credits = pos.total_credits;
         pos.amount -= amount;
 
+        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &env.current_contract_address(),
@@ -329,6 +354,7 @@ impl FarmingPool {
             .ledger()
             .sequence()
             .saturating_sub(pos.checkpoint_ledger);
+        pos.total_credits + pos.amount * rate * elapsed as i128
         Ok(pos.total_credits + pos.amount * rate * elapsed as i128)
     }
 
@@ -455,6 +481,7 @@ impl FarmingPool {
         };
 
         // Pull tokens from caller into the contract.
+        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &from,
@@ -477,6 +504,7 @@ impl FarmingPool {
         let total_credits = stake.credits_banked;
 
         // Return staked tokens to caller.
+        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &env.current_contract_address(),
@@ -569,6 +597,8 @@ impl FarmingPool {
         let multiplier = get_global_multiplier(&env);
         let rate = get_credit_rate(&env);
         let elapsed = env.ledger().sequence().saturating_sub(stake.start_ledger);
+        stake.credits_banked
+            + compute_credits(stake.amount, allocation_pct, multiplier, rate, elapsed)
         Ok(stake.credits_banked
             + compute_credits(stake.amount, allocation_pct, multiplier, rate, elapsed))
     }

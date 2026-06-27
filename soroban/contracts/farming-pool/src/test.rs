@@ -2,9 +2,9 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger},
+    testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
     token::{StellarAssetClient, TokenClient},
-    Address, Env,
+    Address, Env, IntoVal,
 };
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
@@ -12,6 +12,7 @@ use soroban_sdk::{
 struct TestEnv {
     env: Env,
     client: FarmingPoolClient<'static>,
+    contract_id: Address,
     token: TokenClient<'static>,
     token_sac: StellarAssetClient<'static>,
     admin: Address,
@@ -79,11 +80,31 @@ fn setup_with_lock_period(
     TestEnv {
         env,
         client,
+        contract_id,
         token,
         token_sac,
         admin,
         user,
     }
+}
+
+fn setup_without_mocked_auth() -> (Env, Address, FarmingPoolClient<'static>, Address, Address) {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin);
+
+    let contract_id = env.register(FarmingPool, ());
+    let client = FarmingPoolClient::new(&env, &contract_id);
+    client.initialize(&admin, &asset.address(), &2u32, &1i128, &0u32);
+
+    let client = unsafe {
+        core::mem::transmute::<FarmingPoolClient<'_>, FarmingPoolClient<'static>>(client)
+    };
+
+    (env, contract_id, client, admin, user)
 }
 
 fn advance_ledgers(env: &Env, by: u32) {
@@ -314,6 +335,124 @@ fn test_get_credits_zero_without_stake() {
 // ── lock_assets tests ─────────────────────────────────────────────────────────
 
 #[test]
+fn test_admin_getter_returns_current_admin() {
+    let t = setup(2, 1);
+    assert_eq!(t.client.admin(), t.admin);
+}
+
+#[test]
+fn test_transfer_admin_changes_admin() {
+    let t = setup(2, 1);
+    let new_admin = Address::generate(&t.env);
+    t.client.transfer_admin(&new_admin);
+    assert_eq!(t.client.admin(), new_admin);
+}
+
+#[test]
+fn test_transfer_admin_emits_event() {
+    let t = setup(2, 1);
+    let new_admin = Address::generate(&t.env);
+    t.client.transfer_admin(&new_admin);
+
+    assert_eq!(
+        t.env.events().all(),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("adm_xfr").into_val(&t.env)
+                ],
+                (t.admin.clone(), new_admin.clone()).into_val(&t.env),
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_transfer_admin_requires_current_admin_auth() {
+    let (env, contract_id, client, admin, user) = setup_without_mocked_auth();
+    let new_admin = Address::generate(&env);
+
+    let result = client
+        .mock_auths(&[MockAuth {
+            address: &user,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "transfer_admin",
+                args: (&new_admin,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_transfer_admin(&new_admin);
+
+    assert!(result.is_err(), "non-admin transfer_admin must be rejected");
+    assert_eq!(client.admin(), admin);
+}
+
+#[test]
+fn test_old_admin_loses_privileges_after_transfer() {
+    let (env, contract_id, client, old_admin, _user) = setup_without_mocked_auth();
+    let new_admin = Address::generate(&env);
+
+    client
+        .mock_auths(&[MockAuth {
+            address: &old_admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "transfer_admin",
+                args: (&new_admin,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .transfer_admin(&new_admin);
+
+    let old_pause = client
+        .mock_auths(&[MockAuth {
+            address: &old_admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "pause",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_pause();
+    assert!(old_pause.is_err(), "old admin must not be able to pause");
+
+    let old_multiplier = client
+        .mock_auths(&[MockAuth {
+            address: &old_admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_global_multiplier",
+                args: (&3u32,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_set_global_multiplier(&3u32);
+    assert!(
+        old_multiplier.is_err(),
+        "old admin must not be able to set global multiplier"
+    );
+
+    client
+        .mock_auths(&[MockAuth {
+            address: &new_admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "pause",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .pause();
+    assert!(client.is_paused(), "new admin should be able to pause");
+}
+
+#[test]
 fn test_lock_assets_creates_position() {
     let t = setup(1, 1);
     let initial_balance = t.token.balance(&t.user);
@@ -459,6 +598,8 @@ fn test_unlock_blocked_before_min_lock_period() {
 fn test_unlock_allowed_after_min_lock_period() {
     let t = setup_with_lock_period(1, 1, 100);
     t.client.lock_assets(&t.user, &1_000);
+    advance_ledgers(&t.env, 100);
+    // Should succeed at exactly the boundary.
     advance_ledgers(&t.env, 100); // exactly at the boundary
                                   // Should succeed — no panic.
     t.client.unlock_assets(&t.user, &1_000);
