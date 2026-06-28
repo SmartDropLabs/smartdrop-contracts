@@ -4,11 +4,6 @@ mod types;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
 use types::{BoostConfig, DataKey, PoolError, Position, UserStake};
-use soroban_sdk::{
-    contract, contractimpl, symbol_short, token, Address, Env,
-};
-use types::{BoostConfig, DataKey, Position, UserStake};
-pub use types::PoolError;
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5s/ledger).
 const USER_TTL_THRESHOLD: u32 = 518_400;
@@ -35,11 +30,11 @@ fn require_initialized(env: &Env) -> Result<(), PoolError> {
     Ok(())
 }
 
-fn get_admin(env: &Env) -> Result<Address, PoolError> {
+fn get_admin(env: &Env) -> Address {
     env.storage()
         .instance()
         .get(&DataKey::Admin)
-        .ok_or(PoolError::NotInitialized)
+        .expect("contract not initialized")
 }
 
 fn get_global_multiplier(env: &Env) -> u32 {
@@ -137,14 +132,6 @@ fn remove_position(env: &Env, user: &Address) {
 // ── Boost calculation ─────────────────────────────────────────────────────────
 
 /// Compute the effective total stake for credit accrual.
-///
-/// Splits `amount` into a principal portion and a boosted virtual portion:
-///   boosted_amount  = amount * allocation_pct / 100
-///   principal_stake = amount - boosted_amount
-///   virtual_stake   = boosted_amount * multiplier
-///   total_stake     = principal_stake + virtual_stake
-///
-/// With no boost (allocation_pct = 0) total_stake == amount.
 fn compute_total_stake(amount: i128, allocation_pct: u32, multiplier: u32) -> i128 {
     let boosted = amount * allocation_pct as i128 / 100;
     let principal = amount - boosted;
@@ -164,7 +151,6 @@ fn compute_credits(
 }
 
 /// Checkpoint a user's earned credits into `credits_banked` and reset `start_ledger`.
-/// Call this before any change that affects the credit accrual rate (boost or stake amount).
 fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) {
     let allocation_pct = get_user_boost(env, user).unwrap_or(0);
     let multiplier = get_global_multiplier(env);
@@ -193,10 +179,6 @@ pub struct FarmingPool;
 #[contractimpl]
 impl FarmingPool {
     /// Initialise the contract. Must be called exactly once before any other function.
-    ///
-    /// - `global_multiplier`: initial boost multiplier (≥ 1). E.g. `2` = 2× boosted virtual stake.
-    /// - `credit_rate`: credits accrued per unit of effective stake per ledger.
-    /// - `min_lock_period`: minimum number of ledgers a position must be locked before unlock.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -228,8 +210,6 @@ impl FarmingPool {
         Ok(())
     }
 
-    // ── Lock / Unlock system ─────────────────────────────────────────────────
-
     /// Return the current admin address.
     pub fn admin(env: Env) -> Address {
         bump_instance(&env);
@@ -237,9 +217,6 @@ impl FarmingPool {
     }
 
     /// Admin: transfer admin rights to `new_admin`. Current admin must authorise.
-    ///
-    /// Supports key rotation and governance handoffs without redeploying the pool.
-    /// Emits a `("pool", "adm_xfr")` event with `(old_admin, new_admin)`.
     pub fn transfer_admin(env: Env, new_admin: Address) {
         let current = get_admin(&env);
         current.require_auth();
@@ -253,10 +230,7 @@ impl FarmingPool {
         );
     }
 
-    /// Lock `amount` tokens for the caller. If a prior position exists, credits are
-    /// checkpointed first and the new amount is added to the existing position.
-    ///
-    /// Emits a `("pool", "locked")` event with `(user, amount)`.
+    /// Lock `amount` tokens for the caller.
     pub fn lock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
@@ -278,7 +252,6 @@ impl FarmingPool {
             }
         };
 
-        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &user,
@@ -295,11 +268,7 @@ impl FarmingPool {
         Ok(())
     }
 
-    /// Unlock `amount` tokens for the caller. The minimum lock period (in ledgers) must
-    /// have elapsed since the position was created. Partial unlocks are supported; the
-    /// remaining balance stays locked.
-    ///
-    /// Emits a `("pool", "unlocked")` event with `(user, amount, total_credits)`.
+    /// Unlock `amount` tokens for the caller.
     pub fn unlock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
@@ -321,7 +290,6 @@ impl FarmingPool {
         let total_credits = pos.total_credits;
         pos.amount -= amount;
 
-        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &env.current_contract_address(),
@@ -354,7 +322,6 @@ impl FarmingPool {
             .ledger()
             .sequence()
             .saturating_sub(pos.checkpoint_ledger);
-        pos.total_credits + pos.amount * rate * elapsed as i128
         Ok(pos.total_credits + pos.amount * rate * elapsed as i128)
     }
 
@@ -365,15 +332,10 @@ impl FarmingPool {
         Ok(get_position(&env, &user))
     }
 
-    // ── Pause / Unpause ───────────────────────────────────────────────────────
-
-    /// Admin: pause the pool. While paused, `lock_assets`, `unlock_assets`, `stake`,
-    /// `unstake`, and `set_boost` are blocked.
-    ///
-    /// Emits a `("pool", "paused")` event.
+    /// Admin: pause the pool.
     pub fn pause(env: Env) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        get_admin(&env).require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Paused, &true);
         env.events()
@@ -381,12 +343,10 @@ impl FarmingPool {
         Ok(())
     }
 
-    /// Admin: unpause the pool, restoring normal operation.
-    ///
-    /// Emits a `("pool", "unpaused")` event.
+    /// Admin: unpause the pool.
     pub fn unpause(env: Env) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        get_admin(&env).require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.events()
@@ -402,11 +362,6 @@ impl FarmingPool {
     }
 
     /// Admin: return all tokens for `user` during an emergency.
-    ///
-    /// May only be called while the pool is paused. Banked credits from both the
-    /// lock position and the stake record are summed and written to `BankedCredits`
-    /// storage so a future claim mechanism can recover them. Emits an `emrg_exit`
-    /// event with `(admin, user, amount)`.
     pub fn emergency_withdraw(env: Env, user: Address) -> Result<i128, PoolError> {
         get_admin(&env).require_auth();
         if !pool_is_paused(&env) {
@@ -416,7 +371,8 @@ impl FarmingPool {
 
         let mut total_returned: i128 = 0;
         let mut banked_credits: i128 = 0;
-        let token = token::TokenClient::new(&env, &get_stake_token(&env));
+        let stake_token = get_stake_token(&env)?;
+        let token = token::TokenClient::new(&env, &stake_token);
 
         if let Some(pos) = get_position(&env, &user) {
             token.transfer(&env.current_contract_address(), &user, &pos.amount);
@@ -447,8 +403,7 @@ impl FarmingPool {
         Ok(total_returned)
     }
 
-    /// Return the credits preserved for `user` by a prior `emergency_withdraw`. Returns 0
-    /// if no emergency withdrawal has occurred for this user.
+    /// Return the credits preserved for `user` by a prior `emergency_withdraw`.
     pub fn get_banked_credits(env: Env, user: Address) -> i128 {
         bump_instance(&env);
         let key = DataKey::BankedCredits(user);
@@ -459,9 +414,7 @@ impl FarmingPool {
         val.unwrap_or(0)
     }
 
-    // ── Boost / Stake system (unchanged) ─────────────────────────────────────
-
-    /// Stake `amount` tokens. If a prior stake exists, earned credits are checkpointed first.
+    /// Stake `amount` tokens.
     pub fn stake(env: Env, from: Address, amount: i128) -> Result<(), PoolError> {
         from.require_auth();
         assert!(!pool_is_paused(&env), "pool is paused");
@@ -482,8 +435,6 @@ impl FarmingPool {
             }
         };
 
-        // Pull tokens from caller into the contract.
-        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &from,
@@ -506,8 +457,6 @@ impl FarmingPool {
         checkpoint(&env, &from, &mut stake);
         let total_credits = stake.credits_banked;
 
-        // Return staked tokens to caller.
-        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &env.current_contract_address(),
@@ -520,11 +469,6 @@ impl FarmingPool {
     }
 
     /// Set the caller's boost allocation percentage (1–100%).
-    ///
-    /// Credits earned under the previous allocation are checkpointed first so no
-    /// rewards are lost when the boost is updated.
-    ///
-    /// Emits a `boost_applied` event.
     pub fn set_boost(env: Env, user: Address, allocation_pct: u32) -> Result<(), PoolError> {
         user.require_auth();
         assert!(!pool_is_paused(&env), "pool is paused");
@@ -535,7 +479,6 @@ impl FarmingPool {
         );
         bump_instance(&env);
 
-        // Checkpoint before changing the allocation so prior credits are preserved.
         if let Some(mut stake) = get_user_stake(&env, &user) {
             checkpoint(&env, &user, &mut stake);
             set_user_stake(&env, &user, &stake);
@@ -554,9 +497,6 @@ impl FarmingPool {
     }
 
     /// Return the current boost configuration for `user`, or `None` if no boost is set.
-    ///
-    /// `BoostConfig.multiplier` reflects the current global multiplier.
-    /// `BoostConfig.allocation_pct` is the user's chosen allocation.
     pub fn get_boost_config(env: Env, user: Address) -> Result<Option<BoostConfig>, PoolError> {
         require_initialized(&env)?;
         bump_instance(&env);
@@ -569,13 +509,9 @@ impl FarmingPool {
     }
 
     /// Admin: update the global boost multiplier.
-    ///
-    /// Emits a `mult_set` event. Note that in-flight credits are not retroactively
-    /// recalculated; the new multiplier applies from the next ledger onward for
-    /// users whose boost configs are not checkpointed yet.
     pub fn set_global_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        get_admin(&env).require_auth();
         assert!(multiplier >= 1, "multiplier must be >= 1");
         bump_instance(&env);
 
@@ -601,8 +537,6 @@ impl FarmingPool {
         let multiplier = get_global_multiplier(&env);
         let rate = get_credit_rate(&env);
         let elapsed = env.ledger().sequence().saturating_sub(stake.start_ledger);
-        stake.credits_banked
-            + compute_credits(stake.amount, allocation_pct, multiplier, rate, elapsed)
         Ok(stake.credits_banked
             + compute_credits(stake.amount, allocation_pct, multiplier, rate, elapsed))
     }

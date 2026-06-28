@@ -881,3 +881,75 @@ fn test_emergency_withdraw_while_unpaused_returns_not_paused() {
     let result = t.client.try_emergency_withdraw(&t.user);
     assert!(matches!(result, Err(Ok(PoolError::NotPaused))));
 }
+
+// ── Property-Based Fuzz Testing (10,000 cases) ───────────────────────────────
+
+proptest::prelude::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(10000))]
+
+    #[test]
+    fn test_compute_credits_monotonicity(
+        amount in 0..=1_000_000_000_000_000_000_i128,
+        allocation_pct in 0..=100_u32,
+        multiplier in 1..=1000_u32,
+        credit_rate in 0..=1_000_000_000_i128,
+        ledgers1 in 0..=1_036_800_u32,
+        ledgers2 in 0..=1_036_800_u32,
+    ) {
+        let credits1 = compute_credits(amount, allocation_pct, multiplier, credit_rate, ledgers1);
+        let credits2 = compute_credits(amount, allocation_pct, multiplier, credit_rate, ledgers2);
+        if ledgers1 <= ledgers2 {
+            assert!(credits1 <= credits2);
+        } else {
+            assert!(credits1 >= credits2);
+        }
+    }
+
+    #[test]
+    fn test_compute_credits_zero_boost(
+        amount in 0..=1_000_000_000_000_000_000_i128,
+        multiplier in 1..=1000_u32,
+        credit_rate in 0..=1_000_000_000_i128,
+        ledgers_elapsed in 0..=1_036_800_u32,
+    ) {
+        let credits = compute_credits(amount, 0, multiplier, credit_rate, ledgers_elapsed);
+        let expected = amount * credit_rate * ledgers_elapsed as i128;
+        assert_eq!(credits, expected);
+    }
+
+    #[test]
+    fn test_compute_credits_full_boost_multiplier_one(
+        amount in 0..=1_000_000_000_000_000_000_i128,
+        credit_rate in 0..=1_000_000_000_i128,
+        ledgers_elapsed in 0..=1_036_800_u32,
+    ) {
+        let credits = compute_credits(amount, 100, 1, credit_rate, ledgers_elapsed);
+        let expected = amount * credit_rate * ledgers_elapsed as i128;
+        assert_eq!(credits, expected);
+    }
+
+    #[test]
+    fn test_compute_credits_boost_always_geq_unboosted(
+        amount in 0..=1_000_000_000_000_000_000_i128,
+        allocation_pct in 1..=100_u32,
+        multiplier in 1..=1000_u32,
+        credit_rate in 0..=1_000_000_000_i128,
+        ledgers_elapsed in 0..=1_036_800_u32,
+    ) {
+        let boosted = compute_credits(amount, allocation_pct, multiplier, credit_rate, ledgers_elapsed);
+        let unboosted = compute_credits(amount, 0, multiplier, credit_rate, ledgers_elapsed);
+        assert!(boosted >= unboosted);
+    }
+
+    #[test]
+    fn test_compute_credits_no_overflow_or_negative(
+        amount in 0..=1_000_000_000_000_000_000_i128,
+        allocation_pct in 0..=100_u32,
+        multiplier in 1..=1000_u32,
+        credit_rate in 0..=1_000_000_000_i128,
+        ledgers_elapsed in 0..=1_036_800_u32,
+    ) {
+        let credits = compute_credits(amount, allocation_pct, multiplier, credit_rate, ledgers_elapsed);
+        assert!(credits >= 0);
+    }
+}
