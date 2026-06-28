@@ -7,6 +7,11 @@ use soroban_sdk::{contracterror, contracttype, Address};
 pub enum PoolError {
     AlreadyInitialized = 1,
     NotInitialized = 2,
+    /// Returned by `emergency_withdraw` when the pool is not currently paused.
+    NotPaused     = 13,
+    /// Returned by `emergency_withdraw` when the user has no stake or locked position.
+    NoActiveStake = 14,
+    BelowMinimumStake = 15
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.
@@ -49,16 +54,6 @@ pub struct Position {
     pub total_credits: i128,
 }
 
-/// Error codes returned by pool operations.
-#[contracterror]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum PoolError {
-    /// Returned by `emergency_withdraw` when the pool is not currently paused.
-    NotPaused     = 13,
-    /// Returned by `emergency_withdraw` when the user has no stake or locked position.
-    NoActiveStake = 14,
-}
-
 /// Storage keys for all persistent and instance data.
 #[contracttype]
 pub enum DataKey {
@@ -79,4 +74,5 @@ pub enum DataKey {
     UserPosition(Address),
     /// Credits banked for a user after an emergency withdrawal, for future claim.
     BankedCredits(Address),
+    MinStakeAmount,
 }
