@@ -57,12 +57,14 @@ fn setup_with_lock_period(
 
     let contract_id = env.register(FarmingPool, ());
     let client = FarmingPoolClient::new(&env, &contract_id);
+    let min_stake_amount = 100;
     client.initialize(
         &admin,
         &asset.address(),
         &global_multiplier,
         &credit_rate,
         &min_lock_period,
+        &min_stake_amount
     );
 
     let token = TokenClient::new(&env, &asset.address());
@@ -98,7 +100,7 @@ fn setup_without_mocked_auth() -> (Env, Address, FarmingPoolClient<'static>, Add
 
     let contract_id = env.register(FarmingPool, ());
     let client = FarmingPoolClient::new(&env, &contract_id);
-    client.initialize(&admin, &asset.address(), &2u32, &1i128, &0u32);
+    client.initialize(&admin, &asset.address(), &2u32, &1i128, &0u32, &1_i128);
 
     let client = unsafe {
         core::mem::transmute::<FarmingPoolClient<'_>, FarmingPoolClient<'static>>(client)
@@ -880,4 +882,43 @@ fn test_emergency_withdraw_while_unpaused_returns_not_paused() {
 
     let result = t.client.try_emergency_withdraw(&t.user);
     assert!(matches!(result, Err(Ok(PoolError::NotPaused))));
+}
+
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_set_min_stake_amount_lock_assets() {
+    let t = setup(1, 1);
+
+    t.client.lock_assets(&t.user, &10i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_set_min_stake_amount_stake() {
+    let t = setup(1, 1);
+
+    t.client.stake(&t.user, &50);
+}
+
+#[test]
+fn test_set_min_stake_amount_lock_assets_pass() {
+    let t = setup(1, 1);
+
+    t.client.lock_assets(&t.user, &100i128);
+}
+
+
+#[test]
+fn test_set_min_stake_amount() {
+    let t = setup(1, 1);
+
+    let min_stake = t.client.get_min_stake_amount();
+    assert_eq!(min_stake, 100);
+
+    let amount = 200_i128;
+
+    t.client.set_min_stake_amount(&amount);
+    let min_stake = t.client.get_min_stake_amount();
+    assert_eq!(min_stake, amount);
 }
