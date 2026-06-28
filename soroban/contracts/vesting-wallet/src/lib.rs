@@ -1,4 +1,6 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::needless_borrows_for_generic_args)]
 
 mod types;
 

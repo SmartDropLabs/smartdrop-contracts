@@ -5,9 +5,9 @@ use soroban_sdk::{contracterror, contracttype};
 #[repr(u32)]
 pub enum VestingError {
     AlreadyInitialized = 1,
-    NotInitialized     = 2,
-    NotRevocable       = 3,
-    AlreadyRevoked     = 4,
+    NotInitialized = 2,
+    NotRevocable = 3,
+    AlreadyRevoked = 4,
 }
 
 /// Storage keys for all instance data in the vesting wallet.

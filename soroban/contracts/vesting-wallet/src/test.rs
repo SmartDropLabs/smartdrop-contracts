@@ -219,7 +219,10 @@ fn test_release_emits_event() {
     let t = setup(0, 100, 1_000);
     advance_ledgers(&t.env, 50);
     t.client.release();
-    assert!(!t.env.events().all().events().is_empty(), "event not emitted");
+    assert!(
+        !t.env.events().all().events().is_empty(),
+        "event not emitted"
+    );
 }
 
 // ── revoke tests ──────────────────────────────────────────────────────────────
@@ -311,7 +314,10 @@ fn test_revoke_emits_event() {
     let t = setup_revocable(0, 200, 1_000);
     advance_ledgers(&t.env, 100);
     t.client.revoke();
-    assert!(!t.env.events().all().events().is_empty(), "event not emitted");
+    assert!(
+        !t.env.events().all().events().is_empty(),
+        "event not emitted"
+    );
 }
 
 // ── released_amount test ──────────────────────────────────────────────────────
