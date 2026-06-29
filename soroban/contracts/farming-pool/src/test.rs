@@ -428,10 +428,82 @@ fn test_unstake_returns_tokens_and_credits() {
     t.client.set_boost(&t.user, &50u32);
     advance_ledgers(&t.env, 10);
 
-    let credits = t.client.unstake(&t.user);
+    let credits = t.client.unstake(&t.user, &1_000);
     assert_eq!(credits, 15_000); // 1500 * 10
     assert_eq!(t.token.balance(&t.user), initial_balance);
     assert!(t.client.get_stake(&t.user).is_none());
+}
+
+#[test]
+fn test_partial_unstake_preserves_remaining_and_credits() {
+    let t = setup(1, 1); // multiplier=1, no boost: credits = amount * rate * ledgers
+    let initial_balance = t.token.balance(&t.user);
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 10); // banked at checkpoint = 1000 * 1 * 10 = 10_000
+
+    let credits = t.client.unstake(&t.user, &250);
+
+    // Snapshot of banked credits is returned even on a partial exit.
+    assert_eq!(credits, 10_000);
+    // Remaining stake is preserved, not removed.
+    let stake = t.client.get_stake(&t.user).expect("stake should remain");
+    assert_eq!(stake.amount, 750);
+    // Only the unstaked amount is returned to the user.
+    assert_eq!(t.token.balance(&t.user), initial_balance - 750);
+}
+
+#[test]
+fn test_full_unstake_clears_storage() {
+    let t = setup(1, 1);
+    let initial_balance = t.token.balance(&t.user);
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+
+    let credits = t.client.unstake(&t.user, &1_000);
+
+    assert_eq!(credits, 10_000);
+    assert!(t.client.get_stake(&t.user).is_none());
+    assert_eq!(t.token.balance(&t.user), initial_balance);
+}
+
+#[test]
+fn test_unstake_rejects_insufficient_balance() {
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+
+    match t.client.try_unstake(&t.user, &1_001) {
+        Err(Ok(PoolError::InsufficientStake)) => {}
+        _ => panic!("expected PoolError::InsufficientStake"),
+    }
+    // Stake is untouched after a rejected unstake.
+    assert_eq!(t.client.get_stake(&t.user).unwrap().amount, 1_000);
+}
+
+#[test]
+fn test_unstake_rejects_non_positive_amount() {
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+
+    match t.client.try_unstake(&t.user, &0) {
+        Err(Ok(PoolError::InvalidAmount)) => {}
+        _ => panic!("expected PoolError::InvalidAmount for zero"),
+    }
+    match t.client.try_unstake(&t.user, &-100) {
+        Err(Ok(PoolError::InvalidAmount)) => {}
+        _ => panic!("expected PoolError::InvalidAmount for negative"),
+    }
+}
+
+#[test]
+fn test_unstake_emits_event() {
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 5);
+    t.client.unstake(&t.user, &400);
+    assert!(
+        !t.env.events().all().events().is_empty(),
+        "unstake event not emitted"
+    );
 }
 
 #[test]
@@ -913,7 +985,7 @@ fn test_pause_blocks_unstake() {
     let t = setup(1, 1);
     t.client.stake(&t.user, &1_000);
     t.client.pause();
-    assert!(t.client.try_unstake(&t.user).is_err());
+    assert!(t.client.try_unstake(&t.user, &1_000).is_err());
 }
 
 #[test]
@@ -922,7 +994,7 @@ fn test_unpause_restores_unstake() {
     t.client.stake(&t.user, &1_000);
     t.client.pause();
     t.client.unpause();
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert!(t.client.get_stake(&t.user).is_none());
 }
 
