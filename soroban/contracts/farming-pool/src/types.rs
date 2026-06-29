@@ -10,6 +10,7 @@ pub enum PoolError {
     InvalidCreditRate = 3,
     NotPaused = 13,
     NoActiveStake = 14,
+    NotWhitelisted = 15,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.
@@ -58,4 +59,7 @@ pub enum DataKey {
     UserStake(Address),
     UserPosition(Address),
     BankedCredits(Address),
+    // Whitelist keys
+    WhitelistEnabled,
+    Whitelisted(Address),
 }
