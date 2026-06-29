@@ -272,6 +272,116 @@ fn test_admin_sets_global_multiplier() {
 }
 
 #[test]
+fn test_set_credit_rate_updates_public_getters() {
+    let t = setup_with_lock_period(2, 1, 12);
+    t.client.set_credit_rate(&4i128);
+    t.client.set_min_lock_period(&25u32);
+
+    assert_eq!(t.client.credit_rate(), 4);
+    assert_eq!(t.client.get_credit_rate(), 4);
+    assert_eq!(t.client.min_lock_period(), 25);
+    assert_eq!(t.client.get_min_lock_period(), 25);
+
+    assert_eq!(
+        t.env.events().all(),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("rate_set").into_val(&t.env)
+                ],
+                (1i128, 4i128).into_val(&t.env),
+            ),
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("lock_set").into_val(&t.env)
+                ],
+                (12u32, 25u32).into_val(&t.env),
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_set_credit_rate_rejects_zero_with_typed_error() {
+    let t = setup(2, 1);
+    let result = t.client.try_set_credit_rate(&0i128);
+    assert!(matches!(result, Err(Ok(PoolError::InvalidCreditRate))));
+}
+
+#[test]
+fn test_set_credit_rate_requires_admin_auth() {
+    let (env, contract_id, client, _admin, user) = setup_without_mocked_auth();
+
+    let result = client
+        .mock_auths(&[MockAuth {
+            address: &user,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_credit_rate",
+                args: (&5i128,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_set_credit_rate(&5i128);
+
+    assert!(result.is_err(), "non-admin set_credit_rate must be rejected");
+}
+
+#[test]
+fn test_set_min_lock_period_requires_admin_auth() {
+    let (env, contract_id, client, _admin, user) = setup_without_mocked_auth();
+
+    let result = client
+        .mock_auths(&[MockAuth {
+            address: &user,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_min_lock_period",
+                args: (&9u32,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_set_min_lock_period(&9u32);
+
+    assert!(result.is_err(), "non-admin set_min_lock_period must be rejected");
+}
+
+#[test]
+fn test_credit_rate_change_does_not_retroactively_alter_staked_credits() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+
+    t.client.set_credit_rate(&3i128);
+    assert_eq!(t.client.get_credits(&t.user), 10_000);
+
+    t.client.stake(&t.user, &1); // checkpoints under the old rate
+    advance_ledgers(&t.env, 5);
+    assert_eq!(t.client.get_credits(&t.user), 25_015);
+}
+
+#[test]
+fn test_credit_rate_change_does_not_retroactively_alter_locked_credits() {
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+
+    t.client.set_credit_rate(&3i128);
+    assert_eq!(t.client.calculate_credits(&t.user), 10_000);
+
+    t.client.lock_assets(&t.user, &1); // checkpoints under the old rate
+    advance_ledgers(&t.env, 5);
+    assert_eq!(t.client.calculate_credits(&t.user), 25_015);
+}
+
+#[test]
 fn test_admin_multiplier_change_applies_from_next_checkpoint() {
     // 10 ledgers at 50% boost @ 2×, then user checkpoints (banking 2× credits),
     // then admin bumps to 3×, then 10 more ledgers at 50% @ 3×.
@@ -618,6 +728,32 @@ fn test_unlock_allowed_well_past_min_lock_period() {
 // ── calculate_credits tests ───────────────────────────────────────────────────
 
 #[test]
+fn test_min_lock_period_change_does_not_affect_existing_position_unlock_ledger() {
+    let t = setup_with_lock_period(1, 1, 100);
+    t.client.lock_assets(&t.user, &1_000);
+    let position = t.client.get_user_position(&t.user).unwrap();
+    assert_eq!(position.unlock_ledger, position.lock_ledger + 100);
+
+    t.client.set_min_lock_period(&5u32);
+    advance_ledgers(&t.env, 50);
+    assert!(t.client.try_unlock_assets(&t.user, &1_000).is_err());
+
+    advance_ledgers(&t.env, 50);
+    t.client.unlock_assets(&t.user, &1_000);
+    assert!(t.client.get_user_position(&t.user).is_none());
+}
+
+#[test]
+fn test_new_positions_use_updated_min_lock_period() {
+    let t = setup_with_lock_period(1, 1, 100);
+    t.client.set_min_lock_period(&5u32);
+    t.client.lock_assets(&t.user, &1_000);
+
+    let position = t.client.get_user_position(&t.user).unwrap();
+    assert_eq!(position.unlock_ledger, position.lock_ledger + 5);
+}
+
+#[test]
 fn test_calculate_credits_zero_without_position() {
     let t = setup(1, 1);
     assert_eq!(t.client.calculate_credits(&t.user), 0);
@@ -673,8 +809,10 @@ fn test_get_user_position_returns_correct_fields() {
     let pos = t.client.get_user_position(&t.user).unwrap();
     assert_eq!(pos.amount, 750);
     assert_eq!(pos.lock_ledger, start);
+    assert_eq!(pos.unlock_ledger, start);
     assert_eq!(pos.checkpoint_ledger, start);
     assert_eq!(pos.total_credits, 0);
+    assert_eq!(pos.credit_rate, 1);
 }
 
 #[test]
