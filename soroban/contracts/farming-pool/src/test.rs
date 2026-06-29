@@ -275,13 +275,6 @@ fn test_admin_sets_global_multiplier() {
 fn test_set_credit_rate_updates_public_getters() {
     let t = setup_with_lock_period(2, 1, 12);
     t.client.set_credit_rate(&4i128);
-    t.client.set_min_lock_period(&25u32);
-
-    assert_eq!(t.client.credit_rate(), 4);
-    assert_eq!(t.client.get_credit_rate(), 4);
-    assert_eq!(t.client.min_lock_period(), 25);
-    assert_eq!(t.client.get_min_lock_period(), 25);
-
     assert_eq!(
         t.env.events().all(),
         soroban_sdk::vec![
@@ -294,7 +287,15 @@ fn test_set_credit_rate_updates_public_getters() {
                     soroban_sdk::symbol_short!("rate_set").into_val(&t.env)
                 ],
                 (1i128, 4i128).into_val(&t.env),
-            ),
+            )
+        ]
+    );
+
+    t.client.set_min_lock_period(&25u32);
+    assert_eq!(
+        t.env.events().all(),
+        soroban_sdk::vec![
+            &t.env,
             (
                 t.contract_id.clone(),
                 soroban_sdk::vec![
@@ -306,6 +307,11 @@ fn test_set_credit_rate_updates_public_getters() {
             )
         ]
     );
+
+    assert_eq!(t.client.credit_rate(), 4);
+    assert_eq!(t.client.get_credit_rate(), 4);
+    assert_eq!(t.client.min_lock_period(), 25);
+    assert_eq!(t.client.get_min_lock_period(), 25);
 }
 
 #[test]
@@ -331,7 +337,10 @@ fn test_set_credit_rate_requires_admin_auth() {
         }])
         .try_set_credit_rate(&5i128);
 
-    assert!(result.is_err(), "non-admin set_credit_rate must be rejected");
+    assert!(
+        result.is_err(),
+        "non-admin set_credit_rate must be rejected"
+    );
 }
 
 #[test]
@@ -350,7 +359,10 @@ fn test_set_min_lock_period_requires_admin_auth() {
         }])
         .try_set_min_lock_period(&9u32);
 
-    assert!(result.is_err(), "non-admin set_min_lock_period must be rejected");
+    assert!(
+        result.is_err(),
+        "non-admin set_min_lock_period must be rejected"
+    );
 }
 
 #[test]
@@ -1005,8 +1017,14 @@ fn test_emergency_withdraw_while_paused() {
     // 600 locked + 400 staked = 1_000 total tokens returned.
     assert_eq!(returned, 1_000);
     assert_eq!(t.token.balance(&t.user), initial_balance);
-    assert!(t.client.get_user_position(&t.user).is_none(), "position should be cleared");
-    assert!(t.client.get_stake(&t.user).is_none(), "stake should be cleared");
+    assert!(
+        t.client.get_user_position(&t.user).is_none(),
+        "position should be cleared"
+    );
+    assert!(
+        t.client.get_stake(&t.user).is_none(),
+        "stake should be cleared"
+    );
     // 5_000 (lock credits) + 3_000 (stake credits) preserved.
     assert_eq!(t.client.get_banked_credits(&t.user), 8_000);
 }

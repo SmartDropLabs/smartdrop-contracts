@@ -486,10 +486,12 @@ impl FarmingPool {
     pub fn get_boost_config(env: Env, user: Address) -> Result<Option<BoostConfig>, PoolError> {
         require_initialized(&env)?;
         bump_instance(&env);
-        Ok(get_user_boost(&env, &user).map(|allocation_pct| BoostConfig {
-            multiplier: read_global_multiplier(&env),
-            allocation_pct,
-        }))
+        Ok(
+            get_user_boost(&env, &user).map(|allocation_pct| BoostConfig {
+                multiplier: read_global_multiplier(&env),
+                allocation_pct,
+            }),
+        )
     }
 
     pub fn set_global_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
@@ -517,7 +519,9 @@ impl FarmingPool {
         bump_instance(&env);
 
         let old_rate = read_credit_rate(&env);
-        env.storage().instance().set(&DataKey::CreditRate, &new_rate);
+        env.storage()
+            .instance()
+            .set(&DataKey::CreditRate, &new_rate);
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("rate_set")),
             (old_rate, new_rate),
