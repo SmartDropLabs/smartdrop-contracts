@@ -10,6 +10,8 @@ pub enum PoolError {
     InvalidCreditRate = 3,
     NotPaused = 13,
     NoActiveStake = 14,
+    InsufficientStake = 15,
+    InvalidAmount = 16,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.

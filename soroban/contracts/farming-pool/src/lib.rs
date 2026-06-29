@@ -435,25 +435,45 @@ impl FarmingPool {
         Ok(())
     }
 
-    pub fn unstake(env: Env, from: Address) -> Result<i128, PoolError> {
+    pub fn unstake(env: Env, from: Address, amount: i128) -> Result<i128, PoolError> {
         from.require_auth();
         assert!(!pool_is_paused(&env), "pool is paused");
         require_initialized(&env)?;
         bump_instance(&env);
 
-        let mut stake = get_user_stake(&env, &from).expect("no active stake");
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+
+        let mut stake = get_user_stake(&env, &from).ok_or(PoolError::NoActiveStake)?;
+        if amount > stake.amount {
+            return Err(PoolError::InsufficientStake);
+        }
+
+        // Checkpoint before mutating `amount` so credits accrue against the full
+        // staked balance up to this ledger.
         checkpoint(&env, &from, &mut stake);
-        let total_credits = stake.credits_banked;
+        let credits_snapshot = stake.credits_banked;
+        stake.amount -= amount;
 
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &env.current_contract_address(),
             &from,
-            &stake.amount,
+            &amount,
         );
 
-        remove_user_stake(&env, &from);
-        Ok(total_credits)
+        if stake.amount == 0 {
+            remove_user_stake(&env, &from);
+        } else {
+            set_user_stake(&env, &from, &stake);
+        }
+
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("unstaked")),
+            (from, amount, credits_snapshot),
+        );
+        Ok(credits_snapshot)
     }
 
     pub fn set_boost(env: Env, user: Address, allocation_pct: u32) -> Result<(), PoolError> {
