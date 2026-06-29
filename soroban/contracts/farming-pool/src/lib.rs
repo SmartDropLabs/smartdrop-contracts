@@ -2,11 +2,7 @@
 
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
-use types::{BoostConfig, DataKey, PoolError, Position, UserStake};
-use soroban_sdk::{
-    contract, contractimpl, symbol_short, token, Address, Env,
-};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Vec};
 use types::{BoostConfig, DataKey, Position, UserStake};
 pub use types::PoolError;
 
@@ -134,6 +130,22 @@ fn remove_position(env: &Env, user: &Address) {
         .remove(&DataKey::UserPosition(user.clone()));
 }
 
+fn whitelist_enabled(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::WhitelistEnabled)
+        .unwrap_or(false)
+}
+
+fn is_user_whitelisted(env: &Env, user: &Address) -> bool {
+    let key = DataKey::Whitelisted(user.clone());
+    let ok = env.storage().persistent().get(&key).unwrap_or(false);
+    if ok {
+        bump_user(env, &key);
+    }
+    ok
+}
+
 // ── Boost calculation ─────────────────────────────────────────────────────────
 
 /// Compute the effective total stake for credit accrual.
@@ -233,7 +245,7 @@ impl FarmingPool {
     /// Return the current admin address.
     pub fn admin(env: Env) -> Address {
         bump_instance(&env);
-        get_admin(&env)
+        get_admin(&env).unwrap()
     }
 
     /// Admin: transfer admin rights to `new_admin`. Current admin must authorise.
@@ -241,7 +253,7 @@ impl FarmingPool {
     /// Supports key rotation and governance handoffs without redeploying the pool.
     /// Emits a `("pool", "adm_xfr")` event with `(old_admin, new_admin)`.
     pub fn transfer_admin(env: Env, new_admin: Address) {
-        let current = get_admin(&env);
+        let current = get_admin(&env).unwrap();
         current.require_auth();
         bump_instance(&env);
 
@@ -262,6 +274,11 @@ impl FarmingPool {
         require_initialized(&env)?;
         assert!(!pool_is_paused(&env), "pool is paused");
         assert!(amount > 0, "amount must be positive");
+
+        if whitelist_enabled(&env) && !is_user_whitelisted(&env, &user) {
+            return Err(PoolError::NotWhitelisted);
+        }
+
         bump_instance(&env);
 
         let current = env.ledger().sequence();
@@ -278,7 +295,6 @@ impl FarmingPool {
             }
         };
 
-        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &user,
@@ -321,7 +337,6 @@ impl FarmingPool {
         let total_credits = pos.total_credits;
         pos.amount -= amount;
 
-        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &env.current_contract_address(),
@@ -354,7 +369,6 @@ impl FarmingPool {
             .ledger()
             .sequence()
             .saturating_sub(pos.checkpoint_ledger);
-        pos.total_credits + pos.amount * rate * elapsed as i128
         Ok(pos.total_credits + pos.amount * rate * elapsed as i128)
     }
 
@@ -408,7 +422,7 @@ impl FarmingPool {
     /// storage so a future claim mechanism can recover them. Emits an `emrg_exit`
     /// event with `(admin, user, amount)`.
     pub fn emergency_withdraw(env: Env, user: Address) -> Result<i128, PoolError> {
-        get_admin(&env).require_auth();
+        get_admin(&env)?.require_auth();
         if !pool_is_paused(&env) {
             return Err(PoolError::NotPaused);
         }
@@ -416,7 +430,7 @@ impl FarmingPool {
 
         let mut total_returned: i128 = 0;
         let mut banked_credits: i128 = 0;
-        let token = token::TokenClient::new(&env, &get_stake_token(&env));
+        let token = token::TokenClient::new(&env, &get_stake_token(&env).unwrap());
 
         if let Some(pos) = get_position(&env, &user) {
             token.transfer(&env.current_contract_address(), &user, &pos.amount);
@@ -442,7 +456,7 @@ impl FarmingPool {
 
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("emrg_exit")),
-            (get_admin(&env), user, total_returned),
+            (get_admin(&env).unwrap(), user, total_returned),
         );
         Ok(total_returned)
     }
@@ -459,7 +473,71 @@ impl FarmingPool {
         val.unwrap_or(0)
     }
 
-    // ── Boost / Stake system (unchanged) ─────────────────────────────────────
+    // ── Whitelist system ──────────────────────────────────────────────────────
+
+    /// Admin: enable whitelist mode. Admin must authorise.
+    pub fn enable_whitelist(env: Env) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        bump_instance(&env);
+        env.storage().instance().set(&DataKey::WhitelistEnabled, &true);
+        Ok(())
+    }
+
+    /// Admin: disable whitelist mode. Admin must authorise.
+    pub fn disable_whitelist(env: Env) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        bump_instance(&env);
+        env.storage().instance().set(&DataKey::WhitelistEnabled, &false);
+        Ok(())
+    }
+
+    /// Admin: add `user` to the whitelist. Admin must authorise.
+    pub fn add_to_whitelist(env: Env, user: Address) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        bump_instance(&env);
+
+        let key = DataKey::Whitelisted(user.clone());
+        env.storage().persistent().set(&key, &true);
+        bump_user(&env, &key);
+        Ok(())
+    }
+
+    /// Admin: remove `user` from the whitelist. Admin must authorise.
+    pub fn remove_from_whitelist(env: Env, user: Address) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        bump_instance(&env);
+
+        let key = DataKey::Whitelisted(user.clone());
+        env.storage().persistent().remove(&key);
+        Ok(())
+    }
+
+    /// Public: check if `user` is whitelisted. Bumps TTL of the entry if whitelisted.
+    pub fn is_whitelisted(env: Env, user: Address) -> bool {
+        bump_instance(&env);
+        is_user_whitelisted(&env, &user)
+    }
+
+    /// Admin: batch add multiple `users` to the whitelist. Capped at 50 addresses per call. Admin must authorise.
+    pub fn batch_add_to_whitelist(env: Env, users: Vec<Address>) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        assert!(users.len() <= 50, "max 50 addresses per call");
+        bump_instance(&env);
+
+        for user in users.iter() {
+            let key = DataKey::Whitelisted(user.clone());
+            env.storage().persistent().set(&key, &true);
+            bump_user(&env, &key);
+        }
+        Ok(())
+    }
+
+    // ── Boost / Stake system ─────────────────────────────────────────────────
 
     /// Stake `amount` tokens. If a prior stake exists, earned credits are checkpointed first.
     pub fn stake(env: Env, from: Address, amount: i128) -> Result<(), PoolError> {
@@ -467,6 +545,11 @@ impl FarmingPool {
         assert!(!pool_is_paused(&env), "pool is paused");
         require_initialized(&env)?;
         assert!(amount > 0, "amount must be positive");
+
+        if whitelist_enabled(&env) && !is_user_whitelisted(&env, &from) {
+            return Err(PoolError::NotWhitelisted);
+        }
+
         bump_instance(&env);
 
         let current = env.ledger().sequence();
@@ -483,7 +566,6 @@ impl FarmingPool {
         };
 
         // Pull tokens from caller into the contract.
-        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &from,
@@ -507,7 +589,6 @@ impl FarmingPool {
         let total_credits = stake.credits_banked;
 
         // Return staked tokens to caller.
-        token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &env.current_contract_address(),
@@ -601,8 +682,6 @@ impl FarmingPool {
         let multiplier = get_global_multiplier(&env);
         let rate = get_credit_rate(&env);
         let elapsed = env.ledger().sequence().saturating_sub(stake.start_ledger);
-        stake.credits_banked
-            + compute_credits(stake.amount, allocation_pct, multiplier, rate, elapsed)
         Ok(stake.credits_banked
             + compute_credits(stake.amount, allocation_pct, multiplier, rate, elapsed))
     }
