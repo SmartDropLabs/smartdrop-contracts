@@ -29,11 +29,11 @@ fn require_initialized(env: &Env) -> Result<(), PoolError> {
     Ok(())
 }
 
-fn get_admin(env: &Env) -> Result<Address, PoolError> {
+fn get_admin(env: &Env) -> Address {
     env.storage()
         .instance()
         .get(&DataKey::Admin)
-        .ok_or(PoolError::NotInitialized)
+        .expect("contract not initialized")
 }
 
 fn read_global_multiplier(env: &Env) -> u32 {
@@ -128,6 +128,9 @@ fn remove_position(env: &Env, user: &Address) {
         .remove(&DataKey::UserPosition(user.clone()));
 }
 
+// ── Boost calculation ─────────────────────────────────────────────────────────
+
+/// Compute the effective total stake for credit accrual.
 fn compute_total_stake(amount: i128, allocation_pct: u32, multiplier: u32) -> i128 {
     let boosted = amount * allocation_pct as i128 / 100;
     let principal = amount - boosted;
@@ -145,6 +148,7 @@ fn compute_credits(
     compute_total_stake(amount, allocation_pct, multiplier) * credit_rate * ledgers_elapsed as i128
 }
 
+/// Checkpoint a user's earned credits into `credits_banked` and reset `start_ledger`.
 fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) {
     let allocation_pct = get_user_boost(env, user).unwrap_or(0);
     let multiplier = read_global_multiplier(env);
@@ -174,6 +178,7 @@ pub struct FarmingPool;
 
 #[contractimpl]
 impl FarmingPool {
+    /// Initialise the contract. Must be called exactly once before any other function.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -205,13 +210,15 @@ impl FarmingPool {
         Ok(())
     }
 
+    /// Return the current admin address.
     pub fn admin(env: Env) -> Address {
         bump_instance(&env);
-        get_admin(&env).unwrap()
+        get_admin(&env)
     }
 
+    /// Admin: transfer admin rights to `new_admin`. Current admin must authorise.
     pub fn transfer_admin(env: Env, new_admin: Address) {
-        let current = get_admin(&env).unwrap();
+        let current = get_admin(&env);
         current.require_auth();
         bump_instance(&env);
 
@@ -222,6 +229,7 @@ impl FarmingPool {
         );
     }
 
+    /// Lock `amount` tokens for the caller.
     pub fn lock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
@@ -262,6 +270,7 @@ impl FarmingPool {
         Ok(())
     }
 
+    /// Unlock `amount` tokens for the caller.
     pub fn unlock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
@@ -322,9 +331,10 @@ impl FarmingPool {
         Ok(get_position(&env, &user))
     }
 
+    /// Admin: pause the pool.
     pub fn pause(env: Env) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        get_admin(&env).require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Paused, &true);
         env.events()
@@ -332,9 +342,10 @@ impl FarmingPool {
         Ok(())
     }
 
+    /// Admin: unpause the pool.
     pub fn unpause(env: Env) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        get_admin(&env).require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.events()
@@ -348,9 +359,10 @@ impl FarmingPool {
         Ok(pool_is_paused(&env))
     }
 
+    /// Admin: return all tokens for `user` during an emergency.
     pub fn emergency_withdraw(env: Env, user: Address) -> Result<i128, PoolError> {
         require_initialized(&env)?;
-        let admin = get_admin(&env)?;
+        let admin = get_admin(&env);
         admin.require_auth();
         if !pool_is_paused(&env) {
             return Err(PoolError::NotPaused);
@@ -391,6 +403,7 @@ impl FarmingPool {
         Ok(total_returned)
     }
 
+    /// Return the credits preserved for `user` by a prior `emergency_withdraw`.
     pub fn get_banked_credits(env: Env, user: Address) -> i128 {
         bump_instance(&env);
         let key = DataKey::BankedCredits(user);
@@ -401,6 +414,7 @@ impl FarmingPool {
         value.unwrap_or(0)
     }
 
+    /// Stake `amount` tokens.
     pub fn stake(env: Env, from: Address, amount: i128) -> Result<(), PoolError> {
         from.require_auth();
         assert!(!pool_is_paused(&env), "pool is paused");
@@ -456,6 +470,7 @@ impl FarmingPool {
         Ok(total_credits)
     }
 
+    /// Set the caller's boost allocation percentage (1–100%).
     pub fn set_boost(env: Env, user: Address, allocation_pct: u32) -> Result<(), PoolError> {
         user.require_auth();
         assert!(!pool_is_paused(&env), "pool is paused");
@@ -483,6 +498,7 @@ impl FarmingPool {
         Ok(())
     }
 
+    /// Return the current boost configuration for `user`, or `None` if no boost is set.
     pub fn get_boost_config(env: Env, user: Address) -> Result<Option<BoostConfig>, PoolError> {
         require_initialized(&env)?;
         bump_instance(&env);
@@ -494,9 +510,10 @@ impl FarmingPool {
         )
     }
 
+    /// Admin: update the global boost multiplier.
     pub fn set_global_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        get_admin(&env).require_auth();
         assert!(multiplier >= 1, "multiplier must be >= 1");
         bump_instance(&env);
 
@@ -512,7 +529,7 @@ impl FarmingPool {
 
     pub fn set_credit_rate(env: Env, new_rate: i128) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        get_admin(&env).require_auth();
         if new_rate <= 0 {
             return Err(PoolError::InvalidCreditRate);
         }
@@ -531,7 +548,7 @@ impl FarmingPool {
 
     pub fn set_min_lock_period(env: Env, new_period: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        get_admin(&env).require_auth();
         bump_instance(&env);
 
         let old_period = read_min_lock_period(&env);
