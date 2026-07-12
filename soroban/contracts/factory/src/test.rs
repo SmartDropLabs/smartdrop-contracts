@@ -28,8 +28,19 @@ mod farming_pool_wasm {
     soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/farming_pool.wasm");
 }
 
+/// A distinct, valid contract WASM used to prove that `upgrade_pool` changes
+/// the registered pool's executable hash rather than merely re-installing its
+/// current farming-pool WASM.
+mod replacement_wasm {
+    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/factory.wasm");
+}
+
 fn upload_farming_pool_wasm(env: &Env) -> BytesN<32> {
     env.deployer().upload_contract_wasm(farming_pool_wasm::WASM)
+}
+
+fn upload_replacement_wasm(env: &Env) -> BytesN<32> {
+    env.deployer().upload_contract_wasm(replacement_wasm::WASM)
 }
 
 /// Builds an initialised factory using the real farming-pool WASM.
@@ -301,6 +312,95 @@ fn test_transfer_admin_emits_event_with_old_and_new_admin() {
             )
         ]
     );
+}
+
+// ── upgrade_pool ──────────────────────────────────────────────────────────────
+
+#[test]
+fn test_upgrade_pool_hot_swaps_registered_pool_without_changing_factory_hash() {
+    let t = setup();
+    let original_factory_hash = t.client.pool_wasm_hash();
+    let pool_id = t
+        .client
+        .create_pool(&Address::generate(&t.env), &1_728_000u128, &2u32, &10u64);
+    let pool_addr = t.client.get_pool(&pool_id).address;
+
+    let new_wasm_hash = upload_replacement_wasm(&t.env);
+    t.client.upgrade_pool(&pool_id, &new_wasm_hash);
+
+    assert_eq!(
+        t.env.events().all(),
+        vec![
+            &t.env,
+            (
+                pool_addr.clone(),
+                vec![
+                    &t.env,
+                    symbol_short!("pool").into_val(&t.env),
+                    symbol_short!("upgraded").into_val(&t.env),
+                ],
+                new_wasm_hash.clone().into_val(&t.env),
+            ),
+            (
+                t.factory_addr.clone(),
+                vec![
+                    &t.env,
+                    symbol_short!("factory").into_val(&t.env),
+                    symbol_short!("pool_upg").into_val(&t.env),
+                ],
+                (pool_id, pool_addr.clone(), new_wasm_hash.clone()).into_val(&t.env),
+            )
+        ]
+    );
+
+    assert_eq!(
+        t.client.pool_wasm_hash(),
+        original_factory_hash,
+        "pool-by-pool upgrades must not replace the factory default hash"
+    );
+    assert_eq!(
+        pool_record_ttl(&t.env, &t.factory_addr, pool_id),
+        TTL_EXTEND_TO
+    );
+    let record = t.client.get_pool(&pool_id);
+    assert_eq!(record.address, pool_addr);
+}
+
+#[test]
+fn test_upgrade_pool_missing_pool_returns_not_found() {
+    let t = setup();
+    let new_wasm_hash = t.wasm_hash.clone();
+    assert_eq!(
+        t.client.try_upgrade_pool(&0u32, &new_wasm_hash),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
+}
+
+#[test]
+fn test_upgrade_pool_requires_factory_admin_auth() {
+    let t = setup();
+    let pool_id = t
+        .client
+        .create_pool(&Address::generate(&t.env), &1_728_000u128, &2u32, &10u64);
+
+    let not_admin = Address::generate(&t.env);
+    let new_wasm_hash = t.wasm_hash.clone();
+    let args = (&pool_id, &new_wasm_hash).into_val(&t.env);
+    let invoke = MockAuthInvoke {
+        contract: &t.factory_addr,
+        fn_name: "upgrade_pool",
+        args,
+        sub_invokes: &[],
+    };
+    let result = t
+        .client
+        .mock_auths(&[MockAuth {
+            address: &not_admin,
+            invoke: &invoke,
+        }])
+        .try_upgrade_pool(&pool_id, &new_wasm_hash);
+
+    assert!(result.is_err(), "only the factory admin may upgrade pools");
 }
 
 // ── create_pool auth gate ─────────────────────────────────────────────────────
@@ -651,7 +751,9 @@ fn test_create_pool_configures_deployed_pool_matching_factory_record() {
     let t = setup();
     let asset = Address::generate(&t.env);
 
-    let id = t.client.create_pool(&asset, &17_280_000u128, &3u32, &86_400u64);
+    let id = t
+        .client
+        .create_pool(&asset, &17_280_000u128, &3u32, &86_400u64);
     let record = t.client.get_pool(&id);
 
     assert_eq!(record.credit_rate, 1_000);
