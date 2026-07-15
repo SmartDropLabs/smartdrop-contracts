@@ -216,6 +216,7 @@ impl FarmingPool {
         bump_instance(&env);
 
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("adm_xfr")),
             (current, new_admin),
@@ -250,11 +251,12 @@ impl FarmingPool {
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &user,
-            &env.current_contract_address(),
+            env.current_contract_address(),
             &amount,
         );
 
         set_position(&env, &user, &position);
+        #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("locked")),
             (user, amount),
@@ -295,6 +297,7 @@ impl FarmingPool {
             set_position(&env, &user, &position);
         }
 
+        #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("unlocked")),
             (user, amount, total_credits),
@@ -327,6 +330,7 @@ impl FarmingPool {
         get_admin(&env)?.require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Paused, &true);
+        #[allow(deprecated)]
         env.events()
             .publish((symbol_short!("pool"), symbol_short!("paused")), ());
         Ok(())
@@ -337,6 +341,7 @@ impl FarmingPool {
         get_admin(&env)?.require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Paused, &false);
+        #[allow(deprecated)]
         env.events()
             .publish((symbol_short!("pool"), symbol_short!("unpaused")), ());
         Ok(())
@@ -384,6 +389,7 @@ impl FarmingPool {
             set_banked_credits(&env, &user, banked_credits);
         }
 
+        #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("emrg_exit")),
             (admin, user, total_returned),
@@ -427,7 +433,7 @@ impl FarmingPool {
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &from,
-            &env.current_contract_address(),
+            env.current_contract_address(),
             &amount,
         );
 
@@ -461,7 +467,7 @@ impl FarmingPool {
         assert!(!pool_is_paused(&env), "pool is paused");
         require_initialized(&env)?;
         assert!(
-            allocation_pct >= 1 && allocation_pct <= 100,
+            (1..=100).contains(&allocation_pct),
             "allocation_pct must be 1-100"
         );
         bump_instance(&env);
@@ -476,6 +482,7 @@ impl FarmingPool {
         bump_user(&env, &key);
 
         let multiplier = read_global_multiplier(&env);
+        #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("boost"), symbol_short!("applied")),
             (user, allocation_pct, multiplier),
@@ -503,6 +510,7 @@ impl FarmingPool {
         env.storage()
             .instance()
             .set(&DataKey::GlobalMultiplier, &multiplier);
+        #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("boost"), symbol_short!("mult_set")),
             multiplier,
@@ -522,6 +530,7 @@ impl FarmingPool {
         env.storage()
             .instance()
             .set(&DataKey::CreditRate, &new_rate);
+        #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("rate_set")),
             (old_rate, new_rate),
@@ -538,6 +547,7 @@ impl FarmingPool {
         env.storage()
             .instance()
             .set(&DataKey::MinLockPeriod, &new_period);
+        #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("lock_set")),
             (old_period, new_period),
