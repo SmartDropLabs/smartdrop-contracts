@@ -567,7 +567,7 @@ fn test_get_pool_bumps_pool_record_ttl() {
     advance_ledgers(&t.env, TTL_EXTEND_TO - TTL_THRESHOLD + 1);
     assert!(pool_record_ttl(&t.env, &t.factory_addr, id) < TTL_THRESHOLD);
 
-    assert_eq!(t.client.try_get_pool(&id).is_ok(), true);
+    assert!(t.client.try_get_pool(&id).is_ok());
     assert_eq!(pool_record_ttl(&t.env, &t.factory_addr, id), TTL_EXTEND_TO);
 }
 
