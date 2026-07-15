@@ -2,7 +2,9 @@
 
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, Symbol, Val, Vec};
+use soroban_sdk::{
+    contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, Symbol, Val, Vec,
+};
 use types::{DataKey, FactoryError, ListPoolsResponse, PoolRecord};
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
@@ -229,6 +231,9 @@ impl Factory {
             .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
 
         let pool_id: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap();
+        let next_count = pool_id
+            .checked_add(1)
+            .ok_or(FactoryError::PoolCountOverflow)?;
         let wasm_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
         let salt = pool_salt(&env, pool_id);
 
@@ -268,7 +273,7 @@ impl Factory {
         bump_pool(&env, pool_id);
         env.storage()
             .instance()
-            .set(&DataKey::PoolCount, &(pool_id + 1));
+            .set(&DataKey::PoolCount, &next_count);
 
         // Emit enriched event so indexers get the full pool parameters in one shot.
         #[allow(deprecated)]

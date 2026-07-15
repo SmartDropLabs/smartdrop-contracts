@@ -496,6 +496,31 @@ fn test_create_pool_increments_count_after_each_pool() {
 }
 
 #[test]
+fn test_create_pool_returns_typed_error_when_pool_count_overflows() {
+    let t = setup();
+
+    t.env.as_contract(&t.factory_addr, || {
+        t.env
+            .storage()
+            .instance()
+            .set(&DataKey::PoolCount, &u32::MAX);
+    });
+
+    let result =
+        t.client
+            .try_create_pool(&Address::generate(&t.env), &1_728_000u128, &2u32, &100u64);
+
+    assert_eq!(result, Err(Ok(FactoryError::PoolCountOverflow)));
+    assert_eq!(t.client.pool_count(), u32::MAX);
+    assert_eq!(
+        t.env.as_contract(&t.factory_addr, || {
+            t.env.storage().persistent().has(&DataKey::Pool(u32::MAX))
+        }),
+        false
+    );
+}
+
+#[test]
 fn test_create_pool_uses_deterministic_pool_addresses() {
     let t = setup();
     let asset = Address::generate(&t.env);
@@ -651,7 +676,9 @@ fn test_create_pool_configures_deployed_pool_matching_factory_record() {
     let t = setup();
     let asset = Address::generate(&t.env);
 
-    let id = t.client.create_pool(&asset, &17_280_000u128, &3u32, &86_400u64);
+    let id = t
+        .client
+        .create_pool(&asset, &17_280_000u128, &3u32, &86_400u64);
     let record = t.client.get_pool(&id);
 
     assert_eq!(record.credit_rate, 1_000);
