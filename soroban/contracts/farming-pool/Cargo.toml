@@ -8,6 +8,11 @@ publish = false
 crate-type = ["lib", "cdylib"]
 doctest    = false
 
+[features]
+# Enables `farming_pool::WASM` — the compiled contract bytes for use in
+# cross-crate integration tests (e.g. factory's test suite).
+testutils = ["soroban-sdk/testutils"]
+
 [dependencies]
 soroban-sdk = { workspace = true }
 

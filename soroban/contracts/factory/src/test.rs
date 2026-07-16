@@ -7,8 +7,12 @@ use soroban_sdk::{
         storage::Persistent as _, Address as _, AuthorizedFunction, AuthorizedInvocation,
         Events as _, Ledger, MockAuth, MockAuthInvoke,
     },
+    token::{StellarAssetClient, TokenClient},
     vec, Address, BytesN, Env, IntoVal, Symbol,
 };
+
+use farming_pool::{FarmingPoolClient, PoolError as PoolContractError};
+
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -640,5 +644,41 @@ fn test_old_admin_cannot_create_pool_after_transfer_but_new_admin_can() {
         .create_pool(&new_asset, &200u128, &20u64);
 
     assert_eq!(new_id, 0);
-    assert_eq!(t.client.pool_count(), 1);
+assert_eq!(t.client.pool_count(), 1);
 }
+
+#[test]
+fn test_create_pool_deploys_uninitialized_real_farming_pool() {
+    // Root-cause regression test:
+    // factory::create_pool deploys the farming-pool WASM with init args `()` and
+    // never calls FarmingPool::initialize, so any initialized-only entrypoint
+    // must return PoolError::NotInitialized.
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let factory_addr = env.register(Factory, ());
+
+    // Upload the mock WASM hash matching the real farming-pool contract WASM.
+    // This test purposefully asserts that the deployed pool is *not* initialized.
+    //
+    // NOTE: We cannot reuse `MOCK_POOL_WASM` here, because that stub contract does
+    // not implement FarmingPool entrypoints.
+    let wasm_hash = env.deployer().upload_contract_wasm(farming_pool::WASM);
+    let client = FactoryClient::new(&env, &factory_addr);
+    client.initialize(&admin, &wasm_hash);
+
+    let asset = Address::generate(&env);
+    let pool_id = client.create_pool(&asset, &100u128, &10u64);
+    let record = client.get_pool(&pool_id);
+
+    let pool_client = FarmingPoolClient::new(&env, &record.address);
+
+    // Any initialized-only function should fail with NotInitialized.
+    // `stake` also requires the caller to be auth'd; env.mock_all_auths() satisfies that.
+    let user = Address::generate(&env);
+    let res = pool_client.try_stake(&user, &1_000i128);
+    assert_eq!(res, Err(Ok(PoolContractError::NotInitialized)));
+}
+
