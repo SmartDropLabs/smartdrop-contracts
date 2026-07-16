@@ -258,8 +258,8 @@ fn test_list_pools_caps_limit_at_twenty() {
 fn test_get_pools_by_asset_returns_empty_when_no_pools() {
     let t = setup();
     let asset = Address::generate(&t.env);
-    let ids = t.client.get_pools_by_asset(&asset);
-    assert_eq!(ids.len(), 0, "expected no pools for a fresh factory");
+    let page = t.client.get_pools_by_asset(&asset, &0u32, &10u32);
+    assert_eq!(page.records.len(), 0, "expected no pools for a fresh factory");
 }
 
 // ── transfer_admin ────────────────────────────────────────────────────────────
@@ -420,14 +420,14 @@ fn test_get_pools_by_asset_returns_matching_ids() {
     let id_1 = client.create_pool(&asset_b, &200u128, &20u64);
     let id_2 = client.create_pool(&asset_a, &300u128, &30u64);
 
-    let by_a = client.get_pools_by_asset(&asset_a);
-    assert_eq!(by_a.len(), 2);
-    assert_eq!(by_a.get(0), Some(id_0));
-    assert_eq!(by_a.get(1), Some(id_2));
+    let by_a = client.get_pools_by_asset(&asset_a, &0u32, &10u32);
+    assert_eq!(by_a.records.len(), 2);
+    assert_eq!(by_a.records.get(0).map(|r| r.0), Some(id_0));
+    assert_eq!(by_a.records.get(1).map(|r| r.0), Some(id_2));
 
-    let by_b = client.get_pools_by_asset(&asset_b);
-    assert_eq!(by_b.len(), 1);
-    assert_eq!(by_b.get(0), Some(id_1));
+    let by_b = client.get_pools_by_asset(&asset_b, &0u32, &10u32);
+    assert_eq!(by_b.records.len(), 1);
+    assert_eq!(by_b.records.get(0).map(|r| r.0), Some(id_1));
 }
 
 #[test]
@@ -442,8 +442,47 @@ fn test_get_pools_by_asset_unknown_asset_returns_empty() {
 
     client.create_pool(&Address::generate(&env), &100u128, &10u64);
     let unknown = Address::generate(&env);
-    let result = client.get_pools_by_asset(&unknown);
-    assert_eq!(result.len(), 0);
+    let result = client.get_pools_by_asset(&unknown, &0u32, &10u32);
+    assert_eq!(result.records.len(), 0);
+}
+
+#[test]
+fn test_get_pools_by_asset_paginates_large_matching_registry() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let wasm_hash = upload_mock_pool_wasm(&env);
+    let factory_addr = env.register(Factory, ());
+    let client = FactoryClient::new(&env, &factory_addr);
+    client.initialize(&admin, &wasm_hash);
+
+    // Create 25 pools all sharing the same asset
+    let asset = Address::generate(&env);
+    for i in 0..25 {
+        client.create_pool(&asset, &(100 + i as u128), &(10 + i as u64));
+    }
+
+    // First page should return 20 records
+    let page1 = client.get_pools_by_asset(&asset, &0u32, &20u32);
+    assert_eq!(page1.records.len(), 20);
+    assert_eq!(page1.records.get(0).map(|r| r.0), Some(0));
+    assert_eq!(page1.records.get(19).map(|r| r.0), Some(19));
+    assert_eq!(page1.next_start_id, 20);
+    assert_eq!(page1.total, 25);
+
+    // Second page should return remaining 5 records
+    let page2 = client.get_pools_by_asset(&asset, &page1.next_start_id, &20u32);
+    assert_eq!(page2.records.len(), 5);
+    assert_eq!(page2.records.get(0).map(|r| r.0), Some(20));
+    assert_eq!(page2.records.get(4).map(|r| r.0), Some(24));
+    assert_eq!(page2.next_start_id, 25);
+    assert_eq!(page2.total, 25);
+
+    // Third page should be empty
+    let page3 = client.get_pools_by_asset(&asset, &page2.next_start_id, &20u32);
+    assert_eq!(page3.records.len(), 0);
+    assert_eq!(page3.next_start_id, 25);
+    assert_eq!(page3.total, 25);
 }
 
 #[test]

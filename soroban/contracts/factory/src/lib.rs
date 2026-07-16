@@ -124,29 +124,51 @@ impl Factory {
         }
     }
 
-    /// Return all pool IDs whose staking asset matches `asset`.
+    /// Return a page of pool records whose staking asset matches `asset`.
     ///
-    /// Scans every registered pool in O(n) and collects matching IDs.
-    /// Useful for frontends that need to surface all pools for a given token
-    /// without an off-chain indexer.
-    pub fn get_pools_by_asset(env: Env, asset: Address) -> Vec<u32> {
+    /// Scans registered pools starting from `start_id` and collects matching records.
+    /// `limit` is capped at 20 records so callers can page through large registries
+    /// without unbounded contract work. This prevents denial-of-service by design as
+    /// the registry grows organically.
+    ///
+    /// # Resource Limit Reasoning
+    /// Without pagination, this function performs an unbounded O(n) scan over every
+    /// pool ever registered, with no ceiling. As pool_count grows, the function gets
+    /// strictly more expensive per call and would eventually exceed Soroban's
+    /// per-transaction CPU-instruction and read-entry budgets, becoming permanently
+    /// unusable. The 20-record cap mirrors list_pools's design to prevent this.
+    ///
+    /// # Secondary Index Consideration
+    /// For very large registries, a secondary per-asset index (e.g., DataKey::AssetPools
+    /// maintained incrementally in create_pool) would avoid full-registry scans entirely.
+    /// This would be a more robust long-term fix but requires changes to create_pool's
+    /// write path and potentially a migration/backfill for existing pools.
+    pub fn get_pools_by_asset(env: Env, asset: Address, start_id: u32, limit: u32) -> ListPoolsResponse {
         bump_instance(&env);
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::PoolCount)
-            .unwrap_or(0);
-        let mut matches: Vec<u32> = vec![&env];
-        for pool_id in 0..count {
+        let count: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
+        let capped_limit = limit.min(20);
+        let mut records: Vec<(u32, PoolRecord)> = vec![&env];
+        let mut next_start_id = count;
+
+        for pool_id in start_id..count {
+            if records.len() >= capped_limit {
+                next_start_id = pool_id;
+                break;
+            }
             let key = DataKey::Pool(pool_id);
             if let Some(record) = env.storage().persistent().get::<DataKey, PoolRecord>(&key) {
                 if record.asset == asset {
                     bump_pool(&env, pool_id);
-                    matches.push_back(pool_id);
+                    records.push_back((pool_id, record));
                 }
             }
         }
-        matches
+
+        ListPoolsResponse {
+            records,
+            next_start_id,
+            total: count,
+        }
     }
 
     /// Refresh TTLs for a range of pool records to prevent archival.
