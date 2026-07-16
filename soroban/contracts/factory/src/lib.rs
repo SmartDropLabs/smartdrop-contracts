@@ -149,6 +149,45 @@ impl Factory {
         matches
     }
 
+    /// Refresh TTLs for a range of pool records to prevent archival.
+    ///
+    /// This permissionless function allows keepers or any caller to proactively
+    /// extend the TTL of Pool records without requiring specific get_pool or
+    /// get_pools_by_asset queries. This is critical for long-lived factory
+    /// deployments where early pools may go unqueried for extended periods.
+    ///
+    /// # Arguments
+    /// * `start_id` - The first pool ID to refresh (inclusive)
+    /// * `limit` - Maximum number of pools to refresh in this call (capped at 20)
+    ///
+    /// # Important Notes
+    /// - This is a **keep-alive mechanism** that prevents archival by refreshing
+    ///   TTLs before expiry. It does NOT restore already-archived entries.
+    /// - Already-archived entries require off-chain RestoreFootprint operations
+    ///   (e.g., via Soroban CLI) submitted alongside a transaction referencing the
+    ///   expired key - this is outside contract code's control.
+    /// - Instance storage (Admin, WasmHash, PoolCount) is bumped by bump_instance
+    ///   in nearly every public function, so it does not require separate refresh.
+    /// - Only persistent Pool(u32) records are at risk of archival due to their
+    ///   narrower bump coverage (only from pool-specific read paths).
+    ///
+    /// # Keeper Cadence
+    /// Operators should call this function across the full ID range at least once
+    /// every ~45 days (between TTL_THRESHOLD of ~30 days and TTL_EXTEND_TO of
+    /// ~60 days) to ensure all pool records remain accessible.
+    pub fn refresh_pool_ttls(env: Env, start_id: u32, limit: u32) -> Result<(), FactoryError> {
+        bump_instance(&env);
+        let count: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
+        let capped_limit = limit.min(20);
+        let end = start_id.saturating_add(capped_limit).min(count);
+        for pool_id in start_id..end {
+            if env.storage().persistent().has(&DataKey::Pool(pool_id)) {
+                bump_pool(&env, pool_id);
+            }
+        }
+        Ok(())
+    }
+
     /// Transfer admin rights to `new_admin`. Current admin must authorise.
     ///
     /// Supports key rotation and future governance handoffs without redeploying

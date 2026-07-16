@@ -572,6 +572,30 @@ fn test_get_pool_bumps_pool_record_ttl() {
 }
 
 #[test]
+fn test_refresh_pool_ttls_restores_ttl_for_unqueried_pool() {
+    let t = setup();
+    let id = t
+        .client
+        .create_pool(&Address::generate(&t.env), &250u128, &50u64);
+
+    // Initial TTL after creation
+    assert_eq!(pool_record_ttl(&t.env, &t.factory_addr, id), TTL_EXTEND_TO);
+
+    // Advance ledgers past TTL_EXTEND_TO without ever calling get_pool on this pool
+    advance_ledgers(&t.env, TTL_EXTEND_TO + 1);
+    assert!(pool_record_ttl(&t.env, &t.factory_addr, id) < TTL_THRESHOLD);
+
+    // Call refresh_pool_ttls to restore TTL without a specific get_pool query
+    assert_eq!(
+        t.client.try_refresh_pool_ttls(&id, &1u32),
+        Ok(Ok(()))
+    );
+
+    // Verify TTL is restored
+    assert_eq!(pool_record_ttl(&t.env, &t.factory_addr, id), TTL_EXTEND_TO);
+}
+
+#[test]
 fn test_create_pool_emits_pool_crtd_event_with_payload() {
     let t = setup();
     let asset = Address::generate(&t.env);
