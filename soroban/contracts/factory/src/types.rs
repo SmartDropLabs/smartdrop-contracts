@@ -54,4 +54,10 @@ pub enum FactoryError {
     PoolNotFound = 2,
     /// `transfer_admin` was called by an address that is not the current admin.
     Unauthorized = 3,
+    /// A public function was called before `initialize` seeded the factory state.
+    ///
+    /// Returned instead of panicking on an absent `Admin`/`WasmHash` entry, and
+    /// also by the read-only getters that would otherwise report a misleading
+    /// empty registry for a factory that does not exist yet.
+    NotInitialized = 4,
 }

@@ -91,6 +91,22 @@ fn setup() -> TestEnv {
     }
 }
 
+/// Builds a registered-but-uninitialised factory: no `initialize` call, so no
+/// `Admin`/`WasmHash` instance entries exist. Mirrors farming-pool's
+/// `setup_uninitialized` helper.
+fn setup_uninitialized() -> (Env, FactoryClient<'static>) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory_addr = env.register(Factory, ());
+    let client = FactoryClient::new(&env, &factory_addr);
+
+    let client =
+        unsafe { core::mem::transmute::<FactoryClient<'_>, FactoryClient<'static>>(client) };
+
+    (env, client)
+}
+
 fn setup_with_pool_records(count: u32) -> TestEnv {
     let t = setup();
 
@@ -155,6 +171,93 @@ fn test_double_initialize_returns_error() {
         t.client.try_initialize(&t.admin, &t.wasm_hash),
         Err(Ok(FactoryError::AlreadyInitialized))
     );
+}
+
+// ── NotInitialized guard ──────────────────────────────────────────────────────
+
+#[test]
+fn test_admin_uninitialized_returns_not_initialized() {
+    let (_env, client) = setup_uninitialized();
+    match client.try_admin() {
+        Err(Ok(FactoryError::NotInitialized)) => {}
+        _ => panic!("expected FactoryError::NotInitialized"),
+    }
+}
+
+#[test]
+fn test_pool_wasm_hash_uninitialized_returns_not_initialized() {
+    let (_env, client) = setup_uninitialized();
+    match client.try_pool_wasm_hash() {
+        Err(Ok(FactoryError::NotInitialized)) => {}
+        _ => panic!("expected FactoryError::NotInitialized"),
+    }
+}
+
+#[test]
+fn test_create_pool_uninitialized_returns_not_initialized() {
+    let (env, client) = setup_uninitialized();
+    let asset = Address::generate(&env);
+    match client.try_create_pool(&asset, &1_000u128, &86_400u64) {
+        Err(Ok(FactoryError::NotInitialized)) => {}
+        _ => panic!("expected FactoryError::NotInitialized"),
+    }
+}
+
+#[test]
+fn test_pool_count_uninitialized_returns_not_initialized() {
+    let (_env, client) = setup_uninitialized();
+    match client.try_pool_count() {
+        Err(Ok(FactoryError::NotInitialized)) => {}
+        _ => panic!("expected FactoryError::NotInitialized"),
+    }
+}
+
+#[test]
+fn test_get_pool_uninitialized_returns_not_initialized() {
+    let (_env, client) = setup_uninitialized();
+    // NotInitialized must win over PoolNotFound: the registry does not exist yet.
+    match client.try_get_pool(&0u32) {
+        Err(Ok(FactoryError::NotInitialized)) => {}
+        _ => panic!("expected FactoryError::NotInitialized"),
+    }
+}
+
+#[test]
+fn test_list_pools_uninitialized_returns_not_initialized() {
+    let (_env, client) = setup_uninitialized();
+    match client.try_list_pools(&0u32, &10u32) {
+        Err(Ok(FactoryError::NotInitialized)) => {}
+        _ => panic!("expected FactoryError::NotInitialized"),
+    }
+}
+
+#[test]
+fn test_get_pools_by_asset_uninitialized_returns_not_initialized() {
+    let (env, client) = setup_uninitialized();
+    let asset = Address::generate(&env);
+    match client.try_get_pools_by_asset(&asset) {
+        Err(Ok(FactoryError::NotInitialized)) => {}
+        _ => panic!("expected FactoryError::NotInitialized"),
+    }
+}
+
+#[test]
+fn test_transfer_admin_uninitialized_returns_not_initialized() {
+    let (env, client) = setup_uninitialized();
+    let new_admin = Address::generate(&env);
+    match client.try_transfer_admin(&new_admin) {
+        Err(Ok(FactoryError::NotInitialized)) => {}
+        _ => panic!("expected FactoryError::NotInitialized"),
+    }
+}
+
+/// The guard must not fire once `initialize` has seeded the state.
+#[test]
+fn test_guard_passes_after_initialize() {
+    let t = setup();
+    assert!(t.client.try_admin().is_ok());
+    assert!(t.client.try_pool_wasm_hash().is_ok());
+    assert!(t.client.try_pool_count().is_ok());
 }
 
 // ── pool_wasm_hash ────────────────────────────────────────────────────────────
