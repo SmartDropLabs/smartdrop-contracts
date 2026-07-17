@@ -224,6 +224,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "credit_rate"
+                    },
+                    "val": {
+                      "i128": "1"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "lock_ledger"
                     },
                     "val": {
@@ -236,6 +244,14 @@
                     },
                     "val": {
                       "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "unlock_ledger"
+                    },
+                    "val": {
+                      "u32": 0
                     }
                   }
                 ]

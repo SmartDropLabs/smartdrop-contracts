@@ -205,13 +205,13 @@ impl FarmingPool {
         Ok(())
     }
 
-    pub fn admin(env: Env) -> Address {
+    pub fn admin(env: Env) -> Result<Address, PoolError> {
         bump_instance(&env);
-        get_admin(&env).unwrap()
+        get_admin(&env)
     }
 
-    pub fn transfer_admin(env: Env, new_admin: Address) {
-        let current = get_admin(&env).unwrap();
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), PoolError> {
+        let current = get_admin(&env)?;
         current.require_auth();
         bump_instance(&env);
 
@@ -220,6 +220,7 @@ impl FarmingPool {
             (symbol_short!("pool"), symbol_short!("adm_xfr")),
             (current, new_admin),
         );
+        Ok(())
     }
 
     pub fn lock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {

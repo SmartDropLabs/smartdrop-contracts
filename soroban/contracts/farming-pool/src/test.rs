@@ -130,6 +130,25 @@ fn test_pause_uninitialized_returns_not_initialized() {
     }
 }
 
+#[test]
+fn test_admin_uninitialized_returns_not_initialized() {
+    let (_env, client, _user) = setup_uninitialized();
+    match client.try_admin() {
+        Err(Ok(PoolError::NotInitialized)) => {}
+        _ => panic!("expected PoolError::NotInitialized"),
+    }
+}
+
+#[test]
+fn test_transfer_admin_uninitialized_returns_not_initialized() {
+    let (env, client, _user) = setup_uninitialized();
+    let new_admin = Address::generate(&env);
+    match client.try_transfer_admin(&new_admin) {
+        Err(Ok(PoolError::NotInitialized)) => {}
+        _ => panic!("expected PoolError::NotInitialized"),
+    }
+}
+
 // ── Boost calculation unit tests ──────────────────────────────────────────────
 
 #[test]
