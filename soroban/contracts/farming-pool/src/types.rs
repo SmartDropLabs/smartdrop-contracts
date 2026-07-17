@@ -10,6 +10,8 @@ pub enum PoolError {
     InvalidCreditRate = 3,
     NotPaused = 13,
     NoActiveStake = 14,
+    /// `global_multiplier` was 0 or exceeded `MAX_GLOBAL_MULTIPLIER`. See #89.
+    InvalidGlobalMultiplier = 15,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.
