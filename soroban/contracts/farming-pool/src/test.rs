@@ -1037,3 +1037,89 @@ fn test_emergency_withdraw_while_unpaused_returns_not_paused() {
     let result = t.client.try_emergency_withdraw(&t.user);
     assert!(matches!(result, Err(Ok(PoolError::NotPaused))));
 }
+
+// ── lock_assets checks-effects-interactions (#69) ─────────────────────────────
+//
+// `stake_token` is an admin-supplied address, not necessarily a trusted
+// Stellar Asset Contract — a non-standard `transfer` implementation could
+// attempt to call back into FarmingPool before returning. Empirically
+// (verified against this project's soroban-env-host 25.0.1), Soroban's host
+// already rejects same-contract reentrancy outright — `ContractReentryMode`
+// defaults to `Prohibited`, so any attempt to call back into a contract
+// that's already on the invocation's call stack traps with "Contract
+// re-entry is not allowed" *before* any of our code (fixed or not) runs.
+// These tests exercise both realistic reentrant-token shapes and confirm
+// the CEI reordering fix doesn't change correct-path behavior.
+
+use crate::mock_reentrant_token::{
+    MockNaiveReentrantToken, MockNaiveReentrantTokenClient, MockReentrantToken,
+    MockReentrantTokenClient,
+};
+
+extern crate std;
+
+#[test]
+fn test_lock_assets_reentrant_transfer_is_rejected_and_final_state_is_correct() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let farming_pool_id = env.register(FarmingPool, ());
+    let client = FarmingPoolClient::new(&env, &farming_pool_id);
+
+    let token_id = env.register(MockReentrantToken, ());
+    let token_client = MockReentrantTokenClient::new(&env, &token_id);
+    token_client.configure(&farming_pool_id, &user);
+
+    client.initialize(&admin, &token_id, &2u32, &100i128, &0u32);
+
+    // Succeeds fully: the mock token catches the rejected reentry gracefully
+    // (via try_invoke_contract) rather than trapping the whole call.
+    client.lock_assets(&user, &500i128);
+
+    // The reentrant get_user_position call — attempted mid-transfer, before
+    // lock_assets would have returned — was rejected by the host.
+    assert!(token_client.reentry_was_rejected());
+
+    // And with set_position now happening before the transfer, the position
+    // this call was computing is correctly persisted once it completes.
+    let position = client.get_user_position(&user).unwrap();
+    assert_eq!(position.amount, 500);
+}
+
+#[test]
+fn test_lock_assets_reverts_entirely_if_stake_token_naively_reenters() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let farming_pool_id = env.register(FarmingPool, ());
+    let client = FarmingPoolClient::new(&env, &farming_pool_id);
+
+    let token_id = env.register(MockNaiveReentrantToken, ());
+    let token_client = MockNaiveReentrantTokenClient::new(&env, &token_id);
+    token_client.configure(&farming_pool_id, &user);
+
+    client.initialize(&admin, &token_id, &2u32, &100i128, &0u32);
+
+    // The naive mock token doesn't catch the host's rejection, so the
+    // reentrant call traps — and with it, the entire lock_assets invocation,
+    // including our set_position write. Assert the whole call aborts rather
+    // than silently succeeding or leaving a partial state behind.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.lock_assets(&user, &500i128);
+    }));
+    assert!(
+        result.is_err(),
+        "lock_assets should trap when stake_token attempts reentrancy"
+    );
+
+    // Soroban's per-invocation atomicity means the trap rolled back
+    // everything, including the effects-first set_position write — no
+    // partial position was left behind.
+    assert!(client.get_user_position(&user).is_none());
+}

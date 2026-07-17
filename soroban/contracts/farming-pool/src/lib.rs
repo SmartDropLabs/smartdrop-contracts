@@ -1,6 +1,8 @@
 #![no_std]
 
 mod types;
+#[cfg(test)]
+mod mock_reentrant_token;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
 pub use types::PoolError;
@@ -247,6 +249,17 @@ impl FarmingPool {
 
         position.credit_rate = read_credit_rate(&env);
 
+        // Checks-effects-interactions: persist state *before* the external
+        // token transfer below. `stake_token` is an admin-supplied address,
+        // not necessarily a trusted Stellar Asset Contract, and its
+        // `transfer` is a synchronous cross-contract call that could
+        // otherwise observe (or, on a future host that permits it, mutate)
+        // this position while it's still only a local variable. If the
+        // transfer fails, the whole invocation reverts and this write is
+        // rolled back with it — Soroban's per-invocation atomicity, not
+        // manual sequencing, is what keeps this safe on failure. See #69.
+        set_position(&env, &user, &position);
+
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &user,
@@ -254,7 +267,6 @@ impl FarmingPool {
             &amount,
         );
 
-        set_position(&env, &user, &position);
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("locked")),
             (user, amount),
