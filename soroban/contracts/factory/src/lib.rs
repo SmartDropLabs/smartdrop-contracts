@@ -145,29 +145,90 @@ impl Factory {
         }
     }
 
-    /// Return all pool IDs whose staking asset matches `asset`.
+    /// Return a page of pool records whose staking asset matches `asset`.
     ///
-    /// Scans every registered pool in O(n) and collects matching IDs.
-    /// Useful for frontends that need to surface all pools for a given token
-    /// without an off-chain indexer.
-    pub fn get_pools_by_asset(env: Env, asset: Address) -> Vec<u32> {
+    /// Scans registered pools starting from `start_id` and collects matching records.
+    /// `limit` is capped at 20 records so callers can page through large registries
+    /// without unbounded contract work. This prevents denial-of-service by design as
+    /// the registry grows organically.
+    ///
+    /// # Resource Limit Reasoning
+    /// Without pagination, this function performs an unbounded O(n) scan over every
+    /// pool ever registered, with no ceiling. As pool_count grows, the function gets
+    /// strictly more expensive per call and would eventually exceed Soroban's
+    /// per-transaction CPU-instruction and read-entry budgets, becoming permanently
+    /// unusable. The 20-record cap mirrors list_pools's design to prevent this.
+    ///
+    /// # Secondary Index Consideration
+    /// For very large registries, a secondary per-asset index (e.g., DataKey::AssetPools
+    /// maintained incrementally in create_pool) would avoid full-registry scans entirely.
+    /// This would be a more robust long-term fix but requires changes to create_pool's
+    /// write path and potentially a migration/backfill for existing pools.
+    pub fn get_pools_by_asset(env: Env, asset: Address, start_id: u32, limit: u32) -> ListPoolsResponse {
         bump_instance(&env);
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::PoolCount)
-            .unwrap_or(0);
-        let mut matches: Vec<u32> = vec![&env];
-        for pool_id in 0..count {
+        let count: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
+        let capped_limit = limit.min(20);
+        let mut records: Vec<(u32, PoolRecord)> = vec![&env];
+        let mut next_start_id = count;
+
+        for pool_id in start_id..count {
+            if records.len() >= capped_limit {
+                next_start_id = pool_id;
+                break;
+            }
             let key = DataKey::Pool(pool_id);
             if let Some(record) = env.storage().persistent().get::<DataKey, PoolRecord>(&key) {
                 if record.asset == asset {
                     bump_pool(&env, pool_id);
-                    matches.push_back(pool_id);
+                    records.push_back((pool_id, record));
                 }
             }
         }
-        matches
+
+        ListPoolsResponse {
+            records,
+            next_start_id,
+            total: count,
+        }
+    }
+
+    /// Refresh TTLs for a range of pool records to prevent archival.
+    ///
+    /// This permissionless function allows keepers or any caller to proactively
+    /// extend the TTL of Pool records without requiring specific get_pool or
+    /// get_pools_by_asset queries. This is critical for long-lived factory
+    /// deployments where early pools may go unqueried for extended periods.
+    ///
+    /// # Arguments
+    /// * `start_id` - The first pool ID to refresh (inclusive)
+    /// * `limit` - Maximum number of pools to refresh in this call (capped at 20)
+    ///
+    /// # Important Notes
+    /// - This is a **keep-alive mechanism** that prevents archival by refreshing
+    ///   TTLs before expiry. It does NOT restore already-archived entries.
+    /// - Already-archived entries require off-chain RestoreFootprint operations
+    ///   (e.g., via Soroban CLI) submitted alongside a transaction referencing the
+    ///   expired key - this is outside contract code's control.
+    /// - Instance storage (Admin, WasmHash, PoolCount) is bumped by bump_instance
+    ///   in nearly every public function, so it does not require separate refresh.
+    /// - Only persistent Pool(u32) records are at risk of archival due to their
+    ///   narrower bump coverage (only from pool-specific read paths).
+    ///
+    /// # Keeper Cadence
+    /// Operators should call this function across the full ID range at least once
+    /// every ~45 days (between TTL_THRESHOLD of ~30 days and TTL_EXTEND_TO of
+    /// ~60 days) to ensure all pool records remain accessible.
+    pub fn refresh_pool_ttls(env: Env, start_id: u32, limit: u32) -> Result<(), FactoryError> {
+        bump_instance(&env);
+        let count: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
+        let capped_limit = limit.min(20);
+        let end = start_id.saturating_add(capped_limit).min(count);
+        for pool_id in start_id..end {
+            if env.storage().persistent().has(&DataKey::Pool(pool_id)) {
+                bump_pool(&env, pool_id);
+            }
+        }
+        Ok(())
     }
 
     /// Transfer admin rights to `new_admin`. Current admin must authorise.
