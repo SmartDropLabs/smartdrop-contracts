@@ -17,8 +17,9 @@ Emitted immediately whenever a new liquidity or farming pool is successfully dep
 | `pool_id` | `Symbol` | The unique symbol identifier of the pool (Max 9 characters). |
 | `pool_address` | `Address` | The deployed contract address of the new pool. |
 | `asset` | `Address` | The token asset address being staked in the pool. |
-| `daily_rate` | `u128` | The base daily reward generation rate for stakers. |
-| `min_lock_period`| `u64` | The minimum duration (in seconds) tokens must remain locked. |
+| `credit_rate` | `i128` | Per-ledger credit accrual rate, as passed to the pool's `initialize` (converted from `create_pool`'s caller-facing `daily_rate`; see #80). |
+| `global_multiplier` | `u32` | Boost multiplier applied to allocated stake, as passed to `initialize`. |
+| `min_lock_period`| `u32` | The minimum number of ledgers tokens must remain locked. |
 
 ### `adm_chg`
 Emitted when administrative privileges are transferred to a new account.

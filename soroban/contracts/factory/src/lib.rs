@@ -2,12 +2,33 @@
 
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, vec, Address, BytesN, Env, Vec};
+use soroban_sdk::{contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, Symbol, Val, Vec};
 use types::{DataKey, FactoryError, ListPoolsResponse, PoolRecord};
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
 const TTL_THRESHOLD: u32 = 518_400;
 const TTL_EXTEND_TO: u32 = 1_036_800;
+
+/// Ledgers per day at the network's ~5s/ledger target, used to convert
+/// `create_pool`'s caller-facing `daily_rate` into the pool's native
+/// per-ledger `credit_rate`. See `daily_rate_to_credit_rate`.
+const LEDGERS_PER_DAY: u128 = 17_280;
+
+/// Convert a "credits per day" figure into the deployed pool's native
+/// "credits per ledger" `credit_rate`.
+///
+/// `daily_rate` is kept as `create_pool`'s public unit because a per-day
+/// figure is what off-chain/product code already reasons about; ledger-level
+/// rates are an implementation detail of `FarmingPool`. Returns
+/// `InvalidCreditRate` if the conversion truncates to zero (`initialize`
+/// requires `credit_rate > 0`) or does not fit in `i128`.
+fn daily_rate_to_credit_rate(daily_rate: u128) -> Result<i128, FactoryError> {
+    let per_ledger = daily_rate / LEDGERS_PER_DAY;
+    if per_ledger == 0 {
+        return Err(FactoryError::InvalidCreditRate);
+    }
+    i128::try_from(per_ledger).map_err(|_| FactoryError::InvalidCreditRate)
+}
 
 fn bump_instance(env: &Env) {
     env.storage()
@@ -165,15 +186,47 @@ impl Factory {
         );
     }
 
-    /// Create and register a new farming pool. Admin-only.
+    /// Create, deploy, and initialize a new farming pool. Admin-only.
     ///
-    /// The `pool_crtd` event now includes `asset`, `daily_rate`, and
-    /// `min_lock_period` alongside `pool_id` and `pool_address` so off-chain
-    /// indexers can reconstruct the full pool state without a follow-up RPC call.
-    pub fn create_pool(env: Env, asset: Address, daily_rate: u128, min_lock_period: u64) -> u32 {
+    /// Unlike the pre-#80 version of this function, the deployed pool is no
+    /// longer left uninitialized: `create_pool` calls the pool's own
+    /// `initialize` in the same transaction as the deploy, so there is no
+    /// window in which an uninitialized pool address is observable on-chain
+    /// (closing the front-run window described in #79).
+    ///
+    /// `daily_rate` is converted to the pool's native per-ledger
+    /// `credit_rate` via `daily_rate_to_credit_rate` — see that function's
+    /// docs for the conversion and its failure modes.
+    ///
+    /// The pool's admin is fixed to this factory's admin *at creation time*.
+    /// A later `transfer_admin` on the factory does not retroactively change
+    /// any already-deployed pool's admin — each pool is administered
+    /// independently after creation. This is approach B from #80: the
+    /// smallest-diff option that avoids the larger "factory proxies every
+    /// admin action" design surface.
+    ///
+    /// The `pool_crtd` event includes `asset`, `credit_rate`,
+    /// `global_multiplier`, and `min_lock_period` alongside `pool_id` and
+    /// `pool_address` so off-chain indexers can reconstruct the full pool
+    /// state without a follow-up RPC call.
+    pub fn create_pool(
+        env: Env,
+        asset: Address,
+        daily_rate: u128,
+        global_multiplier: u32,
+        min_lock_period: u64,
+    ) -> Result<u32, FactoryError> {
         let admin = load_admin(&env);
         admin.require_auth();
         bump_instance(&env);
+
+        if global_multiplier < 1 {
+            return Err(FactoryError::InvalidGlobalMultiplier);
+        }
+        let credit_rate = daily_rate_to_credit_rate(daily_rate)?;
+        let min_lock_period: u32 = min_lock_period
+            .try_into()
+            .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
 
         let pool_id: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap();
         let wasm_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
@@ -186,10 +239,27 @@ impl Factory {
             .with_current_contract(salt)
             .deploy_v2(wasm_hash, ());
 
+        // Call the freshly deployed pool's `initialize` directly via
+        // `invoke_contract` rather than depending on the `farming-pool`
+        // crate's generated Client: pulling that crate in as a normal
+        // dependency causes its own `#[contractimpl]`-exported WASM symbols
+        // (e.g. `admin`, `transfer_admin`) to collide with the factory's own
+        // exports of the same names when both are linked into one cdylib.
+        let init_args: Vec<Val> = vec![
+            &env,
+            admin.into_val(&env),
+            asset.into_val(&env),
+            global_multiplier.into_val(&env),
+            credit_rate.into_val(&env),
+            min_lock_period.into_val(&env),
+        ];
+        let _: () = env.invoke_contract(&pool_address, &Symbol::new(&env, "initialize"), init_args);
+
         let record = PoolRecord {
             address: pool_address.clone(),
             asset: asset.clone(),
-            daily_rate,
+            credit_rate,
+            global_multiplier,
             min_lock_period,
         };
         env.storage()
@@ -204,10 +274,17 @@ impl Factory {
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("factory"), symbol_short!("pool_crtd")),
-            (pool_id, pool_address, asset, daily_rate, min_lock_period),
+            (
+                pool_id,
+                pool_address,
+                asset,
+                credit_rate,
+                global_multiplier,
+                min_lock_period,
+            ),
         );
 
-        pool_id
+        Ok(pool_id)
     }
 }
 
