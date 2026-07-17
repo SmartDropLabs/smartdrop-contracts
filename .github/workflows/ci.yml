@@ -31,6 +31,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Build farming-pool WASM fixture for factory integration tests
+        working-directory: soroban
+        run: cargo build -p farming-pool --target wasm32v1-none --release
+
       - name: Run tests
         working-directory: soroban
         run: cargo test --workspace
