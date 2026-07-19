@@ -46,6 +46,14 @@ fn load_admin(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::Admin).unwrap()
 }
 
+fn require_initialized(env: &Env) -> Result<(), FactoryError> {
+    if env.storage().instance().has(&DataKey::Admin) {
+        Ok(())
+    } else {
+        Err(FactoryError::NotInitialized)
+    }
+}
+
 /// Build a 32-byte salt from a pool ID so each pool gets a unique, reproducible address.
 fn pool_salt(env: &Env, pool_id: u32) -> BytesN<32> {
     let mut bytes = [0u8; 32];
@@ -245,6 +253,35 @@ impl Factory {
             (symbol_short!("factory"), symbol_short!("adm_xfr")),
             (current, new_admin),
         );
+    }
+
+    /// Update the WASM hash used for future `create_pool` deployments. Admin-only.
+    ///
+    /// Allows the admin to point future pool deployments at a corrected or upgraded
+    /// farming-pool build without redeploying the factory itself. Existing deployed
+    /// pools are unaffected — Soroban contract bytecode is immutable once deployed.
+    ///
+    /// Emits a `wasm_set` event with `(old_hash, new_hash)` so that the previous
+    /// hash is discoverable off-chain for rollback scenarios.
+    pub fn set_pool_wasm_hash(
+        env: Env,
+        new_hash: BytesN<32>,
+    ) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin: Address = load_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+
+        let old_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
+        env.storage()
+            .instance()
+            .set(&DataKey::WasmHash, &new_hash);
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("wasm_set")),
+            (old_hash, new_hash),
+        );
+        Ok(())
     }
 
     /// Create, deploy, and initialize a new farming pool. Admin-only.
