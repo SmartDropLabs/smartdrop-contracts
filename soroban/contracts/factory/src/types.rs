@@ -73,4 +73,6 @@ pub enum FactoryError {
     InvalidCreditRate = 5,
     /// `create_pool`'s `min_lock_period` does not fit in the pool's native `u32`.
     MinLockPeriodOutOfRange = 6,
+    /// A function requiring initialization was called on an uninitialized factory.
+    NotInitialized = 7,
 }

@@ -1,6 +1,8 @@
 #![no_std]
 
 mod types;
+#[cfg(test)]
+mod mock_reentrant_token;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, BytesN, Env};
 pub use types::PoolError;
@@ -30,6 +32,14 @@ fn require_initialized(env: &Env) -> Result<(), PoolError> {
     }
     Ok(())
 }
+
+fn require_not_paused(env: &Env) -> Result<(), PoolError> {
+    if pool_is_paused(env) {
+        return Err(PoolError::Paused);
+    }
+    Ok(())
+}
+
 
 fn get_admin(env: &Env) -> Result<Address, PoolError> {
     env.storage()
@@ -217,13 +227,13 @@ impl FarmingPool {
         Ok(())
     }
 
-    pub fn admin(env: Env) -> Address {
+    pub fn admin(env: Env) -> Result<Address, PoolError> {
         bump_instance(&env);
-        get_admin(&env).unwrap()
+        get_admin(&env)
     }
 
-    pub fn transfer_admin(env: Env, new_admin: Address) {
-        let current = get_admin(&env).unwrap();
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), PoolError> {
+        let current = get_admin(&env)?;
         current.require_auth();
         bump_instance(&env);
 
@@ -232,6 +242,7 @@ impl FarmingPool {
             (symbol_short!("pool"), symbol_short!("adm_xfr")),
             (current, new_admin),
         );
+        Ok(())
     }
 
     pub fn schema_version(env: Env) -> u32 {
@@ -268,7 +279,8 @@ impl FarmingPool {
     pub fn lock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         assert!(amount > 0, "amount must be positive");
         bump_instance(&env);
 
@@ -290,6 +302,17 @@ impl FarmingPool {
 
         position.credit_rate = read_credit_rate(&env);
 
+        // Checks-effects-interactions: persist state *before* the external
+        // token transfer below. `stake_token` is an admin-supplied address,
+        // not necessarily a trusted Stellar Asset Contract, and its
+        // `transfer` is a synchronous cross-contract call that could
+        // otherwise observe (or, on a future host that permits it, mutate)
+        // this position while it's still only a local variable. If the
+        // transfer fails, the whole invocation reverts and this write is
+        // rolled back with it — Soroban's per-invocation atomicity, not
+        // manual sequencing, is what keeps this safe on failure. See #69.
+        set_position(&env, &user, &position);
+
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &user,
@@ -297,7 +320,6 @@ impl FarmingPool {
             &amount,
         );
 
-        set_position(&env, &user, &position);
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("locked")),
             (user, amount),
@@ -308,7 +330,8 @@ impl FarmingPool {
     pub fn unlock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         assert!(amount > 0, "amount must be positive");
         bump_instance(&env);
 
@@ -446,7 +469,8 @@ impl FarmingPool {
 
     pub fn stake(env: Env, from: Address, amount: i128) -> Result<(), PoolError> {
         from.require_auth();
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         require_initialized(&env)?;
         assert!(amount > 0, "amount must be positive");
         bump_instance(&env);
@@ -480,7 +504,8 @@ impl FarmingPool {
 
     pub fn unstake(env: Env, from: Address) -> Result<i128, PoolError> {
         from.require_auth();
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         require_initialized(&env)?;
         bump_instance(&env);
 
@@ -501,7 +526,9 @@ impl FarmingPool {
 
     pub fn set_boost(env: Env, user: Address, allocation_pct: u32) -> Result<(), PoolError> {
         user.require_auth();
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
+
         require_initialized(&env)?;
         assert!(
             allocation_pct >= 1 && allocation_pct <= 100,
