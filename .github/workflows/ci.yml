@@ -32,6 +32,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Build WASM fixtures for factory integration tests
       - name: Check formatting
         working-directory: soroban
         run: cargo fmt --all -- --check
@@ -42,7 +43,7 @@ jobs:
 
       - name: Build farming-pool WASM fixture for factory integration tests
         working-directory: soroban
-        run: cargo build -p farming-pool --target wasm32v1-none --release
+        run: cargo build --workspace --target wasm32v1-none --release
 
       - name: Run tests
         working-directory: soroban
