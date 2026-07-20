@@ -75,4 +75,6 @@ pub enum FactoryError {
     MinLockPeriodOutOfRange = 6,
     /// `create_pool` cannot allocate another monotonically increasing pool ID.
     PoolCountOverflow = 7,
+    /// A function requiring initialization was called on an uninitialized factory.
+    NotInitialized = 7,
 }

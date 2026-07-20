@@ -214,6 +214,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "credit_rate"
+                    },
+                    "val": {
+                      "i128": "1"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "credits_banked"
                     },
                     "val": {
