@@ -31,6 +31,14 @@ fn require_initialized(env: &Env) -> Result<(), PoolError> {
     Ok(())
 }
 
+fn require_not_paused(env: &Env) -> Result<(), PoolError> {
+    if pool_is_paused(env) {
+        return Err(PoolError::Paused);
+    }
+    Ok(())
+}
+
+
 fn get_admin(env: &Env) -> Result<Address, PoolError> {
     env.storage()
         .instance()
@@ -227,7 +235,8 @@ impl FarmingPool {
     pub fn lock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         assert!(amount > 0, "amount must be positive");
         bump_instance(&env);
 
@@ -277,7 +286,8 @@ impl FarmingPool {
     pub fn unlock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         assert!(amount > 0, "amount must be positive");
         bump_instance(&env);
 
@@ -415,7 +425,8 @@ impl FarmingPool {
 
     pub fn stake(env: Env, from: Address, amount: i128) -> Result<(), PoolError> {
         from.require_auth();
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         require_initialized(&env)?;
         assert!(amount > 0, "amount must be positive");
         bump_instance(&env);
@@ -449,7 +460,8 @@ impl FarmingPool {
 
     pub fn unstake(env: Env, from: Address) -> Result<i128, PoolError> {
         from.require_auth();
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         require_initialized(&env)?;
         bump_instance(&env);
 
@@ -470,7 +482,9 @@ impl FarmingPool {
 
     pub fn set_boost(env: Env, user: Address, allocation_pct: u32) -> Result<(), PoolError> {
         user.require_auth();
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
+
         require_initialized(&env)?;
         assert!(
             allocation_pct >= 1 && allocation_pct <= 100,

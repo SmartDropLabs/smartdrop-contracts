@@ -849,16 +849,26 @@ fn test_pause_blocks_lock_assets() {
     let t = setup(1, 1);
     t.client.pause();
     assert!(t.client.is_paused());
-    assert!(t.client.try_lock_assets(&t.user, &100i128).is_err());
+
+    match t.client.try_lock_assets(&t.user, &100i128) {
+        Err(Ok(PoolError::Paused)) => {}
+        other => panic!("expected PoolError::Paused, got: {:?}", other),
+    }
 }
+
 
 #[test]
 fn test_pause_blocks_unlock_assets() {
     let t = setup(1, 1);
     t.client.lock_assets(&t.user, &1_000);
     t.client.pause();
-    assert!(t.client.try_unlock_assets(&t.user, &1_000).is_err());
+
+    match t.client.try_unlock_assets(&t.user, &1_000) {
+        Err(Ok(PoolError::Paused)) => {}
+        other => panic!("expected PoolError::Paused, got: {:?}", other),
+    }
 }
+
 
 #[test]
 fn test_unpause_restores_operations() {
@@ -896,8 +906,13 @@ fn test_unpause_emits_event() {
 fn test_pause_blocks_stake() {
     let t = setup(1, 1);
     t.client.pause();
-    assert!(t.client.try_stake(&t.user, &100i128).is_err());
+
+    match t.client.try_stake(&t.user, &100i128) {
+        Err(Ok(PoolError::Paused)) => {}
+        other => panic!("expected PoolError::Paused, got: {:?}", other),
+    }
 }
+
 
 #[test]
 fn test_unpause_restores_stake() {
