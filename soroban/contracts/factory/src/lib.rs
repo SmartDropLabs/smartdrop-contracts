@@ -2,7 +2,9 @@
 
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, Symbol, Val, Vec};
+use soroban_sdk::{
+    contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, Symbol, Val, Vec,
+};
 use types::{DataKey, FactoryError, ListPoolsResponse, PoolRecord};
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
@@ -44,6 +46,14 @@ fn bump_pool(env: &Env, pool_id: u32) {
 
 fn load_admin(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::Admin).unwrap()
+}
+
+fn require_initialized(env: &Env) -> Result<(), FactoryError> {
+    if env.storage().instance().has(&DataKey::Admin) {
+        Ok(())
+    } else {
+        Err(FactoryError::NotInitialized)
+    }
 }
 
 /// Build a 32-byte salt from a pool ID so each pool gets a unique, reproducible address.
@@ -245,6 +255,64 @@ impl Factory {
             (symbol_short!("factory"), symbol_short!("adm_xfr")),
             (current, new_admin),
         );
+    }
+
+    /// Upgrade one registered farming pool in place. Admin-only.
+    ///
+    /// This deliberately does not update the factory-level `WasmHash`; it is a
+    /// pool-by-pool hot swap for a pre-installed WASM hash.
+    pub fn upgrade_pool(
+        env: Env,
+        pool_id: u32,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), FactoryError> {
+        let admin = load_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+
+        let key = DataKey::Pool(pool_id);
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&key)
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        let upgrade_args: Vec<Val> = vec![&env, new_wasm_hash.clone().into_val(&env)];
+        let _: () =
+            env.invoke_contract(&record.address, &Symbol::new(&env, "upgrade"), upgrade_args);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("pool_upg")),
+            (pool_id, record.address, new_wasm_hash),
+    /// Update the WASM hash used for future `create_pool` deployments. Admin-only.
+    ///
+    /// Allows the admin to point future pool deployments at a corrected or upgraded
+    /// farming-pool build without redeploying the factory itself. Existing deployed
+    /// pools are unaffected — Soroban contract bytecode is immutable once deployed.
+    ///
+    /// Emits a `wasm_set` event with `(old_hash, new_hash)` so that the previous
+    /// hash is discoverable off-chain for rollback scenarios.
+    pub fn set_pool_wasm_hash(
+        env: Env,
+        new_hash: BytesN<32>,
+    ) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin: Address = load_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+
+        let old_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
+        env.storage()
+            .instance()
+            .set(&DataKey::WasmHash, &new_hash);
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("wasm_set")),
+            (old_hash, new_hash),
+        );
+        Ok(())
     }
 
     /// Create, deploy, and initialize a new farming pool. Admin-only.

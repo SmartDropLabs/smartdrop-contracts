@@ -4,7 +4,7 @@ mod types;
 #[cfg(test)]
 mod mock_reentrant_token;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, BytesN, Env};
 pub use types::PoolError;
 use types::{BoostConfig, DataKey, Position, UserStake};
 
@@ -43,6 +43,14 @@ fn require_initialized(env: &Env) -> Result<(), PoolError> {
     }
     Ok(())
 }
+
+fn require_not_paused(env: &Env) -> Result<(), PoolError> {
+    if pool_is_paused(env) {
+        return Err(PoolError::Paused);
+    }
+    Ok(())
+}
+
 
 fn get_admin(env: &Env) -> Result<Address, PoolError> {
     env.storage()
@@ -84,6 +92,13 @@ fn pool_is_paused(env: &Env) -> bool {
         .instance()
         .get(&DataKey::Paused)
         .unwrap_or(false)
+}
+
+fn read_schema_version(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::SchemaVersion)
+        .unwrap_or(SCHEMA_VERSION)
 }
 
 fn get_user_boost(env: &Env, user: &Address) -> Option<u32> {
@@ -216,17 +231,20 @@ impl FarmingPool {
         env.storage()
             .instance()
             .set(&DataKey::MinLockPeriod, &min_lock_period);
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
         bump_instance(&env);
         Ok(())
     }
 
-    pub fn admin(env: Env) -> Address {
+    pub fn admin(env: Env) -> Result<Address, PoolError> {
         bump_instance(&env);
-        get_admin(&env).unwrap()
+        get_admin(&env)
     }
 
-    pub fn transfer_admin(env: Env, new_admin: Address) {
-        let current = get_admin(&env).unwrap();
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), PoolError> {
+        let current = get_admin(&env)?;
         current.require_auth();
         bump_instance(&env);
 
@@ -235,12 +253,45 @@ impl FarmingPool {
             (symbol_short!("pool"), symbol_short!("adm_xfr")),
             (current, new_admin),
         );
+        Ok(())
+    }
+
+    pub fn schema_version(env: Env) -> u32 {
+        bump_instance(&env);
+        read_schema_version(&env)
+    }
+
+    pub fn migrate(env: Env) -> Result<u32, PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        bump_instance(&env);
+
+        let current = read_schema_version(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
+        Ok(current)
+    }
+
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        bump_instance(&env);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("upgraded")),
+            new_wasm_hash.clone(),
+        );
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
     }
 
     pub fn lock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         assert!(amount > 0, "amount must be positive");
         bump_instance(&env);
 
@@ -290,7 +341,8 @@ impl FarmingPool {
     pub fn unlock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         assert!(amount > 0, "amount must be positive");
         bump_instance(&env);
 
@@ -428,7 +480,8 @@ impl FarmingPool {
 
     pub fn stake(env: Env, from: Address, amount: i128) -> Result<(), PoolError> {
         from.require_auth();
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         require_initialized(&env)?;
         assert!(amount > 0, "amount must be positive");
         bump_instance(&env);
@@ -462,7 +515,8 @@ impl FarmingPool {
 
     pub fn unstake(env: Env, from: Address) -> Result<i128, PoolError> {
         from.require_auth();
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         require_initialized(&env)?;
         bump_instance(&env);
 
@@ -483,7 +537,9 @@ impl FarmingPool {
 
     pub fn set_boost(env: Env, user: Address, allocation_pct: u32) -> Result<(), PoolError> {
         user.require_auth();
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
+
         require_initialized(&env)?;
         assert!(
             allocation_pct >= 1 && allocation_pct <= 100,
