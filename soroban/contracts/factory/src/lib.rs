@@ -2,7 +2,9 @@
 
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, vec, Address, BytesN, Env, Vec};
+use soroban_sdk::{
+    contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, Symbol, Val, Vec,
+};
 use types::{DataKey, FactoryError, ListPoolsResponse, PoolRecord};
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
@@ -165,7 +167,17 @@ impl Factory {
         );
     }
 
-    /// Create and register a new farming pool. Admin-only.
+    /// Create, deploy, and initialize a new farming pool in one atomic call. Admin-only.
+    ///
+    /// Deployment and initialization happen within this single invocation so
+    /// there is no externally-observable window where the pool contract
+    /// exists but has no admin — closing the front-running gap where anyone
+    /// could call the freshly-deployed pool's own `initialize` first and
+    /// seize control of it (#79). The factory's own admin becomes the pool's
+    /// initial admin; letting the caller delegate a distinct per-pool admin
+    /// (and pass a real `global_multiplier`/`credit_rate` instead of the
+    /// neutral defaults below) is #80's broader parameterization, not this
+    /// fix's scope.
     ///
     /// The `pool_crtd` event now includes `asset`, `daily_rate`, and
     /// `min_lock_period` alongside `pool_id` and `pool_address` so off-chain
@@ -185,6 +197,34 @@ impl Factory {
             .deployer()
             .with_current_contract(salt)
             .deploy_v2(wasm_hash, ());
+
+        // Initialize the pool immediately, in the same invocation that
+        // deployed it — no other caller gets a chance to observe an
+        // uninitialized pool at this address and claim admin first.
+        // `asset` is passed as both the pool's `stake_token` here and
+        // `PoolRecord.asset` below from the same variable, so the factory's
+        // record of a pool's staking asset can never diverge from what the
+        // pool itself was actually initialized with.
+        // farming-pool's `min_lock_period` is `u32` while `create_pool`'s is
+        // `u64`; guard against silent truncation rather than casting.
+        let pool_min_lock_period: u32 = min_lock_period
+            .try_into()
+            .expect("min_lock_period exceeds u32::MAX ledgers");
+        // Called via `invoke_contract` with raw `Val` args rather than the
+        // `farming-pool` crate's generated `FarmingPoolClient`: depending on
+        // that crate directly pulls its own `#[contractimpl]`-exported WASM
+        // symbols (e.g. `admin`, `transfer_admin`) into this build, and those
+        // collide at link time with factory's own exports of the same names
+        // once both land in one cdylib.
+        let init_args: Vec<Val> = vec![
+            &env,
+            admin.into_val(&env),
+            asset.into_val(&env),
+            1u32.into_val(&env),
+            1i128.into_val(&env),
+            pool_min_lock_period.into_val(&env),
+        ];
+        let _: () = env.invoke_contract(&pool_address, &Symbol::new(&env, "initialize"), init_args);
 
         let record = PoolRecord {
             address: pool_address.clone(),

@@ -12,5 +12,10 @@ doctest    = false
 soroban-sdk = { workspace = true }
 
 [dev-dependencies]
-soroban-sdk   = { workspace = true, features = ["testutils"] }
-farming-pool  = { path = "../farming-pool" }
+soroban-sdk  = { workspace = true, features = ["testutils"] }
+# Only a dev-dependency: create_pool (#79) calls the deployed pool's
+# `initialize` via `env.invoke_contract` with raw args, not this crate's
+# generated Client, specifically so its #[contractimpl]-exported WASM symbols
+# never link into factory's own cdylib (see src/lib.rs::create_pool). Tests
+# use FarmingPoolClient to interact with the real pool WASM fixture.
+farming-pool = { path = "../farming-pool" }
