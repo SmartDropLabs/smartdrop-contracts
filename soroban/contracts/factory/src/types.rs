@@ -75,4 +75,12 @@ pub enum FactoryError {
     MinLockPeriodOutOfRange = 6,
     /// A function requiring initialization was called on an uninitialized factory.
     NotInitialized = 7,
+    /// `create_pool`'s PoolCount increment would overflow `u32::MAX`.
+    ///
+    /// Returned by `create_pool` when the running pool counter is already at
+    /// `u32::MAX` and a further increment would wrap around to 0, which would
+    /// silently clobber pool 0's registry record.  Provides an explicit, typed
+    /// failure instead of relying solely on the workspace Cargo profile's
+    /// `overflow-checks` flag.
+    PoolCountOverflow = 8,
 }

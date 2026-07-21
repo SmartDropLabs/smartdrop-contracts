@@ -518,7 +518,7 @@ fn test_get_pools_by_asset_paginates_large_matching_registry() {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
-    let wasm_hash = upload_mock_pool_wasm(&env);
+    let wasm_hash = upload_farming_pool_wasm(&env);
     let factory_addr = env.register(Factory, ());
     let client = FactoryClient::new(&env, &factory_addr);
     client.initialize(&admin, &wasm_hash);
@@ -526,7 +526,7 @@ fn test_get_pools_by_asset_paginates_large_matching_registry() {
     // Create 25 pools all sharing the same asset
     let asset = Address::generate(&env);
     for i in 0..25 {
-        client.create_pool(&asset, &(100 + i as u128), &(10 + i as u64));
+        client.create_pool(&asset, &(1_728_000 + i as u128), &2u32, &(10 + i as u64));
     }
 
     // First page should return 20 records
@@ -716,7 +716,7 @@ fn test_refresh_pool_ttls_restores_ttl_for_unqueried_pool() {
     let t = setup();
     let id = t
         .client
-        .create_pool(&Address::generate(&t.env), &250u128, &50u64);
+        .create_pool(&Address::generate(&t.env), &1_728_000u128, &2u32, &50u64);
 
     // Initial TTL after creation
     assert_eq!(pool_record_ttl(&t.env, &t.factory_addr, id), TTL_EXTEND_TO);
@@ -853,6 +853,48 @@ fn test_create_pool_admin_matches_factory_admin_at_creation_time() {
     t.client.transfer_admin(&new_admin);
     assert_eq!(pool_client.admin(), t.admin);
     assert_ne!(pool_client.admin(), new_admin);
+}
+
+// ── PoolCount overflow (issue #82) ───────────────────────────────────────────
+
+/// Seed PoolCount to u32::MAX directly via `env.as_contract` — the same
+/// pattern used by `setup_with_pool_records` — then assert that the very next
+/// `create_pool` call returns `PoolCountOverflow` rather than wrapping to 0
+/// and silently clobbering pool 0's registry record.
+///
+/// This also verifies that the overflow check fires *before* any deployment
+/// side effect: because `checked_add` is evaluated ahead of `deploy_v2`,
+/// no pool contract is deployed and PoolCount remains at `u32::MAX`.
+#[test]
+fn test_create_pool_at_max_pool_count_returns_overflow_error() {
+    let t = setup();
+
+    // Seed the counter to the maximum representable value.
+    t.env.as_contract(&t.factory_addr, || {
+        t.env
+            .storage()
+            .instance()
+            .set(&DataKey::PoolCount, &u32::MAX);
+    });
+
+    let asset = Address::generate(&t.env);
+    let result = t
+        .client
+        .try_create_pool(&asset, &1_728_000u128, &1u32, &10u64);
+
+    // Must return the typed overflow error, not wrap to 0.
+    assert_eq!(result, Err(Ok(FactoryError::PoolCountOverflow)));
+
+    // PoolCount must remain unchanged — no partial write should have occurred.
+    t.env.as_contract(&t.factory_addr, || {
+        let count: u32 = t
+            .env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap();
+        assert_eq!(count, u32::MAX, "PoolCount must not be modified on overflow");
+    });
 }
 
 // ── set_pool_wasm_hash ────────────────────────────────────────────────────────

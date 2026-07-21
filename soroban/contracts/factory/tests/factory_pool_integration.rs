@@ -95,7 +95,7 @@ fn deploy_pool_via_factory(
     let factory_client = FactoryClient::new(env, &factory_addr);
     factory_client.initialize(admin, &wasm_hash);
 
-    let pool_id = factory_client.create_pool(asset, &daily_rate, &min_lock_period);
+    let pool_id = factory_client.create_pool(asset, &daily_rate, &2u32, &min_lock_period);
     let record = factory_client.get_pool(&pool_id);
     let pool_address = record.address.clone();
 
@@ -121,18 +121,15 @@ fn smoke_create_pool_returns_live_pool_address() {
     let factory_client = FactoryClient::new(&env, &factory_addr);
     factory_client.initialize(&admin, &wasm_hash);
 
-    let pool_id = factory_client.create_pool(&asset, &100u128, &10u64);
+    let pool_id = factory_client.create_pool(&asset, &1_728_000u128, &2u32, &10u64);
     let record = factory_client.get_pool(&pool_id);
 
     // The deployed pool exists at a real address the factory tracked, and it
     // is reachable via FarmingPoolClient (a bogus/undeployed address would
     // panic on the first call below).
+    // create_pool now initializes the pool in the same transaction (#78/#80
+    // fix), so admin() is immediately accessible without a manual initialize.
     let pool_client = FarmingPoolClient::new(&env, &record.address);
-    // workaround for #78 — remove once create_pool initializes pools.
-    // create_pool's `deploy_v2(wasm_hash, ())` never calls the pool's own
-    // `initialize`, so the pool starts life uninitialized; prove that by
-    // reading its admin only after initializing it here.
-    pool_client.initialize(&admin, &asset, &1u32, &1i128, &0u32);
     assert_eq!(pool_client.admin(), admin);
 }
 
@@ -160,7 +157,7 @@ fn end_to_end_create_pool_then_stake_and_unstake() {
 
     let global_multiplier = 2u32;
     let credit_rate = 1i128;
-    let daily_rate = 500u128;
+    let daily_rate = 17_280u128; // daily_rate / 17_280 = 1 = credit_rate
     let min_lock_period: u32 = 0;
 
     let (pool_client, pool_address) = deploy_pool_via_factory(
@@ -171,16 +168,8 @@ fn end_to_end_create_pool_then_stake_and_unstake() {
         min_lock_period as u64,
     );
 
-    // workaround for #78 — remove once create_pool initializes pools.
-    // Factory::create_pool deploys the pool's WASM but never invokes its
-    // `initialize`, so it must be initialized manually here before use.
-    pool_client.initialize(
-        &admin,
-        &asset.address(),
-        &global_multiplier,
-        &credit_rate,
-        &min_lock_period,
-    );
+    // create_pool now calls initialize on deployment (issue #80 fix),
+    // so no manual pool_client.initialize is needed here.
 
     let stake_amount: i128 = 1_000;
     pool_client.stake(&user, &stake_amount);
@@ -247,28 +236,20 @@ fn end_to_end_create_pool_then_lock_and_unlock() {
     const INITIAL_MINT: i128 = 1_000_000_000;
     token_sac.mint(&user, &INITIAL_MINT);
 
-    let global_multiplier = 1u32;
-    let credit_rate = 2i128;
-    let daily_rate = 300u128;
+    // daily_rate_to_credit_rate: daily_rate / 17_280 = credit_rate, so for
+    // credit_rate = 2 use daily_rate = 2 * 17_280 = 34_560. Using a round
+    // multiple avoids truncation in the conversion.
+    let daily_rate = 34_560u128;
     let min_lock_period_ledgers = 50u32;
 
+    // create_pool now initializes the pool in the same transaction (#78/#80
+    // fix), so no manual pool_client.initialize call is needed here.
     let (pool_client, pool_address) = deploy_pool_via_factory(
         &env,
         &admin,
         &asset.address(),
         daily_rate,
         min_lock_period_ledgers as u64,
-    );
-
-    // workaround for #78 — remove once create_pool initializes pools.
-    // Factory::create_pool deploys the pool's WASM but never invokes its
-    // `initialize`, so it must be initialized manually here before use.
-    pool_client.initialize(
-        &admin,
-        &asset.address(),
-        &global_multiplier,
-        &credit_rate,
-        &min_lock_period_ledgers,
     );
 
     let lock_amount: i128 = 2_000;
