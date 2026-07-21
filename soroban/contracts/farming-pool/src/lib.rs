@@ -8,7 +8,18 @@ use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, BytesN, 
 pub use types::PoolError;
 use types::{BoostConfig, DataKey, Position, UserStake};
 
-pub const SCHEMA_VERSION: u32 = 1;
+// Expose compiled WASM bytes so sibling crates (e.g. `factory`) can upload the
+// real farming-pool contract in their integration tests via:
+//   `env.deployer().upload_contract_wasm(farming_pool::WASM)`
+// Gated behind `testutils` feature (enabled by factory's dev-dependency) so it
+// is never included in on-chain release builds.
+#[cfg(any(test, feature = "testutils"))]
+pub const WASM: &[u8] = soroban_sdk::contractfile!(
+    file = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../target/wasm32v1-none/release/farming_pool.wasm"
+    ),
+);
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5s/ledger).
 const USER_TTL_THRESHOLD: u32 = 518_400;

@@ -12,4 +12,8 @@ doctest    = false
 soroban-sdk = { workspace = true }
 
 [dev-dependencies]
-soroban-sdk = { workspace = true, features = ["testutils"] }
+soroban-sdk   = { workspace = true, features = ["testutils"] }
+# Provides `farming_pool::WASM` (compiled contract bytes) and `FarmingPoolClient`
+# used in `src/test.rs` to prove that `create_pool` deploys a *real*, driveable
+# farming-pool contract. See `test_create_pool_deploys_uninitialized_real_farming_pool`.
+farming-pool  = { path = "../farming-pool", features = ["testutils"] }

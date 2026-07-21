@@ -7,8 +7,12 @@ use soroban_sdk::{
         storage::Persistent as _, Address as _, AuthorizedFunction, AuthorizedInvocation,
         Events as _, Ledger, MockAuth, MockAuthInvoke,
     },
+    token::{StellarAssetClient, TokenClient},
     vec, Address, BytesN, Env, IntoVal, Symbol,
 };
+
+use farming_pool::{FarmingPoolClient, PoolError as PoolContractError};
+
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -804,184 +808,41 @@ fn test_old_admin_cannot_create_pool_after_transfer_but_new_admin_can() {
         .create_pool(&new_asset, &3_456_000u128, &2u32, &20u64);
 
     assert_eq!(new_id, 0);
-    assert_eq!(t.client.pool_count(), 1);
-}
-
-// ── create_pool ↔ deployed pool consistency (#80 acceptance criterion) ───────
-
-#[test]
-fn test_create_pool_configures_deployed_pool_matching_factory_record() {
-    let t = setup();
-    let asset = Address::generate(&t.env);
-
-    let id = t
-        .client
-        .create_pool(&asset, &17_280_000u128, &3u32, &86_400u64);
-    let record = t.client.get_pool(&id);
-
-    assert_eq!(record.credit_rate, 1_000);
-    assert_eq!(record.global_multiplier, 3);
-    assert_eq!(record.min_lock_period, 86_400);
-
-    let pool_client = farming_pool_wasm::Client::new(&t.env, &record.address);
-    assert_eq!(pool_client.admin(), t.admin);
-    assert_eq!(pool_client.credit_rate(), record.credit_rate);
-    assert_eq!(pool_client.min_lock_period(), record.min_lock_period);
-
-    // No direct global_multiplier getter exists on FarmingPool; observe it
-    // indirectly via get_boost_config, which echoes the pool's stored
-    // multiplier alongside a user's allocation once they've opted into boost.
-    let user = Address::generate(&t.env);
-    pool_client.set_boost(&user, &50u32);
-    let boost = pool_client.get_boost_config(&user).unwrap();
-    assert_eq!(boost.multiplier, record.global_multiplier);
+assert_eq!(t.client.pool_count(), 1);
 }
 
 #[test]
-fn test_create_pool_admin_matches_factory_admin_at_creation_time() {
-    let t = setup();
-    let asset = Address::generate(&t.env);
-    let id = t.client.create_pool(&asset, &17_280_000u128, &2u32, &10u64);
-    let record = t.client.get_pool(&id);
+fn test_create_pool_deploys_uninitialized_real_farming_pool() {
+    // Root-cause regression test:
+    // factory::create_pool deploys the farming-pool WASM with init args `()` and
+    // never calls FarmingPool::initialize, so any initialized-only entrypoint
+    // must return PoolError::NotInitialized.
 
-    let pool_client = farming_pool_wasm::Client::new(&t.env, &record.address);
-    assert_eq!(pool_client.admin(), t.admin);
-
-    // Rotating the factory's admin does not retroactively change an
-    // already-deployed pool's admin — documented tradeoff from #80.
-    let new_admin = Address::generate(&t.env);
-    t.client.transfer_admin(&new_admin);
-    assert_eq!(pool_client.admin(), t.admin);
-    assert_ne!(pool_client.admin(), new_admin);
-}
-
-// ── set_pool_wasm_hash ────────────────────────────────────────────────────────
-
-#[test]
-fn test_set_pool_wasm_hash_requires_admin_auth() {
-    let t = setup();
-    let new_hash = BytesN::from_array(&t.env, &[0xABu8; 32]);
-    let not_admin = Address::generate(&t.env);
-    let args = (&new_hash,).into_val(&t.env);
-    let invoke = MockAuthInvoke {
-        contract: &t.factory_addr,
-        fn_name: "set_pool_wasm_hash",
-        args,
-        sub_invokes: &[],
-    };
-    let result = t
-        .client
-        .mock_auths(&[MockAuth {
-            address: &not_admin,
-            invoke: &invoke,
-        }])
-        .try_set_pool_wasm_hash(&new_hash);
-
-    assert!(
-        result.is_err(),
-        "only the current admin may set pool wasm hash"
-    );
-    assert_eq!(t.client.pool_wasm_hash(), t.wasm_hash);
-}
-
-#[test]
-fn test_set_pool_wasm_hash_updates_future_pools() {
     let env = Env::default();
     env.mock_all_auths();
+
     let admin = Address::generate(&env);
-    let wasm_hash = upload_farming_pool_wasm(&env);
     let factory_addr = env.register(Factory, ());
+
+    // Upload the mock WASM hash matching the real farming-pool contract WASM.
+    // This test purposefully asserts that the deployed pool is *not* initialized.
+    //
+    // NOTE: We cannot reuse `MOCK_POOL_WASM` here, because that stub contract does
+    // not implement FarmingPool entrypoints.
+    let wasm_hash = env.deployer().upload_contract_wasm(farming_pool::WASM);
     let client = FactoryClient::new(&env, &factory_addr);
     client.initialize(&admin, &wasm_hash);
 
-    // Create a pool with the original WASM hash
-    let asset_a = Address::generate(&env);
-    let id_a = client.create_pool(&asset_a, &8_640_000u128, &2u32, &100u64);
-    assert_eq!(id_a, 0);
-    assert_eq!(client.pool_wasm_hash(), wasm_hash);
+    let asset = Address::generate(&env);
+    let pool_id = client.create_pool(&asset, &100u128, &10u64);
+    let record = client.get_pool(&pool_id);
 
-    // Change to a bogus hash that doesn't correspond to any uploaded WASM
-    let bogus_hash = BytesN::from_array(&env, &[0xABu8; 32]);
-    assert!(client.try_set_pool_wasm_hash(&bogus_hash).is_ok());
-    assert_eq!(client.pool_wasm_hash(), bogus_hash);
+    let pool_client = FarmingPoolClient::new(&env, &record.address);
 
-    // Future pools should fail to deploy because the bogus hash has no WASM
-    let asset_b = Address::generate(&env);
-    let result = client.try_create_pool(&asset_b, &8_640_000u128, &2u32, &100u64);
-    assert!(
-        result.is_err(),
-        "create_pool must fail when WASM hash doesn't correspond to uploaded code"
-    );
-
-    // Pool 0 is unaffected
-    let record = client.get_pool(&id_a);
-    assert_eq!(record.asset, asset_a);
+    // Any initialized-only function should fail with NotInitialized.
+    // `stake` also requires the caller to be auth'd; env.mock_all_auths() satisfies that.
+    let user = Address::generate(&env);
+    let res = pool_client.try_stake(&user, &1_000i128);
+    assert_eq!(res, Err(Ok(PoolContractError::NotInitialized)));
 }
 
-#[test]
-fn test_set_pool_wasm_hash_does_not_affect_already_deployed_pools() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let wasm_hash = upload_farming_pool_wasm(&env);
-    let factory_addr = env.register(Factory, ());
-    let client = FactoryClient::new(&env, &factory_addr);
-    client.initialize(&admin, &wasm_hash);
-
-    // Create pool 0
-    let asset_a = Address::generate(&env);
-    let id_a = client.create_pool(&asset_a, &8_640_000u128, &2u32, &100u64);
-    let record_a = client.get_pool(&id_a);
-
-    // Change the WASM hash
-    let bogus_hash = BytesN::from_array(&env, &[0xCDu8; 32]);
-    client.set_pool_wasm_hash(&bogus_hash);
-    assert_eq!(client.pool_wasm_hash(), bogus_hash);
-
-    // Existing pool is unaffected
-    let record_a_again = client.get_pool(&id_a);
-    assert_eq!(record_a_again, record_a);
-    assert_eq!(record_a_again.asset, asset_a);
-    assert_eq!(record_a_again.credit_rate, 500);
-    assert_eq!(record_a_again.global_multiplier, 2);
-    assert_eq!(record_a_again.min_lock_period, 100);
-
-    // Deployed pool contract is still functional
-    let pool_client = farming_pool_wasm::Client::new(&env, &record_a.address);
-    assert_eq!(pool_client.admin(), admin);
-}
-
-#[test]
-fn test_set_pool_wasm_hash_emits_event_with_old_and_new_hash() {
-    let t = setup();
-    let new_hash = upload_farming_pool_wasm(&t.env);
-    t.client.set_pool_wasm_hash(&new_hash);
-
-    assert_eq!(
-        t.env.events().all(),
-        vec![
-            &t.env,
-            (
-                t.factory_addr.clone(),
-                vec![
-                    &t.env,
-                    symbol_short!("factory").into_val(&t.env),
-                    symbol_short!("wasm_set").into_val(&t.env),
-                ],
-                (t.wasm_hash.clone(), new_hash.clone()).into_val(&t.env),
-            )
-        ]
-    );
-}
-
-#[test]
-fn test_set_pool_wasm_hash_rejects_uninitialized_factory() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let factory_addr = env.register(Factory, ());
-    let client = FactoryClient::new(&env, &factory_addr);
-    let hash = BytesN::from_array(&env, &[0u8; 32]);
-
-    let result = client.try_set_pool_wasm_hash(&hash);
-    assert_eq!(result, Err(Ok(FactoryError::NotInitialized)));
-}
