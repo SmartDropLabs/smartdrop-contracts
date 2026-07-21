@@ -286,6 +286,10 @@ impl Factory {
         env.events().publish(
             (symbol_short!("factory"), symbol_short!("pool_upg")),
             (pool_id, record.address, new_wasm_hash),
+        );
+        Ok(())
+    }
+
     /// Update the WASM hash used for future `create_pool` deployments. Admin-only.
     ///
     /// Allows the admin to point future pool deployments at a corrected or upgraded
@@ -358,6 +362,12 @@ impl Factory {
             .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
 
         let pool_id: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap();
+        // Compute next count with checked arithmetic before any deployment
+        // side-effect so overflow is caught as a typed error rather than
+        // relying on the workspace Cargo profile's overflow-checks flag.
+        let next_count = pool_id
+            .checked_add(1)
+            .ok_or(FactoryError::PoolCountOverflow)?;
         let wasm_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
         let salt = pool_salt(&env, pool_id);
 
@@ -397,7 +407,7 @@ impl Factory {
         bump_pool(&env, pool_id);
         env.storage()
             .instance()
-            .set(&DataKey::PoolCount, &(pool_id + 1));
+            .set(&DataKey::PoolCount, &next_count);
 
         // Emit enriched event so indexers get the full pool parameters in one shot.
         #[allow(deprecated)]
