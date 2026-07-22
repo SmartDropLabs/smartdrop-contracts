@@ -20,7 +20,10 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "u128": "100"
+                  "u128": "17280"
+                },
+                {
+                  "u32": 1
                 },
                 {
                   "u64": "10"
@@ -103,10 +106,18 @@
                   },
                   {
                     "key": {
-                      "symbol": "daily_rate"
+                      "symbol": "credit_rate"
                     },
                     "val": {
-                      "u128": "100"
+                      "i128": "1"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "global_multiplier"
+                    },
+                    "val": {
+                      "u32": 1
                     }
                   },
                   {
@@ -114,7 +125,7 @@
                       "symbol": "min_lock_period"
                     },
                     "val": {
-                      "u64": "10"
+                      "u32": 10
                     }
                   }
                 ]

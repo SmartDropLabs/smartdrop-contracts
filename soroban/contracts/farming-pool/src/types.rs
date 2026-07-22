@@ -9,7 +9,9 @@ pub enum PoolError {
     NotInitialized = 2,
     InvalidCreditRate = 3,
     NotPaused = 13,
+    Paused = 20,
     NoActiveStake = 14,
+
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.
@@ -53,6 +55,7 @@ pub enum DataKey {
     CreditRate,
     StakeToken,
     MinLockPeriod,
+    SchemaVersion,
     Paused,
     UserBoost(Address),
     UserStake(Address),

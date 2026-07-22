@@ -14,6 +14,12 @@ pub enum DataKey {
 }
 
 /// On-chain record for a registered farming pool.
+///
+/// Every field here is a direct mirror of the value passed to the deployed
+/// pool's `initialize` call — not advisory metadata. Callers can trust that
+/// `credit_rate`/`global_multiplier`/`min_lock_period` match what
+/// `FarmingPoolClient::credit_rate()`/`min_lock_period()` etc. return on the
+/// pool itself at creation time (see `test_create_pool_configures_deployed_pool_matching_factory_record`).
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PoolRecord {
@@ -21,10 +27,12 @@ pub struct PoolRecord {
     pub address: Address,
     /// The staking asset for this pool.
     pub asset: Address,
-    /// Per-ledger credit rate set for this pool at creation time.
-    pub daily_rate: u128,
+    /// Per-ledger credit accrual rate, as passed to the pool's `initialize`.
+    pub credit_rate: i128,
+    /// Boost multiplier applied to allocated stake, as passed to `initialize`.
+    pub global_multiplier: u32,
     /// Minimum number of ledgers a stake must be held before withdrawal.
-    pub min_lock_period: u64,
+    pub min_lock_period: u32,
 }
 
 /// Paginated pool registry response.
@@ -54,4 +62,17 @@ pub enum FactoryError {
     PoolNotFound = 2,
     /// `transfer_admin` was called by an address that is not the current admin.
     Unauthorized = 3,
+    /// `create_pool`'s `global_multiplier` was < 1 (mirrors `FarmingPool::initialize`'s own check).
+    InvalidGlobalMultiplier = 4,
+    /// `create_pool`'s `daily_rate` converts to a `credit_rate` of zero (or doesn't fit `i128`).
+    ///
+    /// `FarmingPool::initialize` requires `credit_rate > 0`; a `daily_rate` below
+    /// `LEDGERS_PER_DAY` truncates to zero under the daily-to-per-ledger conversion
+    /// and is rejected here rather than silently deploying a pool that can never
+    /// initialize.
+    InvalidCreditRate = 5,
+    /// `create_pool`'s `min_lock_period` does not fit in the pool's native `u32`.
+    MinLockPeriodOutOfRange = 6,
+    /// A function requiring initialization was called on an uninitialized factory.
+    NotInitialized = 7,
 }
