@@ -286,6 +286,11 @@ impl Factory {
         env.events().publish(
             (symbol_short!("factory"), symbol_short!("pool_upg")),
             (pool_id, record.address, new_wasm_hash),
+        );
+
+        Ok(())
+    }
+
     /// Update the WASM hash used for future `create_pool` deployments. Admin-only.
     ///
     /// Allows the admin to point future pool deployments at a corrected or upgraded

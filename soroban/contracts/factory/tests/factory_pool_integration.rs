@@ -65,7 +65,7 @@ use soroban_sdk::{
 };
 
 use factory::{Factory, FactoryClient};
-use farming_pool::FarmingPoolClient;
+use farming_pool::{FarmingPoolClient, PoolError};
 
 /// Real, compiled farming-pool WASM — see the module doc comment above for
 /// how this fixture is produced and kept fresh.
@@ -87,6 +87,7 @@ fn deploy_pool_via_factory(
     admin: &Address,
     asset: &Address,
     daily_rate: u128,
+    global_multiplier: u32,
     min_lock_period: u64,
 ) -> (FarmingPoolClient<'static>, Address) {
     let wasm_hash = env.deployer().upload_contract_wasm(FARMING_POOL_WASM);
@@ -95,7 +96,7 @@ fn deploy_pool_via_factory(
     let factory_client = FactoryClient::new(env, &factory_addr);
     factory_client.initialize(admin, &wasm_hash);
 
-    let pool_id = factory_client.create_pool(asset, &daily_rate, &min_lock_period);
+    let pool_id = factory_client.create_pool(asset, &daily_rate, &global_multiplier, &min_lock_period);
     let record = factory_client.get_pool(&pool_id);
     let pool_address = record.address.clone();
 
@@ -121,18 +122,70 @@ fn smoke_create_pool_returns_live_pool_address() {
     let factory_client = FactoryClient::new(&env, &factory_addr);
     factory_client.initialize(&admin, &wasm_hash);
 
-    let pool_id = factory_client.create_pool(&asset, &100u128, &10u64);
+    let pool_id = factory_client.create_pool(&asset, &17_280u128, &1u32, &10u64);
     let record = factory_client.get_pool(&pool_id);
 
     // The deployed pool exists at a real address the factory tracked, and it
     // is reachable via FarmingPoolClient (a bogus/undeployed address would
-    // panic on the first call below).
+    // panic on the first call below). create_pool (#79) already initialized
+    // it atomically, so it must already report the factory's admin as its own.
     let pool_client = FarmingPoolClient::new(&env, &record.address);
-    // workaround for #78 — remove once create_pool initializes pools.
-    // create_pool's `deploy_v2(wasm_hash, ())` never calls the pool's own
-    // `initialize`, so the pool starts life uninitialized; prove that by
-    // reading its admin only after initializing it here.
-    pool_client.initialize(&admin, &asset, &1u32, &1i128, &0u32);
+    assert_eq!(pool_client.admin(), admin);
+}
+
+/// #79 acceptance criterion 1: `create_pool` deploys and initializes the
+/// pool atomically, so the pool's admin is set to the factory's admin by the
+/// time `create_pool` returns — there is no separate step the factory (or
+/// anyone else) needs to perform afterwards.
+#[test]
+fn test_create_pool_pool_admin_is_set_atomically() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    let wasm_hash = env.deployer().upload_contract_wasm(FARMING_POOL_WASM);
+    let factory_addr = env.register(Factory, ());
+    let factory_client = FactoryClient::new(&env, &factory_addr);
+    factory_client.initialize(&admin, &wasm_hash);
+
+    let pool_id = factory_client.create_pool(&asset, &17_280u128, &1u32, &10u64);
+    let record = factory_client.get_pool(&pool_id);
+
+    let pool_client = FarmingPoolClient::new(&env, &record.address);
+    assert_eq!(pool_client.admin(), admin);
+}
+
+/// #79 acceptance criterion 2: because `create_pool` initializes the pool in
+/// the same invocation that deploys it, there is no externally-observable
+/// window in which the pool is deployed but uninitialized. An unrelated
+/// third party who tries to call the deployed pool's own `initialize` after
+/// the fact — the exact front-running move #79 closes — must be rejected
+/// with `PoolError::AlreadyInitialized`, not silently succeed and seize
+/// admin.
+#[test]
+fn test_third_party_cannot_reinitialize_deployed_pool() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    let wasm_hash = env.deployer().upload_contract_wasm(FARMING_POOL_WASM);
+    let factory_addr = env.register(Factory, ());
+    let factory_client = FactoryClient::new(&env, &factory_addr);
+    factory_client.initialize(&admin, &wasm_hash);
+
+    let pool_id = factory_client.create_pool(&asset, &17_280u128, &1u32, &10u64);
+    let record = factory_client.get_pool(&pool_id);
+
+    let pool_client = FarmingPoolClient::new(&env, &record.address);
+    let result = pool_client.try_initialize(&attacker, &asset, &1u32, &1i128, &10u32);
+    assert_eq!(result, Err(Ok(PoolError::AlreadyInitialized)));
+
+    // The rejected re-initialize attempt must not have changed anything.
     assert_eq!(pool_client.admin(), admin);
 }
 
@@ -160,7 +213,10 @@ fn end_to_end_create_pool_then_stake_and_unstake() {
 
     let global_multiplier = 2u32;
     let credit_rate = 1i128;
-    let daily_rate = 500u128;
+    // daily_rate=17_280 is the smallest value that survives create_pool's
+    // daily_rate -> credit_rate conversion (divides by LEDGERS_PER_DAY) and
+    // yields credit_rate == 1, matching this test's assumed rate below.
+    let daily_rate = 17_280u128;
     let min_lock_period: u32 = 0;
 
     let (pool_client, pool_address) = deploy_pool_via_factory(
@@ -168,19 +224,16 @@ fn end_to_end_create_pool_then_stake_and_unstake() {
         &admin,
         &asset.address(),
         daily_rate,
+        1u32,
         min_lock_period as u64,
     );
 
-    // workaround for #78 — remove once create_pool initializes pools.
-    // Factory::create_pool deploys the pool's WASM but never invokes its
-    // `initialize`, so it must be initialized manually here before use.
-    pool_client.initialize(
-        &admin,
-        &asset.address(),
-        &global_multiplier,
-        &credit_rate,
-        &min_lock_period,
-    );
+    // create_pool (#79) already initialized the pool atomically with
+    // global_multiplier=1 and credit_rate derived from daily_rate above;
+    // reconfigure global_multiplier to this test's value via the pool's own
+    // admin setter
+    // (factory's admin became the pool's admin, so this is authorized).
+    pool_client.set_global_multiplier(&global_multiplier);
 
     let stake_amount: i128 = 1_000;
     pool_client.stake(&user, &stake_amount);
@@ -247,9 +300,13 @@ fn end_to_end_create_pool_then_lock_and_unlock() {
     const INITIAL_MINT: i128 = 1_000_000_000;
     token_sac.mint(&user, &INITIAL_MINT);
 
-    let global_multiplier = 1u32;
+    // global_multiplier is passed as 1 at creation — this test only
+    // exercises lock/unlock, which isn't affected by it.
     let credit_rate = 2i128;
-    let daily_rate = 300u128;
+    // daily_rate=17_280 is the smallest value that survives create_pool's
+    // daily_rate -> credit_rate conversion; the resulting credit_rate is
+    // overridden below via set_credit_rate anyway.
+    let daily_rate = 17_280u128;
     let min_lock_period_ledgers = 50u32;
 
     let (pool_client, pool_address) = deploy_pool_via_factory(
@@ -257,19 +314,15 @@ fn end_to_end_create_pool_then_lock_and_unlock() {
         &admin,
         &asset.address(),
         daily_rate,
+        1u32,
         min_lock_period_ledgers as u64,
     );
 
-    // workaround for #78 — remove once create_pool initializes pools.
-    // Factory::create_pool deploys the pool's WASM but never invokes its
-    // `initialize`, so it must be initialized manually here before use.
-    pool_client.initialize(
-        &admin,
-        &asset.address(),
-        &global_multiplier,
-        &credit_rate,
-        &min_lock_period_ledgers,
-    );
+    // create_pool (#79) already initialized the pool atomically with the
+    // factory's hardcoded defaults (global_multiplier=1, credit_rate=1);
+    // reconfigure to this test's values via the pool's own admin setters
+    // (factory's admin became the pool's admin, so this is authorized).
+    pool_client.set_credit_rate(&credit_rate);
 
     let lock_amount: i128 = 2_000;
     pool_client.lock_assets(&user, &lock_amount);

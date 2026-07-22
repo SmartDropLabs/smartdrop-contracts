@@ -253,6 +253,9 @@ fn test_upgrade_requires_admin_auth() {
 
     assert!(result.is_err(), "non-admin upgrade must be rejected");
     assert_eq!(client.admin(), admin);
+}
+
+#[test]
 fn test_admin_uninitialized_returns_not_initialized() {
     let (_env, client, _user) = setup_uninitialized();
     match client.try_admin() {
