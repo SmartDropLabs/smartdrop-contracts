@@ -236,7 +236,11 @@ fn test_get_pools_by_asset_returns_empty_when_no_pools() {
     let t = setup();
     let asset = Address::generate(&t.env);
     let page = t.client.get_pools_by_asset(&asset, &0u32, &10u32);
-    assert_eq!(page.records.len(), 0, "expected no pools for a fresh factory");
+    assert_eq!(
+        page.records.len(),
+        0,
+        "expected no pools for a fresh factory"
+    );
 }
 
 // ── transfer_admin ────────────────────────────────────────────────────────────
@@ -518,7 +522,7 @@ fn test_get_pools_by_asset_paginates_large_matching_registry() {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
-    let wasm_hash = upload_mock_pool_wasm(&env);
+    let wasm_hash = upload_farming_pool_wasm(&env);
     let factory_addr = env.register(Factory, ());
     let client = FactoryClient::new(&env, &factory_addr);
     client.initialize(&admin, &wasm_hash);
@@ -526,7 +530,12 @@ fn test_get_pools_by_asset_paginates_large_matching_registry() {
     // Create 25 pools all sharing the same asset
     let asset = Address::generate(&env);
     for i in 0..25 {
-        client.create_pool(&asset, &(100 + i as u128), &(10 + i as u64));
+        client.create_pool(
+            &asset,
+            &(1_728_000 + i as u128 * 17_280),
+            &2u32,
+            &(10 + i as u64),
+        );
     }
 
     // First page should return 20 records
@@ -635,6 +644,28 @@ fn test_create_pool_increments_count_after_each_pool() {
 }
 
 #[test]
+fn test_create_pool_returns_typed_error_when_pool_count_overflows() {
+    let t = setup();
+
+    t.env.as_contract(&t.factory_addr, || {
+        t.env
+            .storage()
+            .instance()
+            .set(&DataKey::PoolCount, &u32::MAX);
+    });
+
+    let result =
+        t.client
+            .try_create_pool(&Address::generate(&t.env), &1_728_000u128, &2u32, &100u64);
+
+    assert_eq!(result, Err(Ok(FactoryError::PoolCountOverflow)));
+    assert_eq!(t.client.pool_count(), u32::MAX);
+    assert!(!t.env.as_contract(&t.factory_addr, || {
+        t.env.storage().persistent().has(&DataKey::Pool(u32::MAX))
+    }));
+}
+
+#[test]
 fn test_create_pool_uses_deterministic_pool_addresses() {
     let t = setup();
     let asset = Address::generate(&t.env);
@@ -707,7 +738,7 @@ fn test_get_pool_bumps_pool_record_ttl() {
     advance_ledgers(&t.env, TTL_EXTEND_TO - TTL_THRESHOLD + 1);
     assert!(pool_record_ttl(&t.env, &t.factory_addr, id) < TTL_THRESHOLD);
 
-    assert_eq!(t.client.try_get_pool(&id).is_ok(), true);
+    assert!(t.client.try_get_pool(&id).is_ok());
     assert_eq!(pool_record_ttl(&t.env, &t.factory_addr, id), TTL_EXTEND_TO);
 }
 
@@ -716,7 +747,7 @@ fn test_refresh_pool_ttls_restores_ttl_for_unqueried_pool() {
     let t = setup();
     let id = t
         .client
-        .create_pool(&Address::generate(&t.env), &250u128, &50u64);
+        .create_pool(&Address::generate(&t.env), &1_728_000u128, &2u32, &50u64);
 
     // Initial TTL after creation
     assert_eq!(pool_record_ttl(&t.env, &t.factory_addr, id), TTL_EXTEND_TO);
@@ -726,10 +757,7 @@ fn test_refresh_pool_ttls_restores_ttl_for_unqueried_pool() {
     assert!(pool_record_ttl(&t.env, &t.factory_addr, id) < TTL_THRESHOLD);
 
     // Call refresh_pool_ttls to restore TTL without a specific get_pool query
-    assert_eq!(
-        t.client.try_refresh_pool_ttls(&id, &1u32),
-        Ok(Ok(()))
-    );
+    assert_eq!(t.client.try_refresh_pool_ttls(&id, &1u32), Ok(Ok(())));
 
     // Verify TTL is restored
     assert_eq!(pool_record_ttl(&t.env, &t.factory_addr, id), TTL_EXTEND_TO);

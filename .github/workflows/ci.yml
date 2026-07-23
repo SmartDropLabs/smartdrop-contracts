@@ -33,6 +33,9 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build WASM fixtures for factory integration tests
+        working-directory: soroban
+        run: cargo build --workspace --target wasm32v1-none --release
+
       - name: Check formatting
         working-directory: soroban
         run: cargo fmt --all -- --check
@@ -40,10 +43,6 @@ jobs:
       - name: Clippy
         working-directory: soroban
         run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Build farming-pool WASM fixture for factory integration tests
-        working-directory: soroban
-        run: cargo build --workspace --target wasm32v1-none --release
 
       - name: Run tests
         working-directory: soroban

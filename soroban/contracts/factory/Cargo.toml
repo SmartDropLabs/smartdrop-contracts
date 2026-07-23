@@ -12,4 +12,5 @@ doctest    = false
 soroban-sdk = { workspace = true }
 
 [dev-dependencies]
+farming-pool = { path = "../farming-pool" }
 soroban-sdk = { workspace = true, features = ["testutils"] }

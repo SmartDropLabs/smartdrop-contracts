@@ -253,6 +253,9 @@ fn test_upgrade_requires_admin_auth() {
 
     assert!(result.is_err(), "non-admin upgrade must be rejected");
     assert_eq!(client.admin(), admin);
+}
+
+#[test]
 fn test_admin_uninitialized_returns_not_initialized() {
     let (_env, client, _user) = setup_uninitialized();
     match client.try_admin() {
@@ -997,7 +1000,6 @@ fn test_pause_blocks_lock_assets() {
     }
 }
 
-
 #[test]
 fn test_pause_blocks_unlock_assets() {
     let t = setup(1, 1);
@@ -1009,7 +1011,6 @@ fn test_pause_blocks_unlock_assets() {
         other => panic!("expected PoolError::Paused, got: {:?}", other),
     }
 }
-
 
 #[test]
 fn test_unpause_restores_operations() {
@@ -1053,7 +1054,6 @@ fn test_pause_blocks_stake() {
         other => panic!("expected PoolError::Paused, got: {:?}", other),
     }
 }
-
 
 #[test]
 fn test_unpause_restores_stake() {
