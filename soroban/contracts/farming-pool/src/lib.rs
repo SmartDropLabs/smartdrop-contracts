@@ -1,10 +1,14 @@
 #![no_std]
 
 mod types;
+#[cfg(test)]
+mod mock_reentrant_token;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, BytesN, Env};
 pub use types::PoolError;
 use types::{BoostConfig, DataKey, Position, UserStake};
+
+pub const SCHEMA_VERSION: u32 = 1;
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5s/ledger).
 const USER_TTL_THRESHOLD: u32 = 518_400;
@@ -75,6 +79,14 @@ fn require_initialized(env: &Env) -> Result<(), PoolError> {
     Ok(())
 }
 
+fn require_not_paused(env: &Env) -> Result<(), PoolError> {
+    if pool_is_paused(env) {
+        return Err(PoolError::Paused);
+    }
+    Ok(())
+}
+
+
 fn get_admin(env: &Env) -> Result<Address, PoolError> {
     env.storage()
         .instance()
@@ -115,6 +127,13 @@ fn pool_is_paused(env: &Env) -> bool {
         .instance()
         .get(&DataKey::Paused)
         .unwrap_or(false)
+}
+
+fn read_schema_version(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::SchemaVersion)
+        .unwrap_or(SCHEMA_VERSION)
 }
 
 fn get_user_boost(env: &Env, user: &Address) -> Option<u32> {
@@ -256,17 +275,20 @@ impl FarmingPool {
         env.storage()
             .instance()
             .set(&DataKey::MinLockPeriod, &min_lock_period);
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
         bump_instance(&env);
         Ok(())
     }
 
-    pub fn admin(env: Env) -> Address {
+    pub fn admin(env: Env) -> Result<Address, PoolError> {
         bump_instance(&env);
-        get_admin(&env).unwrap()
+        get_admin(&env)
     }
 
-    pub fn transfer_admin(env: Env, new_admin: Address) {
-        let current = get_admin(&env).unwrap();
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), PoolError> {
+        let current = get_admin(&env)?;
         current.require_auth();
         bump_instance(&env);
 
@@ -275,12 +297,45 @@ impl FarmingPool {
             (symbol_short!("pool"), symbol_short!("adm_xfr")),
             (current, new_admin),
         );
+        Ok(())
+    }
+
+    pub fn schema_version(env: Env) -> u32 {
+        bump_instance(&env);
+        read_schema_version(&env)
+    }
+
+    pub fn migrate(env: Env) -> Result<u32, PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        bump_instance(&env);
+
+        let current = read_schema_version(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
+        Ok(current)
+    }
+
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        bump_instance(&env);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("upgraded")),
+            new_wasm_hash.clone(),
+        );
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
     }
 
     pub fn lock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         assert!(amount > 0, "amount must be positive");
         bump_instance(&env);
 
@@ -302,6 +357,17 @@ impl FarmingPool {
 
         position.credit_rate = read_credit_rate(&env);
 
+        // Checks-effects-interactions: persist state *before* the external
+        // token transfer below. `stake_token` is an admin-supplied address,
+        // not necessarily a trusted Stellar Asset Contract, and its
+        // `transfer` is a synchronous cross-contract call that could
+        // otherwise observe (or, on a future host that permits it, mutate)
+        // this position while it's still only a local variable. If the
+        // transfer fails, the whole invocation reverts and this write is
+        // rolled back with it — Soroban's per-invocation atomicity, not
+        // manual sequencing, is what keeps this safe on failure. See #69.
+        set_position(&env, &user, &position);
+
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &user,
@@ -309,7 +375,6 @@ impl FarmingPool {
             &amount,
         );
 
-        set_position(&env, &user, &position);
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("locked")),
             (user, amount),
@@ -320,7 +385,8 @@ impl FarmingPool {
     pub fn unlock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         assert!(amount > 0, "amount must be positive");
         bump_instance(&env);
 
@@ -458,7 +524,8 @@ impl FarmingPool {
 
     pub fn stake(env: Env, from: Address, amount: i128) -> Result<(), PoolError> {
         from.require_auth();
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         require_initialized(&env)?;
         assert!(amount > 0, "amount must be positive");
         bump_instance(&env);
@@ -492,7 +559,8 @@ impl FarmingPool {
 
     pub fn unstake(env: Env, from: Address) -> Result<i128, PoolError> {
         from.require_auth();
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
         require_initialized(&env)?;
         bump_instance(&env);
 
@@ -513,7 +581,9 @@ impl FarmingPool {
 
     pub fn set_boost(env: Env, user: Address, allocation_pct: u32) -> Result<(), PoolError> {
         user.require_auth();
-        assert!(!pool_is_paused(&env), "pool is paused");
+        require_not_paused(&env)?;
+
+
         require_initialized(&env)?;
         assert!(
             allocation_pct >= 1 && allocation_pct <= 100,
