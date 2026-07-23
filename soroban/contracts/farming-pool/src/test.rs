@@ -728,6 +728,7 @@ fn test_lock_assets_creates_position() {
     assert_eq!(pos.amount, 500);
     assert_eq!(pos.total_credits, 0);
     assert_eq!(t.token.balance(&t.user), initial_balance - 500);
+    assert_eq!(t.token.balance(&t.contract_id), 500);
 }
 
 #[test]
@@ -745,6 +746,18 @@ fn test_lock_assets_additional_lock_checkpoints_credits() {
         .expect("position should exist");
     assert_eq!(pos.amount, 1_500);
     assert_eq!(pos.total_credits, 10_000); // 1000 * 10
+}
+
+#[test]
+fn test_multiple_locks_credit_only_new_amount_for_later_ledgers() {
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &100);
+    advance_ledgers(&t.env, 1_000);
+
+    t.client.lock_assets(&t.user, &100);
+    advance_ledgers(&t.env, 1_000);
+
+    assert_eq!(t.client.calculate_credits(&t.user), 300_000);
 }
 
 #[test]
@@ -773,9 +786,21 @@ fn test_lock_assets_rejects_insufficient_balance() {
 fn test_lock_assets_emits_event() {
     let t = setup(1, 1);
     t.client.lock_assets(&t.user, &1_000);
-    assert!(
-        !t.env.events().all().events().is_empty(),
-        "lock event not emitted"
+
+    assert_eq!(
+        t.env.events().all().filter_by_contract(&t.contract_id),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("locked").into_val(&t.env)
+                ],
+                (t.user.clone(), 1_000i128).into_val(&t.env),
+            )
+        ]
     );
 }
 
@@ -792,6 +817,7 @@ fn test_unlock_assets_full_returns_tokens_and_credits() {
 
     // All tokens returned, position removed, credits = 1000 * 10.
     assert_eq!(t.token.balance(&t.user), initial_balance);
+    assert_eq!(t.token.balance(&t.contract_id), 0);
     assert!(t.client.get_user_position(&t.user).is_none());
     assert_eq!(t.client.calculate_credits(&t.user), 0);
 }
@@ -800,19 +826,20 @@ fn test_unlock_assets_full_returns_tokens_and_credits() {
 fn test_unlock_assets_partial_keeps_remaining_position() {
     let t = setup(1, 1);
     let initial_balance = t.token.balance(&t.user);
-    t.client.lock_assets(&t.user, &1_000);
+    t.client.lock_assets(&t.user, &500);
     advance_ledgers(&t.env, 10);
 
-    t.client.unlock_assets(&t.user, &400); // partial unlock
+    t.client.unlock_assets(&t.user, &200); // partial unlock
 
     let pos = t
         .client
         .get_user_position(&t.user)
         .expect("position should still exist");
-    assert_eq!(pos.amount, 600);
-    // 1000 * 10 = 10000 credits banked during checkpoint
-    assert_eq!(pos.total_credits, 10_000);
-    assert_eq!(t.token.balance(&t.user), initial_balance - 600);
+    assert_eq!(pos.amount, 300);
+    // 500 * 10 = 5000 credits banked during checkpoint.
+    assert_eq!(pos.total_credits, 5_000);
+    assert_eq!(t.token.balance(&t.user), initial_balance - 300);
+    assert_eq!(t.token.balance(&t.contract_id), 300);
 }
 
 #[test]
@@ -841,9 +868,21 @@ fn test_unlock_assets_emits_event() {
     t.client.lock_assets(&t.user, &1_000);
     advance_ledgers(&t.env, 5);
     t.client.unlock_assets(&t.user, &1_000);
-    assert!(
-        !t.env.events().all().events().is_empty(),
-        "unlock event not emitted"
+
+    assert_eq!(
+        t.env.events().all().filter_by_contract(&t.contract_id),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("unlocked").into_val(&t.env)
+                ],
+                (t.user.clone(), 1_000i128, 5_000i128).into_val(&t.env),
+            )
+        ]
     );
 }
 
