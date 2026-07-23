@@ -4,7 +4,7 @@ build:
 	cd soroban && cargo build --target wasm32-unknown-unknown --release
 
 test:
-	cd soroban && cargo build -p farming-pool --target wasm32v1-none --release
+	cd soroban && cargo build --workspace --target wasm32v1-none --release
 	cd soroban && cargo test --workspace
 
 deploy-testnet:

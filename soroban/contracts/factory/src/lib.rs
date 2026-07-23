@@ -257,6 +257,35 @@ impl Factory {
         );
     }
 
+    /// Upgrade one registered farming pool in place. Admin-only.
+    ///
+    /// This deliberately does not update the factory-level `WasmHash`; it is a
+    /// pool-by-pool hot swap for a pre-installed WASM hash.
+    pub fn upgrade_pool(
+        env: Env,
+        pool_id: u32,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), FactoryError> {
+        let admin = load_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+
+        let key = DataKey::Pool(pool_id);
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&key)
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        let upgrade_args: Vec<Val> = vec![&env, new_wasm_hash.clone().into_val(&env)];
+        let _: () =
+            env.invoke_contract(&record.address, &Symbol::new(&env, "upgrade"), upgrade_args);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("pool_upg")),
+            (pool_id, record.address, new_wasm_hash),
     /// Update the WASM hash used for future `create_pool` deployments. Admin-only.
     ///
     /// Allows the admin to point future pool deployments at a corrected or upgraded

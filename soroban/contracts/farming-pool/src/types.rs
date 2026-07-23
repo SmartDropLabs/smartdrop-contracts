@@ -55,6 +55,7 @@ pub enum DataKey {
     CreditRate,
     StakeToken,
     MinLockPeriod,
+    SchemaVersion,
     Paused,
     UserBoost(Address),
     UserStake(Address),
