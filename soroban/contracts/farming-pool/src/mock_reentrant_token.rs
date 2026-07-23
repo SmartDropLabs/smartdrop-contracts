@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 //! A minimal token-interface contract for exercising checks-effects-
 //! interactions (CEI) reentrancy scenarios in tests (#69). Configured with a
 //! target contract + user, its `transfer` attempts to call back into the
