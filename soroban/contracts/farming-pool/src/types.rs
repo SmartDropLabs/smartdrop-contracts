@@ -11,6 +11,8 @@ pub enum PoolError {
     NotPaused = 13,
     Paused = 20,
     NoActiveStake = 14,
+    /// `global_multiplier` was 0 or exceeded `MAX_GLOBAL_MULTIPLIER`. See #89.
+    InvalidGlobalMultiplier = 15,
 
 }
 

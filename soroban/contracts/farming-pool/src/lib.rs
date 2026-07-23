@@ -14,6 +14,52 @@ pub const SCHEMA_VERSION: u32 = 1;
 const USER_TTL_THRESHOLD: u32 = 518_400;
 const USER_TTL_EXTEND_TO: u32 = 1_036_800;
 
+/// Sanity ceilings on `global_multiplier` and `credit_rate` (see #89).
+///
+/// `compute_credits` computes
+/// `compute_total_stake(amount, allocation_pct, multiplier) * credit_rate * ledgers_elapsed`,
+/// and `compute_total_stake` reduces to exactly `amount * multiplier` at
+/// `allocation_pct = 100` (its worst case: `boosted = amount`, `principal = 0`).
+/// The `/100` division in `compute_total_stake` therefore does *not* loosen
+/// this bound at the boundary — the naive product below is tight, not a
+/// conservative over-estimate.
+///
+/// Worst-case overflow chain:
+///
+/// ```text
+/// amount_max * multiplier_max * credit_rate_max * elapsed_max <= i128::MAX / 16
+/// ```
+///
+/// Inputs, chosen and justified independently of the multiplier/credit-rate
+/// ceilings themselves:
+/// - `amount_max = 10^18` — 100 billion whole tokens at Stellar's standard
+///   7-decimal ("stroop") convention. Far above any realistic pool TVL, but
+///   many orders of magnitude below `i128::MAX` (~1.7 x 10^38).
+/// - `elapsed_max = 63_072_000` ledgers — ~10 years at 5s/ledger
+///   (`10 * 365 * 24 * 3600 / 5`), a multi-year operational horizon between
+///   checkpoints.
+/// - Headroom factor of 16x, i.e. the worst-case product must not exceed
+///   `i128::MAX / 16`, leaving ample margin beyond the bare non-overflow
+///   requirement.
+///
+/// Solving for `multiplier_max * credit_rate_max`:
+/// `(i128::MAX / 16) / (amount_max * elapsed_max) ≈ 1.686 x 10^11`.
+///
+/// Chosen ceilings (round, human-readable, at or below the derived bound):
+/// - `MAX_GLOBAL_MULTIPLIER = 1_000`
+/// - `MAX_CREDIT_RATE = 100_000_000` (10^8)
+/// - product = 10^11, comfortably under the 1.686 x 10^11 budget.
+///
+/// Verification: `amount_max * multiplier_max * credit_rate_max * elapsed_max`
+/// = `10^18 * 1_000 * 10^8 * 63_072_000` ≈ `6.307 x 10^36`, versus
+/// `i128::MAX ≈ 1.701 x 10^38` — a headroom ratio of ~27x, comfortably
+/// exceeding the required 16x. (For reference, the earlier sketch pair of
+/// 1_000 / 1_000_000_000 gives a worst case of ≈ 6.307 x 10^37, which fits
+/// under raw `i128::MAX` but only with ~2.7x headroom — it does not survive
+/// this derivation's 16x margin, hence `MAX_CREDIT_RATE` here is 10x smaller.)
+const MAX_GLOBAL_MULTIPLIER: u32 = 1_000;
+const MAX_CREDIT_RATE: i128 = 100_000_000;
+
 fn bump_instance(env: &Env) {
     env.storage()
         .instance()
@@ -193,6 +239,10 @@ pub struct FarmingPool;
 
 #[contractimpl]
 impl FarmingPool {
+    /// Initialize the pool. `global_multiplier` and `credit_rate` are bounded
+    /// by `MAX_GLOBAL_MULTIPLIER`/`MAX_CREDIT_RATE` — see #89 for the
+    /// overflow-safety derivation shared with `set_global_multiplier` and
+    /// `set_credit_rate`.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -204,8 +254,13 @@ impl FarmingPool {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(PoolError::AlreadyInitialized);
         }
-        assert!(global_multiplier >= 1, "multiplier must be >= 1");
-        assert!(credit_rate > 0, "credit_rate must be positive");
+        // Ceilings mirror `set_global_multiplier`/`set_credit_rate` — see #89.
+        if !(1..=MAX_GLOBAL_MULTIPLIER).contains(&global_multiplier) {
+            return Err(PoolError::InvalidGlobalMultiplier);
+        }
+        if credit_rate <= 0 || credit_rate > MAX_CREDIT_RATE {
+            return Err(PoolError::InvalidCreditRate);
+        }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -564,10 +619,14 @@ impl FarmingPool {
         )
     }
 
+    /// Set the global credit multiplier. Rejects 0 and anything above
+    /// `MAX_GLOBAL_MULTIPLIER` — see #89 for the overflow-safety derivation.
     pub fn set_global_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
-        assert!(multiplier >= 1, "multiplier must be >= 1");
+        if !(1..=MAX_GLOBAL_MULTIPLIER).contains(&multiplier) {
+            return Err(PoolError::InvalidGlobalMultiplier);
+        }
         bump_instance(&env);
 
         env.storage()
@@ -580,10 +639,12 @@ impl FarmingPool {
         Ok(())
     }
 
+    /// Set the credit accrual rate. Rejects non-positive values and anything
+    /// above `MAX_CREDIT_RATE` — see #89 for the overflow-safety derivation.
     pub fn set_credit_rate(env: Env, new_rate: i128) -> Result<(), PoolError> {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
-        if new_rate <= 0 {
+        if new_rate <= 0 || new_rate > MAX_CREDIT_RATE {
             return Err(PoolError::InvalidCreditRate);
         }
         bump_instance(&env);
