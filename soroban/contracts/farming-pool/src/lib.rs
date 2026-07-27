@@ -691,9 +691,17 @@ impl FarmingPool {
             }
         };
 
-        // Pull tokens from caller into the contract.
-        // token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
+        // Checks-effects-interactions: persist state *before* the external
+        // token transfer below. `stake_token` is an admin-supplied address,
+        // not necessarily a trusted Stellar Asset Contract, and its
+        // `transfer` is a synchronous cross-contract call that could
+        // otherwise observe (or, on a future host that permits it, mutate)
+        // stake state while it's still only a local variable. If the
+        // transfer fails, the whole invocation reverts and this write is
+        // rolled back with it — Soroban's per-invocation atomicity, not
+        // manual sequencing, is what keeps this safe on failure. See #71.
         new_stake.credit_rate = read_credit_rate(&env);
+        set_user_stake(&env, &from, &new_stake);
 
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
@@ -702,7 +710,6 @@ impl FarmingPool {
             &amount,
         );
 
-        set_user_stake(&env, &from, &new_stake);
         Ok(())
     }
 
@@ -719,17 +726,26 @@ impl FarmingPool {
             // proceed with previously banked credits only
         }
         let total_credits = stake.credits_banked;
+        let amount = stake.amount;
 
-        // Return staked tokens to caller.
-        // token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
+        // Checks-effects-interactions: clear state *before* the external
+        // token transfer below. `stake_token` is an admin-supplied address,
+        // not necessarily a trusted Stellar Asset Contract, and its
+        // `transfer` is a synchronous cross-contract call that could
+        // otherwise observe (or, on a future host that permits it, mutate)
+        // the not-yet-removed UserStake, allowing a reentrant double-payout.
+        // Removing the record first ensures a reentrant call sees None/an
+        // already-cleared UserStake and cannot obtain a second payout.
+        // See #71.
+        remove_user_stake(&env, &from);
+
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &env.current_contract_address(),
             &from,
-            &stake.amount,
+            &amount,
         );
 
-        remove_user_stake(&env, &from);
         Ok(total_credits)
     }
 
