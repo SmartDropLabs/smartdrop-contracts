@@ -264,7 +264,9 @@ impl FarmingPool {
         require_initialized(&env)?;
         require_not_paused(&env)?;
 
-        assert!(amount > 0, "amount must be positive");
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
         bump_instance(&env);
 
         let current = env.ledger().sequence();
@@ -315,17 +317,20 @@ impl FarmingPool {
         require_initialized(&env)?;
         require_not_paused(&env)?;
 
-        assert!(amount > 0, "amount must be positive");
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
         bump_instance(&env);
 
-        let mut position = get_position(&env, &user).expect("no active position");
-        assert!(amount <= position.amount, "insufficient locked balance");
+        let mut position = get_position(&env, &user).ok_or(PoolError::NoActiveStake)?;
+        if amount > position.amount {
+            return Err(PoolError::InsufficientBalance);
+        }
 
         let current = env.ledger().sequence();
-        assert!(
-            current >= position.unlock_ledger,
-            "minimum lock period not elapsed"
-        );
+        if current < position.unlock_ledger {
+            return Err(PoolError::LockPeriodNotElapsed);
+        }
 
         // Try to checkpoint credits; if the credit computation overflows,
         // fall back to the previously banked credits so the unlock still works.
@@ -467,7 +472,9 @@ impl FarmingPool {
         require_not_paused(&env)?;
 
         require_initialized(&env)?;
-        assert!(amount > 0, "amount must be positive");
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
         bump_instance(&env);
 
         let current = env.ledger().sequence();
@@ -529,10 +536,9 @@ impl FarmingPool {
 
 
         require_initialized(&env)?;
-        assert!(
-            allocation_pct >= 1 && allocation_pct <= 100,
-            "allocation_pct must be 1-100"
-        );
+        if !(1..=100).contains(&allocation_pct) {
+            return Err(PoolError::InvalidAllocation);
+        }
         bump_instance(&env);
 
         if let Some(mut stake) = get_user_stake(&env, &user) {

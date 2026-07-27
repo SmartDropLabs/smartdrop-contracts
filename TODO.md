@@ -1,18 +1,16 @@
-# Issue #62: farming-pool overflow fix
+# Farming Pool: Typed Validation Errors (#66)
 
-## Steps
+## Progress
 
-- [x] Step 1: Read all source files and gather information
-- [x] Step 2: Create and confirm plan with user
-- [ ] Step 3: Edit `types.rs` - Add `CreditOverflow = 15` to `PoolError`
-- [ ] Step 4: Edit `lib.rs` - Convert `compute_total_stake` to return `Result<i128, PoolError>`
-- [ ] Step 5: Edit `lib.rs` - Convert `compute_credits` to return `Result<i128, PoolError>`
-- [ ] Step 6: Edit `lib.rs` - Convert `checkpoint` to return `Result<(), PoolError>`
-- [ ] Step 7: Edit `lib.rs` - Convert `checkpoint_position` to return `Result<(), PoolError>`
-- [ ] Step 8: Edit `lib.rs` - Propagate `?` through `stake`, `set_boost`, `lock_assets`
-- [ ] Step 9: Edit `lib.rs` - Graceful degradation in `unstake` and `unlock_assets`
-- [ ] Step 10: Edit `lib.rs` - Fix `calculate_credits` and `get_credits` arithmetic
-- [ ] Step 11: Edit `test.rs` - Update existing tests for new Result returns
-- [ ] Step 12: Edit `test.rs` - Add overflow tests
-- [ ] Step 13: Run `cargo test -p farming-pool` to verify
+- [x] Step 1: Add PoolError variants to types.rs
+- [x] Step 2: Replace assert! with typed errors in lib.rs
+  - [x] lock_assets: amount > 0 → InvalidAmount
+  - [x] unlock_assets: amount > 0 → InvalidAmount
+  - [x] unlock_assets: amount <= position.amount → InsufficientBalance
+  - [x] unlock_assets: current >= position.unlock_ledger → LockPeriodNotElapsed
+  - [x] unlock_assets: .expect("no active position") → NoActiveStake (fixes #65 adjacency)
+  - [x] stake: amount > 0 → InvalidAmount
+  - [x] set_boost: allocation_pct 1-100 → InvalidAllocation
+- [x] Step 3: Update tests to assert specific PoolError variants
+- [x] Step 4: Run tests to verify
 

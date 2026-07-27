@@ -16,6 +16,14 @@ pub enum PoolError {
     /// complete with degraded results (e.g., returning principal without the
     /// overflowing credit component).
     CreditOverflow = 15,
+    /// Amount must be positive for lock/stake operations.
+    InvalidAmount = 16,
+    /// Unlock amount exceeds the locked position balance.
+    InsufficientBalance = 17,
+    /// Minimum lock period has not yet elapsed.
+    LockPeriodNotElapsed = 18,
+    /// Allocation percentage must be between 1 and 100.
+    InvalidAllocation = 19,
 
 }
 

@@ -265,17 +265,22 @@ fn test_boost_can_be_updated_repeatedly_without_losing_credits() {
 
 #[test]
 fn test_set_boost_rejects_zero_allocation() {
-    // Soroban host wraps contract panics in HostError; use try_ client variants to inspect them.
     let t = setup(2, 1);
     t.client.stake(&t.user, &1_000);
-    assert!(t.client.try_set_boost(&t.user, &0u32).is_err());
+    match t.client.try_set_boost(&t.user, &0u32) {
+        Err(Ok(PoolError::InvalidAllocation)) => {}
+        other => panic!("expected PoolError::InvalidAllocation, got: {:?}", other),
+    }
 }
 
 #[test]
 fn test_set_boost_rejects_over_100_allocation() {
     let t = setup(2, 1);
     t.client.stake(&t.user, &1_000);
-    assert!(t.client.try_set_boost(&t.user, &101u32).is_err());
+    match t.client.try_set_boost(&t.user, &101u32) {
+        Err(Ok(PoolError::InvalidAllocation)) => {}
+        other => panic!("expected PoolError::InvalidAllocation, got: {:?}", other),
+    }
 }
 
 #[test]
@@ -627,13 +632,19 @@ fn test_lock_assets_additional_lock_checkpoints_credits() {
 #[test]
 fn test_lock_assets_rejects_zero_amount() {
     let t = setup(1, 1);
-    assert!(t.client.try_lock_assets(&t.user, &0i128).is_err());
+    match t.client.try_lock_assets(&t.user, &0i128) {
+        Err(Ok(PoolError::InvalidAmount)) => {}
+        other => panic!("expected PoolError::InvalidAmount, got: {:?}", other),
+    }
 }
 
 #[test]
 fn test_lock_assets_rejects_negative_amount() {
     let t = setup(1, 1);
-    assert!(t.client.try_lock_assets(&t.user, &-1i128).is_err());
+    match t.client.try_lock_assets(&t.user, &-1i128) {
+        Err(Ok(PoolError::InvalidAmount)) => {}
+        other => panic!("expected PoolError::InvalidAmount, got: {:?}", other),
+    }
 }
 
 #[test]
@@ -696,20 +707,29 @@ fn test_unlock_assets_partial_keeps_remaining_position() {
 fn test_unlock_assets_rejects_zero_amount() {
     let t = setup(1, 1);
     t.client.lock_assets(&t.user, &1_000);
-    assert!(t.client.try_unlock_assets(&t.user, &0i128).is_err());
+    match t.client.try_unlock_assets(&t.user, &0i128) {
+        Err(Ok(PoolError::InvalidAmount)) => {}
+        other => panic!("expected PoolError::InvalidAmount, got: {:?}", other),
+    }
 }
 
 #[test]
 fn test_unlock_assets_rejects_more_than_locked() {
     let t = setup(1, 1);
     t.client.lock_assets(&t.user, &1_000);
-    assert!(t.client.try_unlock_assets(&t.user, &1_001i128).is_err());
+    match t.client.try_unlock_assets(&t.user, &1_001i128) {
+        Err(Ok(PoolError::InsufficientBalance)) => {}
+        other => panic!("expected PoolError::InsufficientBalance, got: {:?}", other),
+    }
 }
 
 #[test]
 fn test_unlock_assets_rejects_when_no_position() {
     let t = setup(1, 1);
-    assert!(t.client.try_unlock_assets(&t.user, &100i128).is_err());
+    match t.client.try_unlock_assets(&t.user, &100i128) {
+        Err(Ok(PoolError::NoActiveStake)) => {}
+        other => panic!("expected PoolError::NoActiveStake, got: {:?}", other),
+    }
 }
 
 #[test]
@@ -731,7 +751,10 @@ fn test_unlock_blocked_before_min_lock_period() {
     let t = setup_with_lock_period(1, 1, 100);
     t.client.lock_assets(&t.user, &1_000);
     advance_ledgers(&t.env, 50); // only 50 of 100 ledgers elapsed
-    assert!(t.client.try_unlock_assets(&t.user, &1_000).is_err());
+    match t.client.try_unlock_assets(&t.user, &1_000) {
+        Err(Ok(PoolError::LockPeriodNotElapsed)) => {}
+        other => panic!("expected PoolError::LockPeriodNotElapsed, got: {:?}", other),
+    }
 }
 
 #[test]
