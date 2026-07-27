@@ -222,8 +222,12 @@ impl FarmingPool {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(PoolError::AlreadyInitialized);
         }
-        assert!(global_multiplier >= 1, "multiplier must be >= 1");
-        assert!(credit_rate > 0, "credit_rate must be positive");
+        if global_multiplier < 1 {
+            return Err(PoolError::InvalidMultiplier);
+        }
+        if credit_rate <= 0 {
+            return Err(PoolError::InvalidCreditRate);
+        }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -469,9 +473,8 @@ impl FarmingPool {
 
     pub fn stake(env: Env, from: Address, amount: i128) -> Result<(), PoolError> {
         from.require_auth();
-        require_not_paused(&env)?;
-
         require_initialized(&env)?;
+        require_not_paused(&env)?;
         if amount <= 0 {
             return Err(PoolError::InvalidAmount);
         }
@@ -506,12 +509,11 @@ impl FarmingPool {
 
     pub fn unstake(env: Env, from: Address) -> Result<i128, PoolError> {
         from.require_auth();
-        require_not_paused(&env)?;
-
         require_initialized(&env)?;
+        require_not_paused(&env)?;
         bump_instance(&env);
 
-        let mut stake = get_user_stake(&env, &from).expect("no active stake");
+        let mut stake = get_user_stake(&env, &from).ok_or(PoolError::NoActiveStake)?;
         // Try to checkpoint credits; if the credit computation overflows,
         // fall back to returning whatever credits were already banked.
         if checkpoint(&env, &from, &mut stake).is_err() {
@@ -532,10 +534,8 @@ impl FarmingPool {
 
     pub fn set_boost(env: Env, user: Address, allocation_pct: u32) -> Result<(), PoolError> {
         user.require_auth();
-        require_not_paused(&env)?;
-
-
         require_initialized(&env)?;
+        require_not_paused(&env)?;
         if !(1..=100).contains(&allocation_pct) {
             return Err(PoolError::InvalidAllocation);
         }
@@ -572,7 +572,9 @@ impl FarmingPool {
     pub fn set_global_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
-        assert!(multiplier >= 1, "multiplier must be >= 1");
+        if multiplier < 1 {
+            return Err(PoolError::InvalidMultiplier);
+        }
         bump_instance(&env);
 
         env.storage()

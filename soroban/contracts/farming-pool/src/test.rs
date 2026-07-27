@@ -437,10 +437,10 @@ fn test_admin_multiplier_change_applies_from_next_checkpoint() {
 }
 
 #[test]
-#[should_panic(expected = "multiplier must be >= 1")]
-fn test_admin_multiplier_rejects_zero() {
+fn test_admin_multiplier_rejects_zero_with_typed_error() {
     let t = setup(2, 1);
-    t.client.set_global_multiplier(&0u32);
+    let result = t.client.try_set_global_multiplier(&0u32);
+    assert!(matches!(result, Err(Ok(PoolError::InvalidMultiplier))));
 }
 
 #[test]
@@ -651,10 +651,14 @@ fn test_lock_assets_rejects_negative_amount() {
 fn test_lock_assets_rejects_insufficient_balance() {
     let t = setup(1, 1);
     // User only has 1_000_000_000 tokens; try to lock more.
-    assert!(t
+    let result = t
         .client
-        .try_lock_assets(&t.user, &2_000_000_000i128)
-        .is_err());
+        .try_lock_assets(&t.user, &2_000_000_000i128);
+    assert!(
+        result.is_err(),
+        "expected error for insufficient balance, got: {:?}",
+        result
+    );
 }
 
 #[test]
@@ -969,7 +973,10 @@ fn test_pause_blocks_unstake() {
     let t = setup(1, 1);
     t.client.stake(&t.user, &1_000);
     t.client.pause();
-    assert!(t.client.try_unstake(&t.user).is_err());
+    match t.client.try_unstake(&t.user) {
+        Err(Ok(PoolError::Paused)) => {}
+        other => panic!("expected PoolError::Paused, got: {:?}", other),
+    }
 }
 
 #[test]
@@ -987,7 +994,10 @@ fn test_pause_blocks_set_boost() {
     let t = setup(1, 1);
     t.client.stake(&t.user, &1_000);
     t.client.pause();
-    assert!(t.client.try_set_boost(&t.user, &50u32).is_err());
+    match t.client.try_set_boost(&t.user, &50u32) {
+        Err(Ok(PoolError::Paused)) => {}
+        other => panic!("expected PoolError::Paused, got: {:?}", other),
+    }
 }
 
 #[test]

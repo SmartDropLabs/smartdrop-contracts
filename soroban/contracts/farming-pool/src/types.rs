@@ -24,7 +24,8 @@ pub enum PoolError {
     LockPeriodNotElapsed = 18,
     /// Allocation percentage must be between 1 and 100.
     InvalidAllocation = 19,
-
+    /// Global multiplier must be >= 1.
+    InvalidMultiplier = 21,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.
