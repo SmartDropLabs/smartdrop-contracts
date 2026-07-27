@@ -11,6 +11,11 @@ pub enum PoolError {
     NotPaused = 13,
     Paused = 20,
     NoActiveStake = 14,
+    /// Credit computation overflowed i128. Returned instead of trapping the
+    /// contract via overflow-checks = true. The affected operation may still
+    /// complete with degraded results (e.g., returning principal without the
+    /// overflowing credit component).
+    CreditOverflow = 15,
 
 }
 

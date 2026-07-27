@@ -135,28 +135,28 @@ fn test_pause_uninitialized_returns_not_initialized() {
 #[test]
 fn test_effective_stake_no_boost() {
     // Without boost, effective stake equals staked amount (allocation_pct = 0 → multiplier has no effect).
-    let stake = compute_total_stake(1_000, 0, 5);
+    let stake = compute_total_stake(1_000, 0, 5).unwrap();
     assert_eq!(stake, 1_000);
 }
 
 #[test]
 fn test_effective_stake_full_allocation_2x() {
     // 100% allocation at 2× multiplier: virtual_stake = 1000 * 2 = 2000, principal = 0.
-    let stake = compute_total_stake(1_000, 100, 2);
+    let stake = compute_total_stake(1_000, 100, 2).unwrap();
     assert_eq!(stake, 2_000);
 }
 
 #[test]
 fn test_effective_stake_half_allocation_2x() {
     // 50% allocation at 2×: principal = 500, virtual = 500*2 = 1000. total = 1500.
-    let stake = compute_total_stake(1_000, 50, 2);
+    let stake = compute_total_stake(1_000, 50, 2).unwrap();
     assert_eq!(stake, 1_500);
 }
 
 #[test]
 fn test_effective_stake_25pct_allocation_3x() {
     // 25% allocation at 3×: boosted = 250, principal = 750, virtual = 750. total = 1500.
-    let stake = compute_total_stake(1_000, 25, 3);
+    let stake = compute_total_stake(1_000, 25, 3).unwrap();
     assert_eq!(stake, 1_500);
 }
 
@@ -164,8 +164,26 @@ fn test_effective_stake_25pct_allocation_3x() {
 fn test_effective_stake_1pct_allocation_10x() {
     // Minimal allocation at high multiplier.
     // boosted = 10, principal = 990, virtual = 100. total = 1090.
-    let stake = compute_total_stake(1_000, 1, 10);
+    let stake = compute_total_stake(1_000, 1, 10).unwrap();
     assert_eq!(stake, 1_090);
+}
+
+#[test]
+fn test_compute_total_stake_returns_credit_overflow_on_overflow() {
+    // amount * allocation_pct overflows i128
+    let result = compute_total_stake(i128::MAX, 100, 2);
+    assert!(matches!(result, Err(PoolError::CreditOverflow)));
+
+    // boosted * multiplier overflows i128
+    let result = compute_total_stake(i128::MAX / 2, 100, 3);
+    assert!(matches!(result, Err(PoolError::CreditOverflow)));
+}
+
+#[test]
+fn test_compute_credits_returns_credit_overflow_on_overflow() {
+    // Large amount * credit_rate overflows i128
+    let result = compute_credits(i128::MAX / 2, 100, 2, i128::MAX / 2, 1);
+    assert!(matches!(result, Err(PoolError::CreditOverflow)));
 }
 
 // ── Boost system integration tests ───────────────────────────────────────────
@@ -1051,6 +1069,108 @@ fn test_emergency_withdraw_while_unpaused_returns_not_paused() {
 
     let result = t.client.try_emergency_withdraw(&t.user);
     assert!(matches!(result, Err(Ok(PoolError::NotPaused))));
+}
+
+// ── Overflow / typed-error tests ───────────────────────────────────────────
+//
+// These tests verify that unchecked credit computation produces a typed
+// PoolError::CreditOverflow rather than trapping the contract, and that
+// withdrawal paths (unstake / unlock_assets) degrade gracefully when the
+// credit computation overflows — returning principal tokens even when the
+// credit portion cannot be computed.
+
+#[test]
+fn test_get_credits_returns_typed_error_on_overflow() {
+    // Construct a stake where the credit computation overflows i128.
+    // amount * credit_rate * elapsed = i128::MAX / 2 * i128::MAX / 2 * large_u32 > i128::MAX
+    let t = setup(2, 1);
+    // Stake an extremely large amount
+    t.token_sac.mint(&t.user, &i128::MAX);
+    t.client.stake(&t.user, &i128::MAX / 2);
+    // Set a boost to make total_stake even larger
+    t.client.set_boost(&t.user, &100u32);
+    advance_ledgers(&t.env, 1_000_000);
+
+    // get_credits should return CreditOverflow rather than trapping
+    let result = t.client.try_get_credits(&t.user);
+    assert!(
+        matches!(result, Err(Ok(PoolError::CreditOverflow))),
+        "expected CreditOverflow, got: {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_unstake_still_returns_principal_when_credit_overflows() {
+    // Set up a pool with a rate that will cause overflow for large stakes.
+    let t = setup(2, i128::MAX / 2);
+    t.token_sac.mint(&t.user, &i128::MAX);
+    t.client.stake(&t.user, &i128::MAX / 4);
+    advance_ledgers(&t.env, 1_000_000);
+
+    // unstake should still return principal tokens even though credit
+    // computation overflows. The returned value is the credits_banked
+    // (which may be 0 or whatever was there before the overflowing accrual).
+    let initial_balance = t.token.balance(&t.user);
+    let result = t.client.try_unstake(&t.user);
+    assert!(
+        result.is_ok(),
+        "unstake should succeed even if credit overflows, got: {:?}",
+        result
+    );
+
+    // Principal was returned
+    let balance_after = t.token.balance(&t.user);
+    assert!(
+        balance_after > initial_balance,
+        "principal should be returned"
+    );
+    assert_eq!(
+        balance_after,
+        initial_balance + (i128::MAX / 4),
+        "all principal should be returned"
+    );
+}
+
+#[test]
+fn test_unlock_assets_still_returns_principal_when_credit_overflows() {
+    // Set up a pool with a rate that will cause overflow for large locked amounts.
+    let t = setup_with_lock_period(2, i128::MAX / 2, 10);
+    t.token_sac.mint(&t.user, &i128::MAX);
+    t.client.lock_assets(&t.user, &i128::MAX / 4);
+    advance_ledgers(&t.env, 100); // past min lock period
+
+    let initial_balance = t.token.balance(&t.user);
+    let result = t.client.try_unlock_assets(&t.user, &(i128::MAX / 4));
+    assert!(
+        result.is_ok(),
+        "unlock_assets should succeed even if credit overflows, got: {:?}",
+        result
+    );
+
+    // Principal was returned (tokens back minus the initial lock transfer)
+    let balance_after = t.token.balance(&t.user);
+    assert_eq!(
+        balance_after,
+        initial_balance + (i128::MAX / 4),
+        "all principal should be returned"
+    );
+}
+
+#[test]
+fn test_calculate_credits_returns_typed_error_on_overflow() {
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &i128::MAX / 2);
+    // Set credit_rate high so amount * credit_rate overflows
+    t.client.set_credit_rate(&i128::MAX);
+    advance_ledgers(&t.env, 1_000);
+
+    let result = t.client.try_calculate_credits(&t.user);
+    assert!(
+        matches!(result, Err(Ok(PoolError::CreditOverflow))),
+        "expected CreditOverflow, got: {:?}",
+        result
+    );
 }
 
 // ── lock_assets checks-effects-interactions (#69) ─────────────────────────────
