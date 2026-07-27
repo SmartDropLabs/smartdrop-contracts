@@ -1,4 +1,4 @@
-#![no_std]
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #![no_std]
 #![allow(deprecated)]
 
 #[cfg(test)]
@@ -556,24 +556,36 @@ impl FarmingPool {
 
         let mut total_returned: i128 = 0;
         let mut banked_credits: i128 = 0;
-        let token = token::TokenClient::new(&env, &get_stake_token(&env).unwrap());
-        let mut total_returned = 0i128;
-        let mut banked_credits = 0i128;
         let stake_token = get_stake_token(&env)?;
         let token = token::TokenClient::new(&env, &stake_token);
 
+        // ── Checks-effects-interactions ──────────────────────────────────────
+        // Both branches below clear per-user storage *before* the external
+        // token.transfer call.  `stake_token` is an admin-supplied address,
+        // not necessarily a trusted Stellar Asset Contract, and its
+        // `transfer` is a synchronous cross-contract call.  Clearing the
+        // record first ensures that a reentrant call (if the host ever
+        // permitted same-contract reentry) would see None/an already-cleared
+        // record and cannot double-payout the same user's funds.
+        //
+        // This is the designated incident-response path — during an active
+        // emergency the token itself (or its configuration) is most likely to
+        // be unusual or compromised, making CEI discipline here especially
+        // important.  See #72.
+        // ──────────────────────────────────────────────────────────────────────
+
         if let Some(position) = get_position(&env, &user) {
-            token.transfer(&env.current_contract_address(), &user, &position.amount);
+            remove_position(&env, &user);
             total_returned += position.amount;
             banked_credits += position.total_credits;
-            remove_position(&env, &user);
+            token.transfer(&env.current_contract_address(), &user, &position.amount);
         }
 
         if let Some(stake) = get_user_stake(&env, &user) {
-            token.transfer(&env.current_contract_address(), &user, &stake.amount);
+            remove_user_stake(&env, &user);
             total_returned += stake.amount;
             banked_credits += stake.credits_banked;
-            remove_user_stake(&env, &user);
+            token.transfer(&env.current_contract_address(), &user, &stake.amount);
         }
 
         if total_returned == 0 {
