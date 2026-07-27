@@ -62,6 +62,12 @@ pub enum FactoryError {
     PoolNotFound = 2,
     /// `transfer_admin` was called by an address that is not the current admin.
     Unauthorized = 3,
+    /// A public function was called before `initialize` seeded the factory state.
+    ///
+    /// Returned instead of panicking on an absent `Admin`/`WasmHash` entry, and
+    /// also by the read-only getters that would otherwise report a misleading
+    /// empty registry for a factory that does not exist yet.
+    NotInitialized = 4,
     /// `create_pool`'s `global_multiplier` was < 1 (mirrors `FarmingPool::initialize`'s own check).
     InvalidGlobalMultiplier = 4,
     /// `create_pool`'s `daily_rate` converts to a `credit_rate` of zero (or doesn't fit `i128`).
@@ -73,4 +79,8 @@ pub enum FactoryError {
     InvalidCreditRate = 5,
     /// `create_pool`'s `min_lock_period` does not fit in the pool's native `u32`.
     MinLockPeriodOutOfRange = 6,
+    /// `create_pool` cannot allocate another monotonically increasing pool ID.
+    PoolCountOverflow = 8,
+    /// A function requiring initialization was called on an uninitialized factory.
+    NotInitialized = 7,
 }

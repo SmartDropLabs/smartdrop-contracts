@@ -2,7 +2,9 @@
 
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, Symbol, Val, Vec};
+use soroban_sdk::{
+    contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, Symbol, Val, Vec,
+};
 use types::{DataKey, FactoryError, ListPoolsResponse, PoolRecord};
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
@@ -42,8 +44,43 @@ fn bump_pool(env: &Env, pool_id: u32) {
         .extend_ttl(&DataKey::Pool(pool_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
-fn load_admin(env: &Env) -> Address {
-    env.storage().instance().get(&DataKey::Admin).unwrap()
+/// Reject any call that lands on a factory whose state was never seeded.
+///
+/// `initialize` is the only writer of `DataKey::Admin`, so its presence is the
+/// canonical "this factory exists" marker. Every public entry point except
+/// `initialize` runs this first so callers get a typed `NotInitialized` error
+/// instead of a host panic (or a misleading zero/empty result from the getters).
+fn require_initialized(env: &Env) -> Result<(), FactoryError> {
+    if !env.storage().instance().has(&DataKey::Admin) {
+        return Err(FactoryError::NotInitialized);
+    }
+    Ok(())
+}
+
+fn load_admin(env: &Env) -> Result<Address, FactoryError> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(FactoryError::NotInitialized)
+}
+
+/// Read the pool WASM hash.
+///
+/// Kept separate from `load_admin` because `Admin` and `WasmHash` are distinct
+/// instance entries: a reader of one must not assume the other was proven present.
+fn load_wasm_hash(env: &Env) -> Result<BytesN<32>, FactoryError> {
+    env.storage()
+        .instance()
+        .get(&DataKey::WasmHash)
+        .ok_or(FactoryError::NotInitialized)
+}
+
+fn require_initialized(env: &Env) -> Result<(), FactoryError> {
+    if env.storage().instance().has(&DataKey::Admin) {
+        Ok(())
+    } else {
+        Err(FactoryError::NotInitialized)
+    }
 }
 
 /// Build a 32-byte salt from a pool ID so each pool gets a unique, reproducible address.
@@ -59,6 +96,10 @@ pub struct Factory;
 #[contractimpl]
 impl Factory {
     /// Initialize the factory. Returns `AlreadyInitialized` if called more than once.
+    ///
+    /// Deliberately exempt from `require_initialized`: this is the function that
+    /// establishes the initialised state, and it already enforces the inverse
+    /// precondition via the `has(&DataKey::Admin)` check below.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -77,7 +118,10 @@ impl Factory {
     }
 
     /// Return the current admin address.
-    pub fn admin(env: Env) -> Address {
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn admin(env: Env) -> Result<Address, FactoryError> {
+        require_initialized(&env)?;
         bump_instance(&env);
         load_admin(&env)
     }
@@ -86,24 +130,37 @@ impl Factory {
     ///
     /// Clients can call this to verify which farming-pool build is active before
     /// trusting a pool address returned by `create_pool`.
-    pub fn pool_wasm_hash(env: Env) -> BytesN<32> {
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn pool_wasm_hash(env: Env) -> Result<BytesN<32>, FactoryError> {
+        require_initialized(&env)?;
         bump_instance(&env);
-        env.storage().instance().get(&DataKey::WasmHash).unwrap()
+        load_wasm_hash(&env)
     }
 
     /// Return the total number of pools registered by this factory.
-    pub fn pool_count(env: Env) -> u32 {
+    ///
+    /// Guarded even though the underlying read defaults to 0: an uninitialized
+    /// factory has no registry at all, and reporting `0` would be indistinguishable
+    /// from an initialized factory that has yet to create a pool.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn pool_count(env: Env) -> Result<u32, FactoryError> {
+        require_initialized(&env)?;
         bump_instance(&env);
-        env.storage()
+        Ok(env
+            .storage()
             .instance()
             .get(&DataKey::PoolCount)
-            .unwrap_or(0)
+            .unwrap_or(0))
     }
 
     /// Return the `PoolRecord` for `pool_id`.
     ///
-    /// Returns `PoolNotFound` if `pool_id` has not been created yet.
+    /// Returns `NotInitialized` if the factory has not been initialized, or
+    /// `PoolNotFound` if `pool_id` has not been created yet.
     pub fn get_pool(env: Env, pool_id: u32) -> Result<PoolRecord, FactoryError> {
+        require_initialized(&env)?;
         bump_instance(&env);
         let key = DataKey::Pool(pool_id);
         match env.storage().persistent().get::<DataKey, PoolRecord>(&key) {
@@ -119,7 +176,17 @@ impl Factory {
     ///
     /// `limit` is capped at 20 records so callers can page through large
     /// registries without unbounded contract work.
-    pub fn list_pools(env: Env, start_id: u32, limit: u32) -> ListPoolsResponse {
+    ///
+    /// Guarded like `pool_count`: an empty page from an uninitialized factory
+    /// would be indistinguishable from an initialized but empty registry.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn list_pools(
+        env: Env,
+        start_id: u32,
+        limit: u32,
+    ) -> Result<ListPoolsResponse, FactoryError> {
+        require_initialized(&env)?;
         bump_instance(&env);
         let count: u32 = env
             .storage()
@@ -138,11 +205,11 @@ impl Factory {
             }
         }
 
-        ListPoolsResponse {
+        Ok(ListPoolsResponse {
             records,
             next_start_id: if end < count { end } else { count },
             total: count,
-        }
+        })
     }
 
     /// Return a page of pool records whose staking asset matches `asset`.
@@ -159,14 +226,33 @@ impl Factory {
     /// per-transaction CPU-instruction and read-entry budgets, becoming permanently
     /// unusable. The 20-record cap mirrors list_pools's design to prevent this.
     ///
+    /// Scans every registered pool in O(n) and collects matching IDs.
+    /// Useful for frontends that need to surface all pools for a given token
+    /// without an off-chain indexer.
+    ///
+    /// Guarded like `pool_count`: an empty result from an uninitialized factory
+    /// would be indistinguishable from "no pools hold this asset".
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn get_pools_by_asset(env: Env, asset: Address) -> Result<Vec<u32>, FactoryError> {
+        require_initialized(&env)?;
     /// # Secondary Index Consideration
     /// For very large registries, a secondary per-asset index (e.g., DataKey::AssetPools
     /// maintained incrementally in create_pool) would avoid full-registry scans entirely.
     /// This would be a more robust long-term fix but requires changes to create_pool's
     /// write path and potentially a migration/backfill for existing pools.
-    pub fn get_pools_by_asset(env: Env, asset: Address, start_id: u32, limit: u32) -> ListPoolsResponse {
+    pub fn get_pools_by_asset(
+        env: Env,
+        asset: Address,
+        start_id: u32,
+        limit: u32,
+    ) -> ListPoolsResponse {
         bump_instance(&env);
-        let count: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
         let capped_limit = limit.min(20);
         let mut records: Vec<(u32, PoolRecord)> = vec![&env];
         let mut next_start_id = count;
@@ -184,6 +270,7 @@ impl Factory {
                 }
             }
         }
+        Ok(matches)
 
         ListPoolsResponse {
             records,
@@ -220,7 +307,11 @@ impl Factory {
     /// ~60 days) to ensure all pool records remain accessible.
     pub fn refresh_pool_ttls(env: Env, start_id: u32, limit: u32) -> Result<(), FactoryError> {
         bump_instance(&env);
-        let count: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
         let capped_limit = limit.min(20);
         let end = start_id.saturating_add(capped_limit).min(count);
         for pool_id in start_id..end {
@@ -235,8 +326,11 @@ impl Factory {
     ///
     /// Supports key rotation and future governance handoffs without redeploying
     /// the factory. Emits a `adm_xfr` event with `(old_admin, new_admin)`.
-    pub fn transfer_admin(env: Env, new_admin: Address) {
-        let current = load_admin(&env);
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let current = load_admin(&env)?;
         current.require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
@@ -245,6 +339,65 @@ impl Factory {
             (symbol_short!("factory"), symbol_short!("adm_xfr")),
             (current, new_admin),
         );
+        Ok(())
+    }
+
+    /// Upgrade one registered farming pool in place. Admin-only.
+    ///
+    /// This deliberately does not update the factory-level `WasmHash`; it is a
+    /// pool-by-pool hot swap for a pre-installed WASM hash.
+    pub fn upgrade_pool(
+        env: Env,
+        pool_id: u32,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), FactoryError> {
+        let admin = load_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+
+        let key = DataKey::Pool(pool_id);
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&key)
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        let upgrade_args: Vec<Val> = vec![&env, new_wasm_hash.clone().into_val(&env)];
+        let _: () =
+            env.invoke_contract(&record.address, &Symbol::new(&env, "upgrade"), upgrade_args);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("pool_upg")),
+            (pool_id, record.address, new_wasm_hash),
+        );
+
+        Ok(())
+    }
+
+    /// Update the WASM hash used for future `create_pool` deployments. Admin-only.
+    ///
+    /// Allows the admin to point future pool deployments at a corrected or upgraded
+    /// farming-pool build without redeploying the factory itself. Existing deployed
+    /// pools are unaffected — Soroban contract bytecode is immutable once deployed.
+    ///
+    /// Emits a `wasm_set` event with `(old_hash, new_hash)` so that the previous
+    /// hash is discoverable off-chain for rollback scenarios.
+    pub fn set_pool_wasm_hash(env: Env, new_hash: BytesN<32>) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin: Address = load_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+
+        let old_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
+        env.storage().instance().set(&DataKey::WasmHash, &new_hash);
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("wasm_set")),
+            (old_hash, new_hash),
+        );
+        Ok(())
     }
 
     /// Create, deploy, and initialize a new farming pool. Admin-only.
@@ -259,6 +412,11 @@ impl Factory {
     /// `credit_rate` via `daily_rate_to_credit_rate` — see that function's
     /// docs for the conversion and its failure modes.
     ///
+    /// The `pool_crtd` event now includes `asset`, `daily_rate`, and
+    /// `min_lock_period` alongside `pool_id` and `pool_address` so off-chain
+    /// indexers can reconstruct the full pool state without a follow-up RPC call.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
     /// The pool's admin is fixed to this factory's admin *at creation time*.
     /// A later `transfer_admin` on the factory does not retroactively change
     /// any already-deployed pool's admin — each pool is administered
@@ -274,6 +432,10 @@ impl Factory {
         env: Env,
         asset: Address,
         daily_rate: u128,
+        min_lock_period: u64,
+    ) -> Result<u32, FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
         global_multiplier: u32,
         min_lock_period: u64,
     ) -> Result<u32, FactoryError> {
@@ -290,7 +452,11 @@ impl Factory {
             .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
 
         let pool_id: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap();
+        let next_count = pool_id
+            .checked_add(1)
+            .ok_or(FactoryError::PoolCountOverflow)?;
         let wasm_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
+        let wasm_hash = load_wasm_hash(&env)?;
         let salt = pool_salt(&env, pool_id);
 
         // Deploy a fresh farming-pool instance. The resulting address is
@@ -329,7 +495,7 @@ impl Factory {
         bump_pool(&env, pool_id);
         env.storage()
             .instance()
-            .set(&DataKey::PoolCount, &(pool_id + 1));
+            .set(&DataKey::PoolCount, &next_count);
 
         // Emit enriched event so indexers get the full pool parameters in one shot.
         #[allow(deprecated)]
