@@ -1,5 +1,5 @@
 //! A minimal token-interface contract for exercising checks-effects-
-//! interactions (CEI) reentrancy scenarios in tests (#69). Configured with a
+//! interactions (CEI) reentrancy scenarios in tests (#69, #71). Configured with a
 //! target contract + user, its `transfer` attempts to call back into the
 //! target *during* the transfer — exactly what a non-standard `stake_token`
 //! could do, since `token::TokenClient::transfer` is a synchronous
@@ -21,6 +21,7 @@ enum DataKey {
     Target,
     ReentrantUser,
     ReentryWasRejected,
+    ReentryFnName,
 }
 
 #[contract]
@@ -30,12 +31,27 @@ pub struct MockReentrantToken;
 impl MockReentrantToken {
     /// `target` is the contract to reenter (e.g. the FarmingPool under
     /// test); `reentrant_user` is the user address to pass to the reentrant
-    /// call.
+    /// call. Reenters via `get_user_position` by default.
     pub fn configure(env: Env, target: Address, reentrant_user: Address) {
         env.storage().instance().set(&DataKey::Target, &target);
         env.storage()
             .instance()
             .set(&DataKey::ReentrantUser, &reentrant_user);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentryFnName, &Symbol::new(&env, "get_user_position"));
+    }
+
+    /// Like `configure`, but allows specifying the function name to reenter
+    /// (e.g. `"get_stake"` for stake/unstake reentrancy tests).
+    pub fn configure_with_fn(env: Env, target: Address, reentrant_user: Address, fn_name: Symbol) {
+        env.storage().instance().set(&DataKey::Target, &target);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrantUser, &reentrant_user);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentryFnName, &fn_name);
     }
 
     /// Matches the token interface's `transfer(from, to, amount)` exactly —
@@ -47,11 +63,16 @@ impl MockReentrantToken {
             .instance()
             .get(&DataKey::ReentrantUser)
             .unwrap();
+        let fn_name: Symbol = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReentryFnName)
+            .unwrap();
 
         let args: Vec<Val> = soroban_sdk::vec![&env, reentrant_user.into_val(&env)];
         let result = env.try_invoke_contract::<Val, soroban_sdk::Error>(
             &target,
-            &Symbol::new(&env, "get_user_position"),
+            &fn_name,
             args,
         );
 
@@ -79,8 +100,8 @@ impl MockReentrantToken {
 /// more naive (and arguably more realistic) way a hostile token author would
 /// write this without any special handling. Used to confirm that even
 /// without any graceful error handling in the token, a rejected reentry
-/// safely aborts the *entire* invocation (including `lock_assets`'s state
-/// writes) rather than leaving anything partially applied.
+/// safely aborts the *entire* invocation (including state writes) rather
+/// than leaving anything partially applied.
 #[contract]
 pub struct MockNaiveReentrantToken;
 
@@ -91,6 +112,19 @@ impl MockNaiveReentrantToken {
         env.storage()
             .instance()
             .set(&DataKey::ReentrantUser, &reentrant_user);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentryFnName, &Symbol::new(&env, "get_user_position"));
+    }
+
+    pub fn configure_with_fn(env: Env, target: Address, reentrant_user: Address, fn_name: Symbol) {
+        env.storage().instance().set(&DataKey::Target, &target);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrantUser, &reentrant_user);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentryFnName, &fn_name);
     }
 
     pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
@@ -100,10 +134,16 @@ impl MockNaiveReentrantToken {
             .instance()
             .get(&DataKey::ReentrantUser)
             .unwrap();
+        let fn_name: Symbol = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReentryFnName)
+            .unwrap();
 
         let args: Vec<Val> = soroban_sdk::vec![&env, reentrant_user.into_val(&env)];
         // No try_invoke_contract here — a rejected reentry traps this call
         // (and the whole transaction) immediately.
-        let _: Val = env.invoke_contract(&target, &Symbol::new(&env, "get_user_position"), args);
+        let _: Val = env.invoke_contract(&target, &fn_name, args);
     }
 }
+
