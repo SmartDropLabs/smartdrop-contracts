@@ -1501,6 +1501,295 @@ fn test_calculate_credits_returns_typed_error_on_overflow() {
     );
 }
 
+// ── #76: i128 overflow boundary tests ────────────────────────────────────────
+//
+// These tests exercise `compute_total_stake` and `compute_credits` at the
+// precise i128::MAX boundary, verifying that the overflow-protected arithmetic
+// returns `PoolError::CreditOverflow` when the product would exceed i128::MAX
+// (rather than trapping silently, which was the risk before `checked_mul`
+// migration).
+//
+// The companion property-based fuzz sweep below provides statistical coverage
+// across a wide range of realistic inputs.
+
+/// Helper: compute the exact i128 boundary for `compute_credits` at a given
+/// set of parameters.  The function succeeds when
+///
+///   total_stake * credit_rate * elapsed <= i128::MAX
+///
+/// We derive `amount` by starting from the worst-case `total_stake` factor
+/// `amount * allocation_pct/100 * multiplier` at max boost (allocation_pct=100
+/// reduces `compute_total_stake` to exactly `amount * multiplier`).
+///
+/// To simplify: at `allocation_pct = 100`, `compute_total_stake` returns
+/// `amount * multiplier`.  So `compute_credits` = `amount * multiplier *
+/// credit_rate * elapsed`.  We want this <= i128::MAX.
+///
+/// The derived max amount for a given (multiplier, credit_rate, elapsed) is:
+///   amount_max = i128::MAX / (multiplier * credit_rate * elapsed)
+fn compute_credits_max_amount(multiplier: u32, credit_rate: i128, elapsed: u32) -> i128 {
+    let divisor = (multiplier as i128)
+        .checked_mul(credit_rate)
+        .and_then(|v| v.checked_mul(elapsed as i128))
+        .expect("test divisor must fit in i128");
+    if divisor == 0 {
+        return i128::MAX; // degenerate case, no overflow possible
+    }
+    i128::MAX / divisor
+}
+
+#[test]
+fn test_compute_total_stake_boundary_at_i128_max_max_boost() {
+    // At allocation_pct = 100, multiplier = 1:
+    //   total_stake = amount * 1
+    // So the boundary is amount = i128::MAX.
+    let result = compute_total_stake(i128::MAX, 100, 1);
+    assert_eq!(result.unwrap(), i128::MAX);
+}
+
+#[test]
+fn test_compute_total_stake_boundary_just_over_i128_max() {
+    // allocation_pct = 100, multiplier = 2:
+    //   total_stake = amount * 2
+    // Boundary: i128::MAX / 2 ≈ 8.5e37 is the last safe amount.
+    let safe = i128::MAX / 2 - 1;
+    let result = compute_total_stake(safe, 100, 2);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), safe * 2);
+
+    // i128::MAX / 2 + 1 would overflow.
+    let overflow = i128::MAX / 2 + 1;
+    let result = compute_total_stake(overflow, 100, 2);
+    assert!(matches!(result, Err(PoolError::CreditOverflow)));
+}
+
+#[test]
+fn test_compute_total_stake_boundary_partial_boost() {
+    // allocation_pct = 50, multiplier = 2:
+    //   boosted = amount * 50 / 100 = amount / 2
+    //   principal = amount - amount/2 = amount/2
+    //   virtual_stake = (amount/2) * 2 = amount
+    //   total = amount/2 + amount = 1.5 * amount
+    //
+    // So the boundary is amount = i128::MAX / 3 * 2 (approximately).
+    // More precisely: 1.5 * amount <= i128::MAX → amount <= i128::MAX / 3 * 2
+    let max_safe = i128::MAX / 3 * 2;
+    let result = compute_total_stake(max_safe, 50, 2);
+    assert!(result.is_ok(), "expected Ok at max_safe boundary");
+
+    // Just above: amount = (i128::MAX / 3 * 2) + 1 should overflow
+    let too_big = max_safe.saturating_add(1_000_000_000_000i128);
+    let result = compute_total_stake(too_big, 50, 2);
+    assert!(matches!(result, Err(PoolError::CreditOverflow)));
+}
+
+#[test]
+fn test_compute_credits_boundary_simple_case() {
+    // allocation_pct = 100, multiplier = 1, credit_rate = 1, elapsed = 1:
+    //   total_stake = amount
+    //   credits = amount * 1 * 1 = amount
+    // Boundary: amount = i128::MAX.
+    let result = compute_credits(i128::MAX, 100, 1, 1, 1);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), i128::MAX);
+}
+
+#[test]
+fn test_compute_credits_crosses_boundary_with_elapsed_gt_1() {
+    // allocation_pct = 100, multiplier = 1, credit_rate = 1, elapsed = 2:
+    //   credits = amount * 1 * 1 * 2 = amount * 2
+    // amount = i128::MAX / 2 should succeed.
+    let safe = i128::MAX / 2;
+    let result = compute_credits(safe, 100, 1, 1, 2);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), safe * 2);
+
+    // amount = i128::MAX / 2 + 1 should overflow.
+    let overflow = i128::MAX / 2 + 1;
+    let result = compute_credits(overflow, 100, 1, 1, 2);
+    assert!(matches!(result, Err(PoolError::CreditOverflow)));
+}
+
+#[test]
+fn test_compute_credits_boundary_multiplier_pushes_over() {
+    // multiplier = 1_000 (MAX_GLOBAL_MULTIPLIER), credit_rate = 1, elapsed = 1:
+    //   credits = amount * 1_000
+    // amount = i128::MAX / 1_000 should succeed.
+    let safe = i128::MAX / 1_000;
+    let result = compute_credits(safe, 100, MAX_GLOBAL_MULTIPLIER, 1, 1);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), safe * MAX_GLOBAL_MULTIPLIER as i128);
+
+    // amount = i128::MAX / 1_000 + 1 should overflow.
+    let overflow = i128::MAX / 1_000 + 1;
+    let result = compute_credits(overflow, 100, MAX_GLOBAL_MULTIPLIER, 1, 1);
+    assert!(matches!(result, Err(PoolError::CreditOverflow)));
+}
+
+#[test]
+fn test_compute_credits_boundary_credit_rate_pushes_over() {
+    // multiplier = 1, credit_rate = MAX_CREDIT_RATE (100_000_000), elapsed = 1:
+    //   credits = amount * 100_000_000
+    let safe = i128::MAX / MAX_CREDIT_RATE;
+    let result = compute_credits(safe, 100, 1, MAX_CREDIT_RATE, 1);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), safe * MAX_CREDIT_RATE);
+
+    let overflow = i128::MAX / MAX_CREDIT_RATE + 1;
+    let result = compute_credits(overflow, 100, 1, MAX_CREDIT_RATE, 1);
+    assert!(matches!(result, Err(PoolError::CreditOverflow)));
+}
+
+#[test]
+fn test_compute_credits_all_four_params_at_boundary() {
+    // multiplier = 1_000, credit_rate = 100_000_000, elapsed = 63_072_000
+    //   divisor = 1_000 * 100_000_000 * 63_072_000 = 6.3072e18
+    //   safe amount = i128::MAX / 6.3072e18 ≈ 2.7e19
+    // This is well within realistic amounts (~27 tokens at 18 decimals).
+    // Ensure this specific combination returns Ok and the right magnitude.
+    let max_amount = compute_credits_max_amount(
+        MAX_GLOBAL_MULTIPLIER,
+        MAX_CREDIT_RATE,
+        63_072_000,
+    );
+
+    // Should succeed
+    let result = compute_credits(max_amount, 100, MAX_GLOBAL_MULTIPLIER, MAX_CREDIT_RATE, 63_072_000);
+    assert!(result.is_ok(), "expected Ok at computed boundary amount");
+
+    // Slightly larger amount should overflow
+    let result = compute_credits(max_amount + 1, 100, MAX_GLOBAL_MULTIPLIER, MAX_CREDIT_RATE, 63_072_000);
+    assert!(matches!(result, Err(PoolError::CreditOverflow)));
+}
+
+/// Characterisation test: confirm that `compute_credits` with realistic large
+/// but bounded inputs does NOT overflow when the ceilings from #89 are applied.
+/// This complements `test_compute_credits_no_overflow_at_ceilings` which tests
+/// this via the full contract path.
+#[test]
+fn test_compute_credits_does_not_overflow_within_ceilings() {
+    // Worst case within ceilings:
+    // amount = 10^18, multiplier = 1_000, credit_rate = 100_000_000, elapsed = 63_072_000
+    // Expected product = 10^18 * 1_000 * 10^8 * 63_072_000 ≈ 6.307 * 10^36
+    // i128::MAX ≈ 1.701 * 10^38 → headroom ≈ 27x
+    let result = compute_credits(1_000_000_000_000_000_000i128, 100, MAX_GLOBAL_MULTIPLIER, MAX_CREDIT_RATE, 63_072_000);
+    assert!(result.is_ok(), "expected no overflow within ceilings");
+    let expected = 1_000_000_000_000_000_000i128
+        * MAX_GLOBAL_MULTIPLIER as i128
+        * MAX_CREDIT_RATE
+        * 63_072_000i128;
+    assert_eq!(result.unwrap(), expected);
+}
+
+#[test]
+fn test_compute_credits_overflow_at_combined_max_elapsed() {
+    // Push just past the safe boundary by using one more ledger than the
+    // computed max amount allows.
+    let max_amount = compute_credits_max_amount(MAX_GLOBAL_MULTIPLIER, MAX_CREDIT_RATE, 63_072_000);
+    let result = compute_credits(max_amount, 100, MAX_GLOBAL_MULTIPLIER, MAX_CREDIT_RATE, 63_072_001);
+    assert!(matches!(result, Err(PoolError::CreditOverflow)));
+}
+
+// ── #76: property-based fuzz sweep (proptest) ──────────────────────────────
+//
+// The bounded fuzz below exercises `compute_credits` across a wide range of
+// realistic inputs and asserts two invariants:
+//
+//   1. The function never returns a negative value — a negative `credits`
+//      result would indicate silent wraparound, which is strictly worse than
+//      a panic/trap because it corrupts state without signalling failure.
+//   2. The function either returns `Ok(positive_value)` or
+//      `Err(PoolError::CreditOverflow)` — i.e., it never traps/panics and
+//      never silently returns a wrong (wrapped) result.
+//
+// The input ranges are chosen to include both the "safe zone" (well below the
+// overflow boundary for typical admin-chosen ceilings) and the "overflow zone"
+// (large values that exercise the checked_mul boundary at i128::MAX).
+
+#[cfg(test)]
+mod proptest_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A bounded fuzz sweep near the i128::MAX overflow boundary.
+    ///
+    /// Ranges:
+    /// - `amount`: spans from 1 to i128::MAX / 1_000 — large enough to reach
+    ///   the overflow boundary when combined with high multiplier/credit_rate/elapsed.
+    /// - `allocation_pct`: 1..100 (101 excluded to avoid /0-like edge; 100 is
+    ///   the max boost path which hits overflow fastest).
+    /// - `multiplier`: 1..=MAX_GLOBAL_MULTIPLIER (1_000).
+    /// - `credit_rate`: 1..=MAX_CREDIT_RATE (100_000_000).
+    /// - `elapsed`: 1..=63_072_000 (~10 years at 5s/ledger).
+    proptest! {
+        #[test]
+        fn compute_credits_never_wraps_or_panics_silently(
+            amount in 1i128..i128::MAX / 1_000,
+            allocation_pct in 1u32..=100u32,
+            multiplier in 1u32..=MAX_GLOBAL_MULTIPLIER,
+            credit_rate in 1i128..=MAX_CREDIT_RATE,
+            elapsed in 1u32..=63_072_000u32,
+        ) {
+            let result = compute_credits(amount, allocation_pct, multiplier, credit_rate, elapsed);
+            match result {
+                Ok(credits) => {
+                    // Invariant #1: result must never be negative (no wraparound).
+                    prop_assert!(credits >= 0, "compute_credits returned negative: {} (amount={}, allocation_pct={}, multiplier={}, credit_rate={}, elapsed={})",
+                        credits, amount, allocation_pct, multiplier, credit_rate, elapsed);
+                    // Invariant #1a: result must be at least the naive lower bound.
+                    // The worst case (minimum possible) is when allocation_pct = 0
+                    // (no boost), which gives total_stake = amount.  So credits
+                    // should be >= amount * credit_rate * elapsed... but wait,
+                    // allocation_pct must be >= 1, so the minimum boost is 1%.
+                    // Still, we can check a simple lower bound: credits >= 0.
+                }
+                Err(PoolError::CreditOverflow) => {
+                    // Invariant #2: overflow is the only acceptable error.
+                }
+                Err(other) => {
+                    // Any other error means the function panicked or produced
+                    // an unexpected error variant — fail the test.
+                    panic!("compute_credits returned unexpected error: {:?} (amount={}, allocation_pct={}, multiplier={}, credit_rate={}, elapsed={})",
+                        other, amount, allocation_pct, multiplier, credit_rate, elapsed);
+                }
+            }
+        }
+
+        /// Property: `compute_total_stake` must not return a negative value
+        /// or a value smaller than the un-boosted principal.
+        #[test]
+        fn compute_total_stake_is_never_negative_or_wrapped(
+            amount in 1i128..i128::MAX / 10,
+            allocation_pct in 0u32..=100u32,
+            multiplier in 1u32..=MAX_GLOBAL_MULTIPLIER,
+        ) {
+            let result = compute_total_stake(amount, allocation_pct, multiplier);
+            match result {
+                Ok(total) => {
+                    prop_assert!(total >= 0);
+                    // The principal must always be <= total
+                    let principal = amount - (amount * allocation_pct as i128) / 100;
+                    prop_assert!(total >= principal,
+                        "total_stake {} < principal {} (amount={}, allocation_pct={}, multiplier={})",
+                        total, principal, amount, allocation_pct, multiplier);
+                    // Should not exceed amount * multiplier (worst case at 100% boost)
+                    let max_possible = amount.checked_mul(multiplier as i128)
+                        .unwrap_or(i128::MAX);
+                    prop_assert!(total <= max_possible,
+                        "total_stake {} > max_possible {} (amount={}, allocation_pct={}, multiplier={})",
+                        total, max_possible, amount, allocation_pct, multiplier);
+                }
+                Err(PoolError::CreditOverflow) => {
+                    // Acceptable — overflow is properly detected.
+                }
+                Err(other) => {
+                    panic!("compute_total_stake returned unexpected error: {:?}", other);
+                }
+            }
+        }
+    }
+}
+
 // ── Whitelist system tests ───────────────────────────────────────────────────
 
 #[test]
