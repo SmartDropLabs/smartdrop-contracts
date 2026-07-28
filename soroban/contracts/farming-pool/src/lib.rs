@@ -1,14 +1,11 @@
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #![no_std]
+                                                                                                                                                                                                                                                                                                                                                                                                                                     #![no_std]
 #![allow(deprecated)]
 
 #[cfg(test)]
 mod mock_reentrant_token;
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Vec};
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
-use types::{BoostConfig, DataKey, PoolError, Position, UserStake};
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, BytesN, Env, Vec};
 pub use types::PoolError;
 use types::{BoostConfig, DataKey, Position, UserStake};
 
@@ -24,6 +21,9 @@ pub const WASM: &[u8] = soroban_sdk::contractfile!(
         "/../target/wasm32v1-none/release/farming_pool.wasm"
     ),
 );
+
+// Current schema version for data migration support.
+const SCHEMA_VERSION: u32 = 1;
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5s/ledger).
 const USER_TTL_THRESHOLD: u32 = 518_400;
@@ -141,6 +141,19 @@ fn pool_is_paused(env: &Env) -> bool {
         .instance()
         .get(&DataKey::Paused)
         .unwrap_or(false)
+}
+
+fn is_user_whitelisted(env: &Env, user: &Address) -> bool {
+    if !env.storage().instance().get(&DataKey::WhitelistEnabled).unwrap_or(false) {
+        // Whitelist mode disabled — everyone is implicitly whitelisted.
+        return true;
+    }
+    let key = DataKey::Whitelisted(user.clone());
+    let value: Option<bool> = env.storage().persistent().get(&key);
+    if value.is_some() {
+        bump_user(env, &key);
+    }
+    value.unwrap_or(false)
 }
 
 fn read_schema_version(env: &Env) -> u32 {
@@ -296,10 +309,6 @@ impl FarmingPool {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(PoolError::AlreadyInitialized);
         }
-        if global_multiplier < 1 {
-            return Err(PoolError::InvalidMultiplier);
-        }
-        if credit_rate <= 0 {
         // Ceilings mirror `set_global_multiplier`/`set_credit_rate` — see #89.
         if !(1..=MAX_GLOBAL_MULTIPLIER).contains(&global_multiplier) {
             return Err(PoolError::InvalidGlobalMultiplier);
@@ -324,6 +333,8 @@ impl FarmingPool {
         env.storage()
             .instance()
             .set(&DataKey::MinStakeAmount, &min_stake_amount);
+        env.storage()
+            .instance()
             .set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
         bump_instance(&env);
         Ok(())
@@ -331,15 +342,13 @@ impl FarmingPool {
 
     pub fn admin(env: Env) -> Result<Address, PoolError> {
         bump_instance(&env);
-        get_admin(&env).unwrap()
+        get_admin(&env)
     }
 
     /// Admin: transfer admin rights to `new_admin`. Current admin must authorise.
     ///
     /// Supports key rotation and governance handoffs without redeploying the pool.
     /// Emits a `("pool", "adm_xfr")` event with `(old_admin, new_admin)`.
-    pub fn transfer_admin(env: Env, new_admin: Address) {
-        let current = get_admin(&env).unwrap();
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), PoolError> {
         let current = get_admin(&env)?;
         current.require_auth();
@@ -410,7 +419,6 @@ impl FarmingPool {
             }
         };
 
-        // token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         position.credit_rate = read_credit_rate(&env);
 
         // Checks-effects-interactions: persist state *before* the external
@@ -466,7 +474,6 @@ impl FarmingPool {
         let total_credits = position.total_credits;
         position.amount -= amount;
 
-        // token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &env.current_contract_address(),
@@ -497,9 +504,6 @@ impl FarmingPool {
         let elapsed = env
             .ledger()
             .sequence()
-            .saturating_sub(pos.checkpoint_ledger);
-        pos.total_credits + pos.amount * rate * elapsed as i128;
-        Ok(pos.total_credits + pos.amount * rate * elapsed as i128)
             .saturating_sub(position.checkpoint_ledger);
         let accruing = position
             .amount
@@ -545,7 +549,6 @@ impl FarmingPool {
     }
 
     pub fn emergency_withdraw(env: Env, user: Address) -> Result<i128, PoolError> {
-        get_admin(&env).unwrap().require_auth();
         require_initialized(&env)?;
         let admin = get_admin(&env)?;
         admin.require_auth();
@@ -677,6 +680,68 @@ impl FarmingPool {
         Ok(())
     }
 
+    // ── TTL keep-alive system ────────────────────────────────────────────────
+
+    /// Permissionless function to extend TTLs of a specific user's persistent
+    /// storage entries (UserStake, UserPosition, UserBoost, BankedCredits).
+    ///
+    /// # Archival Risk
+    ///
+    /// Every per-user persistent storage entry (UserStake, UserPosition,
+    /// UserBoost, BankedCredits) is only ever TTL-bumped as a side effect
+    /// of that specific user transacting or being read.  If a user locks or
+    /// stakes funds and then never calls any function again for longer than
+    /// `USER_TTL_EXTEND_TO` (~60 days at ~5s/ledger) without anyone
+    /// (including read-only indexers) querying their specific entries, the
+    /// persistent entry's TTL lapses and Soroban archives it.
+    ///
+    /// Once archived, the entry cannot be read or written without an explicit
+    /// off-chain `RestoreFootprint` operation — this `keep_alive` function
+    /// does **not** restore already-archived entries; it only extends the TTL
+    /// of entries that are still live.  For already-archived entries, an
+    /// operator must submit a Soroban transaction that includes the archived
+    /// key in its footprint with a `RestoreFootprint` operation.
+    ///
+    /// # Keeper Cadence
+    ///
+    /// Off-chain keepers/indexers should call `keep_alive` (or the individual
+    /// getter functions, which bump TTL as a read side-effect) for every
+    /// known active user at least once every ~45 days (between
+    /// `USER_TTL_THRESHOLD` of ~30 days and `USER_TTL_EXTEND_TO` of ~60 days)
+    /// to ensure all user entries remain accessible.
+    ///
+    /// # Edge Cases
+    ///
+    /// - The four per-user key types (UserStake, UserPosition, UserBoost,
+    ///   BankedCredits) have independent TTLs.  This function handles each
+    ///   independently by calling the respective getter (which bumps on read).
+    /// - A user with only a Position (lock/unlock path) never touches
+    ///   UserBoost, so that entry could archive independently — this function
+    ///   checks all four regardless.
+    /// - This function is intentionally not gated by `require_not_paused` so
+    ///   it remains callable even during an incident, which is desirable for
+    ///   the recovery path described in #72/#73.
+    /// - If the user has no entries at all, this function succeeds as a no-op.
+    pub fn keep_alive(env: Env, user: Address) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        // Each getter bumps the entry's TTL if the entry exists.  We call
+        // them all so that independent TTLs are each extended.  Discard the
+        // values — we only need the bump side-effect.
+        let _ = get_user_stake(&env, &user);
+        let _ = get_position(&env, &user);
+        let _ = get_user_boost(&env, &user);
+
+        // BankedCredits is a separate DataKey — bump it directly if it exists.
+        let banked_key = DataKey::BankedCredits(user.clone());
+        if env.storage().persistent().has(&banked_key) {
+            bump_user(&env, &banked_key);
+        }
+
+        Ok(())
+    }
+
     // ── Boost / Stake system ─────────────────────────────────────────────────
 
     /// Stake `amount` tokens. If a prior stake exists, earned credits are checkpointed first.
@@ -768,13 +833,6 @@ impl FarmingPool {
         if !(1..=100).contains(&allocation_pct) {
             return Err(PoolError::InvalidAllocation);
         }
-        require_not_paused(&env)?;
-
-        require_initialized(&env)?;
-        assert!(
-            (1..=100).contains(&allocation_pct),
-            "allocation_pct must be 1-100"
-        );
         bump_instance(&env);
 
         if let Some(mut stake) = get_user_stake(&env, &user) {
@@ -810,8 +868,8 @@ impl FarmingPool {
     pub fn set_global_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
-        if multiplier < 1 {
-            return Err(PoolError::InvalidMultiplier);
+        if !(1..=MAX_GLOBAL_MULTIPLIER).contains(&multiplier) {
+            return Err(PoolError::InvalidGlobalMultiplier);
         }
         bump_instance(&env);
 
@@ -892,6 +950,9 @@ impl FarmingPool {
         let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
         let multiplier = read_global_multiplier(&env);
         let elapsed = env.ledger().sequence().saturating_sub(stake.start_ledger);
+        // Note: All field types of UserStake are Copy, so accessing them here
+        // creates copies — `stake` itself is not moved by compute_credits.
+        let credits_banked = stake.credits_banked;
         let accruing = compute_credits(
             stake.amount,
             allocation_pct,
@@ -899,8 +960,7 @@ impl FarmingPool {
             stake.credit_rate,
             elapsed,
         )?;
-        stake
-            .credits_banked
+        credits_banked
             .checked_add(accruing)
             .ok_or(PoolError::CreditOverflow)
     }
@@ -936,3 +996,4 @@ impl FarmingPool {
 }
 
 mod test;
+

@@ -7,14 +7,13 @@ use soroban_sdk::{contracterror, contracttype, Address};
 pub enum PoolError {
     AlreadyInitialized = 1,
     NotInitialized = 2,
-    /// Returned by `emergency_withdraw` when the pool is not currently paused.
-    NotPaused     = 13,
-    /// Returned by `emergency_withdraw` when the user has no stake or locked position.
-    NoActiveStake = 14,
-    BelowMinimumStake = 15
+    /// `credit_rate` was ≤ 0 or exceeded `MAX_CREDIT_RATE`. See #89.
     InvalidCreditRate = 3,
+    /// Lock/stake amount is below the configured minimum.
+    BelowMinimumStake = 4,
+    /// Returned by `emergency_withdraw` when the pool is not currently paused.
     NotPaused = 13,
-    Paused = 20,
+    /// Returned when the user has no stake or locked position.
     NoActiveStake = 14,
     /// Credit computation overflowed i128. Returned instead of trapping the
     /// contract via overflow-checks = true. The affected operation may still
@@ -29,12 +28,14 @@ pub enum PoolError {
     LockPeriodNotElapsed = 18,
     /// Allocation percentage must be between 1 and 100.
     InvalidAllocation = 19,
-    /// Global multiplier must be >= 1.
+    /// Pool is paused and the operation is not allowed.
+    Paused = 20,
+    /// Global multiplier was 0 (legacy variant, use `InvalidGlobalMultiplier`).
     InvalidMultiplier = 21,
-    NotWhitelisted = 15,
+    /// User is not whitelisted (whitelist mode is enabled).
+    NotWhitelisted = 22,
     /// `global_multiplier` was 0 or exceeded `MAX_GLOBAL_MULTIPLIER`. See #89.
-    InvalidGlobalMultiplier = 15,
-
+    InvalidGlobalMultiplier = 23,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.

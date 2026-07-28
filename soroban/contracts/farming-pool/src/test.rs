@@ -1655,6 +1655,163 @@ fn test_set_min_stake_amount() {
     let min_stake = t.client.get_min_stake_amount();
     assert_eq!(min_stake, amount);
 }
+// ── keep_alive tests ───────────────────────────────────────────────────────────
+
+fn get_persistent_ttl(env: &Env, contract_id: &Address, key: &DataKey) -> u32 {
+    env.as_contract(contract_id, || {
+        env.storage().persistent().get_ttl(key)
+    })
+}
+
+#[test]
+fn test_keep_alive_bumps_user_stake_ttl() {
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+
+    let stake_key = DataKey::UserStake(t.user.clone());
+
+    // Initial TTL after creation
+    assert_eq!(
+        get_persistent_ttl(&t.env, &t.contract_id, &stake_key),
+        USER_TTL_EXTEND_TO
+    );
+
+    // Advance ledgers past TTL_EXTEND_TO without any user activity
+    advance_ledgers(&t.env, USER_TTL_EXTEND_TO - USER_TTL_THRESHOLD + 1);
+    assert!(
+        get_persistent_ttl(&t.env, &t.contract_id, &stake_key) < USER_TTL_THRESHOLD
+    );
+
+    // Call keep_alive to extend TTL
+    t.client.keep_alive(&t.user);
+    assert_eq!(
+        get_persistent_ttl(&t.env, &t.contract_id, &stake_key),
+        USER_TTL_EXTEND_TO
+    );
+}
+
+#[test]
+fn test_keep_alive_bumps_position_ttl() {
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &500);
+
+    let pos_key = DataKey::UserPosition(t.user.clone());
+
+    // Initial TTL after creation
+    assert_eq!(
+        get_persistent_ttl(&t.env, &t.contract_id, &pos_key),
+        USER_TTL_EXTEND_TO
+    );
+
+    // Advance ledgers past threshold
+    advance_ledgers(&t.env, USER_TTL_EXTEND_TO - USER_TTL_THRESHOLD + 1);
+    assert!(
+        get_persistent_ttl(&t.env, &t.contract_id, &pos_key) < USER_TTL_THRESHOLD
+    );
+
+    // Call keep_alive
+    t.client.keep_alive(&t.user);
+    assert_eq!(
+        get_persistent_ttl(&t.env, &t.contract_id, &pos_key),
+        USER_TTL_EXTEND_TO
+    );
+}
+
+#[test]
+fn test_keep_alive_bumps_user_boost_ttl() {
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &50u32);
+
+    let boost_key = DataKey::UserBoost(t.user.clone());
+
+    // Initial TTL
+    assert_eq!(
+        get_persistent_ttl(&t.env, &t.contract_id, &boost_key),
+        USER_TTL_EXTEND_TO
+    );
+
+    // Advance ledgers past threshold
+    advance_ledgers(&t.env, USER_TTL_EXTEND_TO - USER_TTL_THRESHOLD + 1);
+    assert!(
+        get_persistent_ttl(&t.env, &t.contract_id, &boost_key) < USER_TTL_THRESHOLD
+    );
+
+    // Call keep_alive
+    t.client.keep_alive(&t.user);
+    assert_eq!(
+        get_persistent_ttl(&t.env, &t.contract_id, &boost_key),
+        USER_TTL_EXTEND_TO
+    );
+}
+
+#[test]
+fn test_keep_alive_bumps_banked_credits_ttl() {
+    let t = setup(1, 1);
+    // Lock and stake so we can trigger emergency_withdraw which sets banked_credits
+    t.client.lock_assets(&t.user, &500);
+    t.client.stake(&t.user, &300);
+    t.client.pause();
+    t.client.emergency_withdraw(&t.user);
+
+    let banked_key = DataKey::BankedCredits(t.user.clone());
+
+    // Initial TTL after banked_credits was set
+    assert_eq!(
+        get_persistent_ttl(&t.env, &t.contract_id, &banked_key),
+        USER_TTL_EXTEND_TO
+    );
+
+    // Advance ledgers past threshold
+    advance_ledgers(&t.env, USER_TTL_EXTEND_TO - USER_TTL_THRESHOLD + 1);
+    assert!(
+        get_persistent_ttl(&t.env, &t.contract_id, &banked_key) < USER_TTL_THRESHOLD
+    );
+
+    // Call keep_alive
+    t.client.keep_alive(&t.user);
+    assert_eq!(
+        get_persistent_ttl(&t.env, &t.contract_id, &banked_key),
+        USER_TTL_EXTEND_TO
+    );
+}
+
+#[test]
+fn test_keep_alive_succeeds_for_user_with_no_state() {
+    let t = setup(1, 1);
+    // Calling keep_alive on a user with no entries should succeed as a no-op
+    let result = t.client.try_keep_alive(&t.user);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_keep_alive_is_permissionless() {
+    let (env, contract_id, client, admin, user) = setup_without_mocked_auth();
+    client.stake(&user, &1_000);
+
+    let stake_key = DataKey::UserStake(user.clone());
+    advance_ledgers(&env, USER_TTL_EXTEND_TO - USER_TTL_THRESHOLD + 1);
+    assert!(
+        get_persistent_ttl(&env, &contract_id, &stake_key) < USER_TTL_THRESHOLD
+    );
+
+    // Call keep_alive without any mock_auth — should succeed since it's permissionless
+    client.keep_alive(&user);
+    assert_eq!(
+        get_persistent_ttl(&env, &contract_id, &stake_key),
+        USER_TTL_EXTEND_TO
+    );
+}
+
+#[test]
+fn test_keep_alive_uninitialized_returns_not_initialized() {
+    let (_env, client, user) = setup_uninitialized();
+    match client.try_keep_alive(&user) {
+        Err(Ok(PoolError::NotInitialized)) => {}
+        _ => panic!("expected PoolError::NotInitialized"),
+    }
+}
+
 // ── lock_assets checks-effects-interactions (#69) ─────────────────────────────
 //
 // `stake_token` is an admin-supplied address, not necessarily a trusted
