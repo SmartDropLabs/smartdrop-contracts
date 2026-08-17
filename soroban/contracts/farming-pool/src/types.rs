@@ -17,6 +17,8 @@ pub enum PoolError {
     /// Returned by `emergency_withdraw` when the user has no stake or locked position.
     NoActiveStake = 8,
     Paused = 9,
+    /// Returned when credit accrual would overflow `i128`; see #62.
+    CreditOverflow = 10,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.

@@ -245,11 +245,24 @@ fn is_user_whitelisted(env: &Env, user: &Address) -> bool {
 ///   total_stake     = principal_stake + virtual_stake
 ///
 /// With no boost (allocation_pct = 0) total_stake == amount.
-fn compute_total_stake(amount: i128, allocation_pct: u32, multiplier: u32) -> i128 {
-    let boosted = amount * allocation_pct as i128 / 100;
-    let principal = amount - boosted;
-    let virtual_stake = boosted * multiplier as i128;
-    principal + virtual_stake
+fn compute_total_stake(
+    amount: i128,
+    allocation_pct: u32,
+    multiplier: u32,
+) -> Result<i128, PoolError> {
+    let boosted = amount
+        .checked_mul(allocation_pct as i128)
+        .ok_or(PoolError::CreditOverflow)?
+        / 100;
+    let principal = amount
+        .checked_sub(boosted)
+        .ok_or(PoolError::CreditOverflow)?;
+    let virtual_stake = boosted
+        .checked_mul(multiplier as i128)
+        .ok_or(PoolError::CreditOverflow)?;
+    principal
+        .checked_add(virtual_stake)
+        .ok_or(PoolError::CreditOverflow)
 }
 
 fn compute_credits(
@@ -258,8 +271,12 @@ fn compute_credits(
     multiplier: u32,
     credit_rate: i128,
     ledgers_elapsed: u32,
-) -> i128 {
-    compute_total_stake(amount, allocation_pct, multiplier) * credit_rate * ledgers_elapsed as i128
+) -> Result<i128, PoolError> {
+    let total_stake = compute_total_stake(amount, allocation_pct, multiplier)?;
+    total_stake
+        .checked_mul(credit_rate)
+        .and_then(|v| v.checked_mul(ledgers_elapsed as i128))
+        .ok_or(PoolError::CreditOverflow)
 }
 
 /// Credits accrued by a `Position` over `elapsed` ledgers at `credit_rate`.
@@ -268,33 +285,49 @@ fn compute_credits(
 /// checkpointing path (`checkpoint_position`) and the preview path
 /// (`calculate_credits`). Deliberately separate from `compute_credits`, which
 /// applies UserStake boost/multiplier semantics that Positions do not have.
-fn compute_position_credits(amount: i128, credit_rate: i128, elapsed: u32) -> i128 {
-    amount * credit_rate * elapsed as i128
+fn compute_position_credits(
+    amount: i128,
+    credit_rate: i128,
+    elapsed: u32,
+) -> Result<i128, PoolError> {
+    amount
+        .checked_mul(credit_rate)
+        .and_then(|v| v.checked_mul(elapsed as i128))
+        .ok_or(PoolError::CreditOverflow)
 }
 
-fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) {
+fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) -> Result<(), PoolError> {
     let allocation_pct = get_user_boost(env, user).unwrap_or(0);
     let multiplier = read_global_multiplier(env);
     let current = env.ledger().sequence();
     let elapsed = current.saturating_sub(stake.start_ledger);
-    stake.credits_banked += compute_credits(
+    let accrued = compute_credits(
         stake.amount,
         allocation_pct,
         multiplier,
         stake.credit_rate,
         elapsed,
-    );
+    )?;
+    stake.credits_banked = stake
+        .credits_banked
+        .checked_add(accrued)
+        .ok_or(PoolError::CreditOverflow)?;
     stake.start_ledger = current;
     stake.credit_rate = read_credit_rate(env);
+    Ok(())
 }
 
-fn checkpoint_position(env: &Env, position: &mut Position) {
+fn checkpoint_position(env: &Env, position: &mut Position) -> Result<(), PoolError> {
     let current = env.ledger().sequence();
     let elapsed = current.saturating_sub(position.checkpoint_ledger);
-    position.total_credits +=
-        compute_position_credits(position.amount, position.credit_rate, elapsed);
+    let accrued = compute_position_credits(position.amount, position.credit_rate, elapsed)?;
+    position.total_credits = position
+        .total_credits
+        .checked_add(accrued)
+        .ok_or(PoolError::CreditOverflow)?;
     position.checkpoint_ledger = current;
     position.credit_rate = read_credit_rate(env);
+    Ok(())
 }
 
 #[contract]
@@ -421,7 +454,7 @@ impl FarmingPool {
 
         let current = env.ledger().sequence();
         let mut position = if let Some(mut existing) = get_position(&env, &user) {
-            checkpoint_position(&env, &mut existing);
+            checkpoint_position(&env, &mut existing)?;
             existing.amount += amount;
             existing
         } else {
@@ -480,7 +513,7 @@ impl FarmingPool {
             "minimum lock period not elapsed"
         );
 
-        checkpoint_position(&env, &mut position);
+        checkpoint_position(&env, &mut position)?;
         let total_credits = position.total_credits;
         position.amount -= amount;
 
@@ -516,8 +549,11 @@ impl FarmingPool {
             .ledger()
             .sequence()
             .saturating_sub(position.checkpoint_ledger);
-        Ok(position.total_credits
-            + compute_position_credits(position.amount, position.credit_rate, elapsed))
+        let accrued = compute_position_credits(position.amount, position.credit_rate, elapsed)?;
+        position
+            .total_credits
+            .checked_add(accrued)
+            .ok_or(PoolError::CreditOverflow)
     }
 
     pub fn get_user_position(env: Env, user: Address) -> Result<Option<Position>, PoolError> {
@@ -695,7 +731,7 @@ impl FarmingPool {
 
         let current = env.ledger().sequence();
         let mut new_stake = if let Some(mut existing) = get_user_stake(&env, &from) {
-            checkpoint(&env, &from, &mut existing);
+            checkpoint(&env, &from, &mut existing)?;
             existing.amount += amount;
             existing
         } else {
@@ -730,7 +766,7 @@ impl FarmingPool {
         bump_instance(&env);
 
         let mut stake = get_user_stake(&env, &from).expect("no active stake");
-        checkpoint(&env, &from, &mut stake);
+        checkpoint(&env, &from, &mut stake)?;
         let total_credits = stake.credits_banked;
 
         // Return staked tokens to caller.
@@ -758,7 +794,7 @@ impl FarmingPool {
         bump_instance(&env);
 
         if let Some(mut stake) = get_user_stake(&env, &user) {
-            checkpoint(&env, &user, &mut stake);
+            checkpoint(&env, &user, &mut stake)?;
             set_user_stake(&env, &user, &stake);
         }
 
@@ -872,14 +908,17 @@ impl FarmingPool {
         let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
         let multiplier = read_global_multiplier(&env);
         let elapsed = env.ledger().sequence().saturating_sub(stake.start_ledger);
-        Ok(stake.credits_banked
-            + compute_credits(
-                stake.amount,
-                allocation_pct,
-                multiplier,
-                stake.credit_rate,
-                elapsed,
-            ))
+        let accrued = compute_credits(
+            stake.amount,
+            allocation_pct,
+            multiplier,
+            stake.credit_rate,
+            elapsed,
+        )?;
+        stake
+            .credits_banked
+            .checked_add(accrued)
+            .ok_or(PoolError::CreditOverflow)
     }
 
     pub fn set_min_stake_amount(env: Env, amount: i128) -> Result<(), PoolError> {
