@@ -89,6 +89,37 @@ const MAX_GLOBAL_MULTIPLIER: u32 = 1_000;
 const MAX_CREDIT_RATE: i128 = 100_000_000;
 const MAX_STAKE_AMOUNT: i128 = 10i128.pow(18);
 
+/// Upper ceiling on `min_lock_period` enforced in both `initialize` and
+/// `set_min_lock_period`. See #132 for the fund-safety rationale.
+///
+/// Derivation (mirrors #89's approach):
+///
+/// `min_lock_period` is stored as a `u32` ledger count. At Stellar's ~5 s/ledger
+/// target the full `u32` range (`u32::MAX = 4_294_967_295`) is ~681 years — a
+/// value that is, for any practical purpose, a permanent lock. Any user who
+/// locks *after* an admin sets an extreme value has their principal trapped
+/// with no recovery path other than the admin-gated `emergency_withdraw`
+/// (i.e. trusting the same admin who set the extreme value).
+///
+/// A generous, clearly-finite ceiling is chosen so that every plausible
+/// legitimate campaign duration is covered while ruling out fat-finger or
+/// malicious extremes:
+///
+/// ```text
+/// MAX_MIN_LOCK_PERIOD = 2 years × 365 days × 24 h × 3600 s / 5 s/ledger
+///                     = 2 × 365 × 86_400 / 5
+///                     = 12_614_400 ledgers
+/// ```
+///
+/// Two years covers any realistic campaign-style lock window. The companion
+/// `vesting-wallet` contract in this workspace is the intended vehicle for
+/// pure vesting use cases, so `farming-pool` locks are campaign-oriented by
+/// design — multi-year horizons beyond this ceiling have no credible business
+/// justification in this contract's role.
+///
+/// Mirrored in `factory::create_pool` (see #132).
+const MAX_MIN_LOCK_PERIOD: u32 = 12_614_400; // ~2 years at 5 s/ledger
+
 fn bump_instance(env: &Env) {
     env.storage()
         .instance()
@@ -746,6 +777,10 @@ impl FarmingPool {
         };
         if min_stake > MAX_STAKE_AMOUNT {
             return Err(PoolError::InvalidMinStakeAmount);
+        }
+        // Ceiling mirrors `set_min_lock_period` — see #132.
+        if min_lock_period > MAX_MIN_LOCK_PERIOD {
+            return Err(PoolError::MinLockPeriodAboveCeiling);
         }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -1707,6 +1742,10 @@ impl FarmingPool {
     pub fn set_min_lock_period(env: Env, new_period: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
+        // Ceiling mirrors `initialize` — see #132.
+        if new_period > MAX_MIN_LOCK_PERIOD {
+            return Err(PoolError::MinLockPeriodAboveCeiling);
+        }
         bump_instance(&env);
 
         let old_period = read_min_lock_period(&env);

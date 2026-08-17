@@ -25,6 +25,13 @@ const MIN_STAKE_AMOUNT: i128 = 1_000_000;
 // Minimum lock period in ledgers required to prevent flash-loan-style attacks.
 const MIN_LOCK_PERIOD: u32 = 1;
 
+/// Mirror of `farming_pool::MAX_MIN_LOCK_PERIOD`: the factory rejects any
+/// `min_lock_period` above this ceiling in `create_pool` before deploying a
+/// pool, consistent with the pool-side check in `initialize`. See #132.
+///
+/// `2 years × 365 × 86_400 s/day / 5 s/ledger = 12_614_400 ledgers`.
+const MAX_MIN_LOCK_PERIOD: u32 = 12_614_400; // ~2 years at 5 s/ledger
+
 /// Convert a "credits per day" figure into the deployed pool's native
 /// "credits per ledger" `credit_rate`.
 ///
@@ -1085,6 +1092,10 @@ impl Factory {
             .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
         if min_lock_period < MIN_LOCK_PERIOD {
             return Err(FactoryError::MinLockPeriodTooShort);
+        }
+        // Mirror the farming-pool ceiling — see #132.
+        if min_lock_period > MAX_MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodAboveCeiling);
         }
         let effective_min_stake = if min_stake_amount <= 0 {
             MIN_STAKE_AMOUNT

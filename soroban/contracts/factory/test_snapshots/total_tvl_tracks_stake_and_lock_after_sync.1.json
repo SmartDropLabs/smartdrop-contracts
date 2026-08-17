@@ -67,7 +67,7 @@
                   "u32": 1
                 },
                 {
-                  "u64": "50"
+                  "u64": "1"
                 },
                 {
                   "i128": "0"
@@ -82,37 +82,18 @@
     [],
     [
       [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAZLY4W5HLJTS7F55I7ATXL24IZDSA7JKFS5HQI5TTY5HIIJ2O5TQRCV",
-              "function_name": "set_credit_rate",
-              "args": [
-                {
-                  "i128": "2"
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
-    [
-      [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
         {
           "function": {
             "contract_fn": {
               "contract_address": "CAZLY4W5HLJTS7F55I7ATXL24IZDSA7JKFS5HQI5TTY5HIIJ2O5TQRCV",
-              "function_name": "lock_assets",
+              "function_name": "stake",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "i128": "2000000"
+                  "i128": "5000000"
                 }
               ]
             }
@@ -131,7 +112,50 @@
                       "address": "CAZLY4W5HLJTS7F55I7ATXL24IZDSA7JKFS5HQI5TTY5HIIJ2O5TQRCV"
                     },
                     {
-                      "i128": "2000000"
+                      "i128": "5000000"
+                    }
+                  ]
+                }
+              },
+              "sub_invocations": []
+            }
+          ]
+        }
+      ]
+    ],
+    [
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAZLY4W5HLJTS7F55I7ATXL24IZDSA7JKFS5HQI5TTY5HIIJ2O5TQRCV",
+              "function_name": "lock_assets",
+              "args": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                },
+                {
+                  "i128": "3000000"
+                }
+              ]
+            }
+          },
+          "sub_invocations": [
+            {
+              "function": {
+                "contract_fn": {
+                  "contract_address": "CCABDO7UZXYE4W6GVSEGSNNZTKSLFQGKXXQTH6OX7M7GKZ4Z6CUJNGZN",
+                  "function_name": "transfer",
+                  "args": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                    },
+                    {
+                      "address": "CAZLY4W5HLJTS7F55I7ATXL24IZDSA7JKFS5HQI5TTY5HIIJ2O5TQRCV"
+                    },
+                    {
+                      "i128": "3000000"
                     }
                   ]
                 }
@@ -146,28 +170,6 @@
     [],
     [],
     [],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAZLY4W5HLJTS7F55I7ATXL24IZDSA7JKFS5HQI5TTY5HIIJ2O5TQRCV",
-              "function_name": "unlock_assets",
-              "args": [
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                },
-                {
-                  "i128": "800000"
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
     [],
     [],
     [],
@@ -178,13 +180,10 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAZLY4W5HLJTS7F55I7ATXL24IZDSA7JKFS5HQI5TTY5HIIJ2O5TQRCV",
-              "function_name": "unlock_assets",
+              "function_name": "unstake",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                },
-                {
-                  "i128": "1200000"
                 }
               ]
             }
@@ -193,13 +192,14 @@
         }
       ]
     ],
+    [],
     [],
     [],
     []
   ],
   "ledger": {
     "protocol_version": 25,
-    "sequence_number": 60,
+    "sequence_number": 0,
     "timestamp": 0,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
@@ -274,26 +274,6 @@
           "data": {
             "contract_data": {
               "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "key": {
-                "ledger_key_nonce": {
-                  "nonce": "4837995959683129791"
-                }
-              },
-              "durability": "temporary",
-              "val": "void"
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 6311999
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
               "key": {
                 "ledger_key_nonce": {
@@ -317,7 +297,7 @@
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
               "key": {
                 "ledger_key_nonce": {
-                  "nonce": "6277191135259896685"
+                  "nonce": "4270020994084947596"
                 }
               },
               "durability": "temporary",
@@ -326,7 +306,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6312059
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -337,7 +317,7 @@
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
               "key": {
                 "ledger_key_nonce": {
-                  "nonce": "8370022561469687789"
+                  "nonce": "4837995959683129791"
                 }
               },
               "durability": "temporary",
@@ -346,7 +326,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6312059
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -464,7 +444,7 @@
                       "symbol": "min_lock_period"
                     },
                     "val": {
-                      "u32": 50
+                      "u32": 1
                     }
                   },
                   {
@@ -502,7 +482,7 @@
               },
               "durability": "persistent",
               "val": {
-                "i128": "0"
+                "i128": "3000000"
               }
             }
           },
@@ -584,6 +564,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "TotalTvl"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "3000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "WasmHash"
                           }
                         ]
@@ -611,7 +603,7 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "BankedCredits"
+                    "symbol": "UserPosition"
                   },
                   {
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
@@ -623,18 +615,50 @@
                 "map": [
                   {
                     "key": {
-                      "symbol": "position_credits"
+                      "symbol": "amount"
                     },
                     "val": {
-                      "i128": "240000000"
+                      "i128": "3000000"
                     }
                   },
                   {
                     "key": {
-                      "symbol": "stake_credits"
+                      "symbol": "checkpoint_ledger"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "credit_rate"
+                    },
+                    "val": {
+                      "i128": "1"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "lock_ledger"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "total_credits"
                     },
                     "val": {
                       "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "unlock_ledger"
+                    },
+                    "val": {
+                      "u32": 1
                     }
                   }
                 ]
@@ -643,7 +667,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 1036860
+        "live_until": 1036800
       },
       {
         "entry": {
@@ -681,7 +705,7 @@
                         ]
                       },
                       "val": {
-                        "i128": "2"
+                        "i128": "1"
                       }
                     },
                     {
@@ -717,7 +741,7 @@
                         ]
                       },
                       "val": {
-                        "u32": 50
+                        "u32": 1
                       }
                     },
                     {
@@ -765,7 +789,7 @@
                         ]
                       },
                       "val": {
-                        "u32": 0
+                        "u32": 1
                       }
                     },
                     {
@@ -777,7 +801,7 @@
                         ]
                       },
                       "val": {
-                        "i128": "240000000"
+                        "i128": "0"
                       }
                     },
                     {
@@ -789,7 +813,7 @@
                         ]
                       },
                       "val": {
-                        "i128": "240000000"
+                        "i128": "0"
                       }
                     },
                     {
@@ -801,7 +825,19 @@
                         ]
                       },
                       "val": {
-                        "i128": "0"
+                        "i128": "3000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "UnstakeCount"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 1
                       }
                     }
                   ]
@@ -838,7 +874,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "1000000000"
+                      "i128": "997000000"
                     }
                   },
                   {
@@ -890,7 +926,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "0"
+                      "i128": "3000000"
                     }
                   },
                   {
