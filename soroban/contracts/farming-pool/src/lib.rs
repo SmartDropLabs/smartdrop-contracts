@@ -262,6 +262,16 @@ fn compute_credits(
     compute_total_stake(amount, allocation_pct, multiplier) * credit_rate * ledgers_elapsed as i128
 }
 
+/// Credits accrued by a `Position` over `elapsed` ledgers at `credit_rate`.
+///
+/// Single source of truth for Position credit accrual, shared by the
+/// checkpointing path (`checkpoint_position`) and the preview path
+/// (`calculate_credits`). Deliberately separate from `compute_credits`, which
+/// applies UserStake boost/multiplier semantics that Positions do not have.
+fn compute_position_credits(amount: i128, credit_rate: i128, elapsed: u32) -> i128 {
+    amount * credit_rate * elapsed as i128
+}
+
 fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) {
     let allocation_pct = get_user_boost(env, user).unwrap_or(0);
     let multiplier = read_global_multiplier(env);
@@ -281,7 +291,8 @@ fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) {
 fn checkpoint_position(env: &Env, position: &mut Position) {
     let current = env.ledger().sequence();
     let elapsed = current.saturating_sub(position.checkpoint_ledger);
-    position.total_credits += position.amount * position.credit_rate * elapsed as i128;
+    position.total_credits +=
+        compute_position_credits(position.amount, position.credit_rate, elapsed);
     position.checkpoint_ledger = current;
     position.credit_rate = read_credit_rate(env);
 }
@@ -505,7 +516,8 @@ impl FarmingPool {
             .ledger()
             .sequence()
             .saturating_sub(position.checkpoint_ledger);
-        Ok(position.total_credits + position.amount * position.credit_rate * elapsed as i128)
+        Ok(position.total_credits
+            + compute_position_credits(position.amount, position.credit_rate, elapsed))
     }
 
     pub fn get_user_position(env: Env, user: Address) -> Result<Option<Position>, PoolError> {

@@ -1107,6 +1107,80 @@ fn test_calculate_credits_reflects_partial_unlock_checkpoint() {
     assert_eq!(t.client.calculate_credits(&t.user), 13_000);
 }
 
+// ── Position credit accrual unit tests ────────────────────────────────────────
+
+#[test]
+fn test_compute_position_credits_zero_elapsed() {
+    // No time elapsed → no credits accrued regardless of amount/rate.
+    assert_eq!(compute_position_credits(1_000, 1, 0), 0);
+    assert_eq!(compute_position_credits(5_000, 100, 0), 0);
+}
+
+#[test]
+fn test_compute_position_credits_positive() {
+    // amount * credit_rate * elapsed
+    assert_eq!(compute_position_credits(500, 2, 20), 20_000);
+}
+
+#[test]
+fn test_compute_position_credits_combinations() {
+    let cases = [
+        (1_000, 1, 10, 10_000),
+        (2_000, 3, 5, 30_000),
+        (750, 4, 100, 300_000),
+        (1, 1, 1, 1),
+        (1_000, 1, 1_000_000, 1_000_000_000),
+    ];
+    for (amount, credit_rate, elapsed, expected) in cases {
+        assert_eq!(
+            compute_position_credits(amount, credit_rate, elapsed),
+            expected,
+            "amount={amount}, credit_rate={credit_rate}, elapsed={elapsed}"
+        );
+    }
+}
+
+#[test]
+fn test_position_banked_vs_previewed_credits_match() {
+    // The value banked by checkpoint_position and previewed by calculate_credits
+    // must come from the same calculation.
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+
+    // Preview before checkpointing.
+    let previewed = t.client.calculate_credits(&t.user);
+    assert_eq!(previewed, 10_000); // 1000 * 1 * 10
+
+    // Checkpoint via a second lock, banking the same accrued credits.
+    t.client.lock_assets(&t.user, &100);
+    let pos = t
+        .client
+        .get_user_position(&t.user)
+        .expect("position should exist");
+    assert_eq!(pos.total_credits, previewed);
+
+    // Nothing further accrues since the checkpoint.
+    assert_eq!(t.client.calculate_credits(&t.user), previewed);
+}
+
+#[test]
+fn test_position_multi_checkpoint_accrual() {
+    // Each checkpoint banks credits via the shared formula; the total is the sum.
+    // Amounts must stay at/above the default min_stake_amount (100) to pass the
+    // lock/min-stake gate.
+    let t = setup(1, 2);
+    t.client.lock_assets(&t.user, &1_000);
+    advance_ledgers(&t.env, 5);
+    t.client.lock_assets(&t.user, &100); // banks 1000 * 2 * 5 = 10_000
+    advance_ledgers(&t.env, 5);
+    t.client.lock_assets(&t.user, &100); // banks 1100 * 2 * 5 = 11_000
+    advance_ledgers(&t.env, 5);
+    t.client.unlock_assets(&t.user, &100); // banks 1200 * 2 * 5 = 12_000
+
+    assert_eq!(t.client.calculate_credits(&t.user), 33_000);
+}
+
 // ── get_user_position tests ───────────────────────────────────────────────────
 
 #[test]
