@@ -1,7 +1,7 @@
 #![cfg(test)]
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
+    testutils::{Address as _, EnvTestConfig, Events, Ledger, MockAuth, MockAuthInvoke},
     token::{StellarAssetClient, TokenClient},
     Address, BytesN, Env, IntoVal, Symbol, Val,
 };
@@ -2072,3 +2072,609 @@ fn test_emergency_withdraw_reverts_entirely_if_stake_token_naively_reenters() {
     let stake = client.get_stake(&user).unwrap();
     assert_eq!(stake.amount, 300);
 }
+
+// ── Credit-accrual invariants, property-based (#75) ──────────────────────────
+//
+// Shared notation used by every derivation below. Writing
+// `B(a, p) = floor(a * p / 100)` for the boosted portion computed by
+// `compute_total_stake`, that function reduces algebraically to
+//
+//     S(a, p, m) = (a - B(a, p)) + B(a, p) * m
+//                = a + B(a, p) * (m - 1)
+//
+// and `compute_credits` is `S(a, p, m) * r * elapsed`. `B` is the *only*
+// nonlinearity in the whole accrual path — everything else is integer
+// multiplication and addition, which are exact.
+//
+// Where truncation could bite, and by how much. For a partition
+// `A = a_1 + ... + a_n`, write `a_i * p / 100 = q_i + f_i` with `f_i` in
+// `[0, 1)`. Then `sum_i B(a_i, p) = sum_i q_i` while
+// `B(A, p) = floor(sum_i (q_i + f_i)) = sum_i q_i + floor(sum_i f_i)`, so
+//
+//     B(A, p) - sum_i B(a_i, p) = floor(sum_i f_i)  in  [0, n - 1]
+//
+// (upper bound `n - 1` because each `f_i <= 99/100`, so `sum f_i < n`; tight at
+// `p = 99, a_i = 1, n = 100`). An implementation that banked each deposit's
+// boosted portion *separately* would therefore lose up to
+// `(n - 1) * (m - 1) * r * elapsed` credits relative to one that aggregates
+// first. That is the loss issue #75 anticipated.
+//
+// It is not reachable by splitting a deposit, because `stake` performs
+// `existing.amount += amount` *before* `B` is next evaluated, and every call
+// site of `compute_total_stake` passes the cumulative `stake.amount`. `B` is
+// only ever applied to the aggregate. Properties A and B below are therefore
+// *strict equalities*, not tolerance-bounded comparisons: an epsilon of
+// `(n - 1) * (m - 1) * r * elapsed` would be blind to a regression of exactly
+// that size, which is the regression these tests exist to catch.
+//
+// Preconditions shared by A and B, outside which they are false *by design*:
+//   * `credit_rate` fixed. `checkpoint` snapshots the rate into `UserStake`, so
+//     a mid-flight change is priced from the next checkpoint onward — see
+//     `test_credit_rate_change_does_not_retroactively_alter_staked_credits`.
+//   * `global_multiplier` fixed. See the "Property E" note at the end of this
+//     section: unlike the rate, the multiplier is *not* snapshotted.
+//   * `allocation_pct` fixed and set before the first stake, so that
+//     `checkpoint`'s `get_user_boost` read is the same value at every call.
+
+use proptest::prelude::*;
+
+/// Case count for every property in this section. Deliberately modest: each
+/// case registers a Stellar Asset Contract plus a pool instance and drives
+/// several contract invocations, so cost per case is milliseconds rather than
+/// microseconds. 64 is enough to explore the truncating region of `B` densely
+/// while keeping the whole section well under a second — see #75's acceptance
+/// criterion on CI runtime.
+const PROP_CASES: u32 = 64;
+
+/// Upper bound on a single generated deposit.
+///
+/// Chosen to stay far inside #89's overflow budget rather than to probe it:
+/// with `multiplier <= MAX_GLOBAL_MULTIPLIER`, `credit_rate <= MAX_CREDIT_RATE`,
+/// at most `MAX_DEPOSITS` deposits and a horizon under 10^5 ledgers, the worst
+/// case is `6e12 * 1e3 * 1e8 * 1e5 ~= 4.5e28`, about ten orders of magnitude
+/// below `i128::MAX ~= 1.7e38`. Overflow boundaries are #76's subject, not
+/// this file's — these properties must fail on *accounting* errors only.
+const MAX_DEPOSIT: i128 = 1_000_000_000_000;
+
+const MAX_DEPOSITS: usize = 6;
+const MAX_CHECKPOINTS: usize = 8;
+
+/// Largest gap, in ledgers, generated between two timeline steps.
+const MAX_GAP: u32 = 5_000;
+
+/// A pool configured for property testing.
+///
+/// Differs from [`setup`] in three ways that matter:
+///  * `capture_snapshot_at_drop: false` — soroban writes a
+///    `test_snapshots/<test>.N.json` file for every `Env` it drops
+///    (soroban-sdk `src/env.rs`, `impl Drop for Env`). With one `Env` per
+///    proptest case per path that would be hundreds of JSON files per run.
+///  * `min_stake_amount = 1` — the loosest legal setting (`get_min_stake_amount`
+///    itself defaults to 1), which is also the most adversarial: it lets a
+///    deposit be split into parts as small as a single unit, maximising the
+///    number of independent `floor` roundings a per-deposit implementation
+///    would incur.
+///  * a much larger mint, so a six-deposit schedule at `MAX_DEPOSIT` each is
+///    always affordable.
+fn setup_for_props(global_multiplier: u32, credit_rate: i128) -> TestEnv {
+    let env = Env::new_with_config(EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    });
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_sac = StellarAssetClient::new(&env, &asset.address());
+    token_sac.mint(&user, &i128::from(u64::MAX));
+
+    let contract_id = env.register(FarmingPool, ());
+    let client = FarmingPoolClient::new(&env, &contract_id);
+    client.initialize(
+        &admin,
+        &asset.address(),
+        &global_multiplier,
+        &credit_rate,
+        &0u32,
+        &1i128,
+    );
+
+    let token = TokenClient::new(&env, &asset.address());
+
+    // SAFETY: as in `setup_with_lock_period` — `env` owns the contract and
+    // token registrations, so they outlive the returned struct.
+    let client = unsafe {
+        core::mem::transmute::<FarmingPoolClient<'_>, FarmingPoolClient<'static>>(client)
+    };
+    let token = unsafe { core::mem::transmute::<TokenClient<'_>, TokenClient<'static>>(token) };
+    let token_sac = unsafe {
+        core::mem::transmute::<StellarAssetClient<'_>, StellarAssetClient<'static>>(token_sac)
+    };
+
+    TestEnv {
+        env,
+        client,
+        contract_id,
+        token,
+        token_sac,
+        admin,
+        user,
+    }
+}
+
+/// One event on a generated timeline: `gap` ledgers elapse, then `action`.
+#[derive(Clone, Copy, Debug)]
+enum Action {
+    /// Stake this amount.
+    Deposit(i128),
+    /// Re-apply the *same* `allocation_pct`, which forces `checkpoint` to run
+    /// (`set_boost` checkpoints before writing) without altering any input to
+    /// the accrual formula. The purest available no-op checkpoint.
+    Checkpoint,
+}
+
+type Step = (u32, Action);
+
+/// Independent oracle for the credits a schedule should produce.
+///
+/// Written in the *reduced* form `S = a + B(a, p) * (m - 1)` derived at the top
+/// of this section, rather than by calling `compute_total_stake`, so that these
+/// properties are oracle tests rather than merely differential ones: two paths
+/// through the contract cannot agree with each other *and* with this expression
+/// while both being wrong in the same way.
+///
+/// The oracle deliberately keeps the `floor` — it is not a rational-arithmetic
+/// reference. Its job is to pin the *aggregation structure* (`B` applied once
+/// per checkpoint to the running total, credits summed over intervals), which
+/// is exactly what deposit granularity and checkpoint frequency could perturb.
+fn oracle_total_stake(amount: i128, allocation_pct: u32, multiplier: u32) -> i128 {
+    amount + (amount * allocation_pct as i128 / 100) * (multiplier as i128 - 1)
+}
+
+/// Credits accrued by `steps` followed by `tail_gap` further ledgers, given a
+/// boost set before the first deposit and a fixed multiplier and rate.
+///
+/// `sum_j S(A_j, p, m) * r * (t_{j+1} - t_j)` where `A_j` is the amount held
+/// during interval `j`. `Checkpoint` steps contribute nothing beyond their gap,
+/// which is precisely Property B's claim.
+fn oracle_credits(
+    steps: &[Step],
+    allocation_pct: u32,
+    multiplier: u32,
+    credit_rate: i128,
+    tail_gap: u32,
+) -> i128 {
+    let mut held = 0i128;
+    let mut total = 0i128;
+    for &(gap, action) in steps {
+        // `gap` ledgers elapse while `held` is staked. Before the first
+        // deposit `held` is 0 and the interval contributes nothing.
+        total += oracle_total_stake(held, allocation_pct, multiplier) * credit_rate * gap as i128;
+        if let Action::Deposit(amount) = action {
+            held += amount;
+        }
+    }
+    total += oracle_total_stake(held, allocation_pct, multiplier) * credit_rate * tail_gap as i128;
+    total
+}
+
+/// Split `amount` into `weights.len()` positive parts in the given proportions.
+///
+/// Every part is at least 1 (the pool's `min_stake_amount`), and the parts sum
+/// to exactly `amount`, so the split changes deposit *granularity* and nothing
+/// else. The caller must ensure `1 <= weights.len() <= amount`.
+fn partition(amount: i128, weights: &[u32]) -> std::vec::Vec<i128> {
+    let n = weights.len() as i128;
+    debug_assert!(n >= 1 && n <= amount);
+    let weight_sum: i128 = weights.iter().map(|&w| i128::from(w)).sum();
+
+    let mut assigned = 0i128;
+    let mut parts = std::vec::Vec::with_capacity(weights.len());
+    for (i, &w) in weights.iter().enumerate().take(weights.len() - 1) {
+        // Leave at least 1 unit for each part still to come.
+        let reserved = n - 1 - i as i128;
+        let part = (amount * i128::from(w) / weight_sum).clamp(1, amount - assigned - reserved);
+        parts.push(part);
+        assigned += part;
+    }
+    parts.push(amount - assigned);
+    parts
+}
+
+// ── Generators ───────────────────────────────────────────────────────────────
+//
+// Every range below is the *reachable* range for that input, so the properties
+// never assert anything about a state the contract would have rejected:
+//
+//   multiplier     1..=MAX_GLOBAL_MULTIPLIER  (lib.rs, `set_global_multiplier`)
+//   credit_rate    1..=MAX_CREDIT_RATE        (lib.rs, `set_credit_rate`)
+//   allocation_pct 1..=100                    (lib.rs, `set_boost`)
+//   deposit        >= min_stake_amount, > 0   (lib.rs, `stake`)
+//
+// Both ceilings are #89's landed constants, imported rather than re-stated, so
+// this file tracks any future change to them automatically.
+
+/// `2..=MAX_GLOBAL_MULTIPLIER`, not `1..=`.
+///
+/// At `multiplier == 1`, `S(a, p, m) = a` identically and the `floor` in `B`
+/// cannot affect the result at all — a split-invariance property would pass
+/// vacuously. Properties A and B exist to exercise the truncating branch, so
+/// they exclude the one value that switches it off. Property D, which makes no
+/// claim about truncation, keeps the full `1..=` range.
+fn boosting_multiplier() -> impl Strategy<Value = u32> {
+    2..=MAX_GLOBAL_MULTIPLIER
+}
+
+fn any_multiplier() -> impl Strategy<Value = u32> {
+    1..=MAX_GLOBAL_MULTIPLIER
+}
+
+fn any_credit_rate() -> impl Strategy<Value = i128> {
+    1..=MAX_CREDIT_RATE
+}
+
+fn any_allocation_pct() -> impl Strategy<Value = u32> {
+    1..=100u32
+}
+
+fn any_deposit() -> impl Strategy<Value = i128> {
+    1..=MAX_DEPOSIT
+}
+
+fn any_gap() -> impl Strategy<Value = u32> {
+    0..=MAX_GAP
+}
+
+/// A timeline mixing deposits and no-op checkpoints.
+fn any_steps() -> impl Strategy<Value = std::vec::Vec<Step>> {
+    let action = prop_oneof![
+        3 => any_deposit().prop_map(Action::Deposit),
+        1 => Just(Action::Checkpoint),
+    ];
+    proptest::collection::vec((any_gap(), action), 1..=(MAX_DEPOSITS + MAX_CHECKPOINTS))
+}
+
+/// A deposits-only timeline, paired with per-deposit split weights.
+fn any_deposit_schedule() -> impl Strategy<Value = std::vec::Vec<(u32, i128, std::vec::Vec<u32>)>> {
+    proptest::collection::vec(
+        (
+            any_gap(),
+            any_deposit(),
+            proptest::collection::vec(1..=1_000u32, 1..=4),
+        ),
+        1..=MAX_DEPOSITS,
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(PROP_CASES))]
+
+    /// PROPERTY A — total credits do not depend on deposit granularity.
+    ///
+    /// Claim: for a fixed schedule of deposits `(t_j, amt_j)`, subdividing any
+    /// `amt_j` into parts staked at the *same* ledger `t_j` leaves total
+    /// credits unchanged at every later ledger. Tolerance: **exactly zero**.
+    ///
+    /// Derivation. Two facts about a second `stake` call at the same ledger:
+    ///
+    ///  1. It checkpoints with `elapsed = current - stake.start_ledger = 0`,
+    ///     so `credits_banked += S(...) * r * 0 = 0` and `start_ledger` is
+    ///     rewritten to the value it already held. The bank is untouched, and
+    ///     — crucially — `B` never sees the individual part.
+    ///  2. `existing.amount += amount` aggregates *before* `B` is next
+    ///     evaluated, at the following checkpoint or read.
+    ///
+    /// So after subdividing, `UserStake` is field-for-field identical:
+    /// `{amount, start_ledger, credits_banked, credit_rate}` all match. By
+    /// induction over the schedule every subsequent checkpoint observes
+    /// identical state, hence identical credits. No rounding is introduced,
+    /// which is why this is `==` and not `<= epsilon`.
+    ///
+    /// What it catches: a refactor that banked each deposit's boosted portion
+    /// separately would lose `floor(sum_i f_i) * (m - 1) * r * elapsed`
+    /// credits, up to `(n - 1) * (m - 1) * r * elapsed` — the bound derived at
+    /// the top of this section. Strict equality detects that at `n = 2`.
+    #[test]
+    fn prop_credits_are_independent_of_deposit_granularity(
+        multiplier in boosting_multiplier(),
+        credit_rate in any_credit_rate(),
+        allocation_pct in any_allocation_pct(),
+        schedule in any_deposit_schedule(),
+        tail_gap in 1..=MAX_GAP,
+    ) {
+        // Coarse path: one `stake` call per scheduled deposit.
+        let coarse = {
+            let t = setup_for_props(multiplier, credit_rate);
+            t.client.set_boost(&t.user, &allocation_pct);
+            for &(gap, amount, _) in &schedule {
+                advance_ledgers(&t.env, gap);
+                t.client.stake(&t.user, &amount);
+            }
+            advance_ledgers(&t.env, tail_gap);
+            t.client.get_credits(&t.user)
+        };
+
+        // Fine path: identical timeline, but each deposit arrives as several
+        // same-ledger calls summing to the same amount.
+        let fine = {
+            let t = setup_for_props(multiplier, credit_rate);
+            t.client.set_boost(&t.user, &allocation_pct);
+            for (gap, amount, weights) in &schedule {
+                advance_ledgers(&t.env, *gap);
+                // `partition` needs at least one unit per part.
+                let parts = (weights.len() as i128).min(*amount).max(1) as usize;
+                for part in partition(*amount, &weights[..parts]) {
+                    t.client.stake(&t.user, &part);
+                }
+            }
+            advance_ledgers(&t.env, tail_gap);
+            t.client.get_credits(&t.user)
+        };
+
+        prop_assert_eq!(
+            coarse, fine,
+            "deposit granularity changed total credits (m={}, r={}, pct={})",
+            multiplier, credit_rate, allocation_pct
+        );
+
+        // ...and both agree with the independent closed form, so the property
+        // cannot be satisfied by two identically-wrong paths.
+        let steps: std::vec::Vec<Step> = schedule
+            .iter()
+            .map(|&(gap, amount, _)| (gap, Action::Deposit(amount)))
+            .collect();
+        prop_assert_eq!(
+            coarse,
+            oracle_credits(&steps, allocation_pct, multiplier, credit_rate, tail_gap),
+            "credits diverged from the closed-form oracle"
+        );
+    }
+
+    /// PROPERTY B — total credits do not depend on checkpoint frequency.
+    ///
+    /// Claim: with `amount`, `allocation_pct`, `multiplier` and `credit_rate`
+    /// fixed, inserting arbitrarily many extra no-op checkpoints at arbitrary
+    /// ledgers leaves total credits unchanged. Tolerance: **exactly zero**.
+    ///
+    /// Derivation. Chop `[t_0, T]` at `t_0 < t_1 < ... < t_k`. Because
+    /// `amount`, `p` and `m` are unchanged at every checkpoint, `S(A, p, m)`
+    /// is the *same integer* `S` at each one, so the banked total is
+    ///
+    ///     sum_j S * r * (t_{j+1} - t_j) = S * r * sum_j (t_{j+1} - t_j)
+    ///                                   = S * r * T
+    ///
+    /// Integer multiplication distributes exactly over integer addition, so
+    /// partitioning *time* introduces no rounding whatsoever. Structurally:
+    /// the only `floor` in the accrual path is `B(amount, pct)`, a function of
+    /// amount and percentage alone — it is entirely independent of `elapsed`.
+    /// This is why the property needs no epsilon even though #75 expected one.
+    ///
+    /// Both paths walk the identical ledger timeline; they differ only in
+    /// whether the `Checkpoint` steps actually invoke the contract. Deposits
+    /// are interleaved so the property is tested across changing amounts, not
+    /// only for a single static stake.
+    #[test]
+    fn prop_credits_are_independent_of_checkpoint_frequency(
+        multiplier in boosting_multiplier(),
+        credit_rate in any_credit_rate(),
+        allocation_pct in any_allocation_pct(),
+        steps in any_steps(),
+        tail_gap in 1..=MAX_GAP,
+    ) {
+        // Sparse path: checkpoint steps advance the ledger but do nothing.
+        let sparse = {
+            let t = setup_for_props(multiplier, credit_rate);
+            t.client.set_boost(&t.user, &allocation_pct);
+            for &(gap, action) in &steps {
+                advance_ledgers(&t.env, gap);
+                if let Action::Deposit(amount) = action {
+                    t.client.stake(&t.user, &amount);
+                }
+            }
+            advance_ledgers(&t.env, tail_gap);
+            t.client.get_credits(&t.user)
+        };
+
+        // Dense path: same timeline, checkpoint steps actually checkpoint.
+        let dense = {
+            let t = setup_for_props(multiplier, credit_rate);
+            t.client.set_boost(&t.user, &allocation_pct);
+            for &(gap, action) in &steps {
+                advance_ledgers(&t.env, gap);
+                match action {
+                    Action::Deposit(amount) => t.client.stake(&t.user, &amount),
+                    // Re-applying the same pct checkpoints without changing
+                    // any input to the accrual formula.
+                    Action::Checkpoint => t.client.set_boost(&t.user, &allocation_pct),
+                }
+            }
+            advance_ledgers(&t.env, tail_gap);
+            t.client.get_credits(&t.user)
+        };
+
+        prop_assert_eq!(
+            sparse, dense,
+            "checkpoint frequency changed total credits (m={}, r={}, pct={})",
+            multiplier, credit_rate, allocation_pct
+        );
+
+        prop_assert_eq!(
+            sparse,
+            oracle_credits(&steps, allocation_pct, multiplier, credit_rate, tail_gap),
+            "credits diverged from the closed-form oracle"
+        );
+    }
+
+    /// PROPERTY C — credits are strictly increasing in elapsed ledgers.
+    ///
+    /// Claim: for fixed stake, multiplier, rate and allocation, advancing the
+    /// ledger by `d >= 1` strictly increases the reported credits; advancing by
+    /// zero leaves them unchanged.
+    ///
+    /// Derivation. `get_credits = credits_banked + S(A, p, m) * r * elapsed`,
+    /// and both factors of the slope are bounded below by 1:
+    ///
+    ///   * `S = A + B(A, p) * (m - 1) >= A >= 1`, since `stake` asserts
+    ///     `amount > 0`, `B >= 0` and `m >= 1`;
+    ///   * `r >= 1`, since `credit_rate` is constrained to
+    ///     `1..=MAX_CREDIT_RATE`.
+    ///
+    /// So `delta = S * r * d >= 1 * 1 * 1 = 1 > 0`. Unlike A and B this needs
+    /// no truncation argument at all: `elapsed` appears only as a multiplicand,
+    /// never inside a division, so there is no rounding to reason about. The
+    /// same argument gives the lock/`Position` path (`amount * rate * elapsed`)
+    /// a slope of `amount * rate >= 1`.
+    ///
+    /// Crossing a checkpoint is also safe: at the instant of banking,
+    /// `banked' = banked + S * r * elapsed` while `elapsed' = 0`, so the
+    /// observable is continuous and the sequence stays monotone.
+    #[test]
+    fn prop_credits_are_strictly_increasing_in_elapsed_ledgers(
+        multiplier in any_multiplier(),
+        credit_rate in any_credit_rate(),
+        allocation_pct in any_allocation_pct(),
+        amount in any_deposit(),
+        advances in proptest::collection::vec(1..=MAX_GAP, 1..=8),
+    ) {
+        let t = setup_for_props(multiplier, credit_rate);
+        t.client.set_boost(&t.user, &allocation_pct);
+        t.client.stake(&t.user, &amount);
+        t.client.lock_assets(&t.user, &amount);
+
+        let mut previous_staked = t.client.get_credits(&t.user);
+        let mut previous_locked = t.client.calculate_credits(&t.user);
+
+        // Advancing by zero must be a no-op for both credit systems.
+        advance_ledgers(&t.env, 0);
+        prop_assert_eq!(t.client.get_credits(&t.user), previous_staked);
+        prop_assert_eq!(t.client.calculate_credits(&t.user), previous_locked);
+
+        for delta in advances {
+            advance_ledgers(&t.env, delta);
+
+            let staked = t.client.get_credits(&t.user);
+            prop_assert!(
+                staked > previous_staked,
+                "get_credits did not increase over {} ledgers: {} -> {}",
+                delta, previous_staked, staked
+            );
+
+            let locked = t.client.calculate_credits(&t.user);
+            prop_assert!(
+                locked > previous_locked,
+                "calculate_credits did not increase over {} ledgers: {} -> {}",
+                delta, previous_locked, locked
+            );
+
+            previous_staked = staked;
+            previous_locked = locked;
+        }
+    }
+
+    /// PROPERTY D — credits are never negative, for any reachable input.
+    ///
+    /// Claim: `get_credits` and `calculate_credits` return a non-negative
+    /// value for every input the contract's own validation admits.
+    ///
+    /// Derivation. `get_credits` is a sum of products of provably non-negative
+    /// factors:
+    ///
+    ///   * `credits_banked` starts at 0 and only ever `+=` a `compute_credits`
+    ///     result, so by induction it is non-negative;
+    ///   * `principal = A - B(A, p) >= 0`, because `p <= 100` forces
+    ///     `B(A, p) = floor(A * p / 100) <= A`;
+    ///   * `virtual_stake = B(A, p) * m >= 0` since `m >= 1`;
+    ///   * `r > 0` and `elapsed >= 0` (`saturating_sub` floors it at zero).
+    ///
+    /// "Reachable input" is what makes this a real test rather than a check on
+    /// an unreachable state, so the generators mirror the contract's own
+    /// constraints exactly: `amount > 0` and `>= min_stake_amount`
+    /// (`stake`), `allocation_pct in 1..=100` (`set_boost`), `multiplier in
+    /// 1..=MAX_GLOBAL_MULTIPLIER` and `credit_rate in 1..=MAX_CREDIT_RATE`
+    /// (#89). Whitelisting is left disabled, its default. `multiplier == 1`
+    /// and `allocation_pct == 100` are both kept in range: the latter is the
+    /// `S = A * m` extreme, where `principal` reaches exactly zero.
+    ///
+    /// The zero-credit boundaries are covered too — a user with no position at
+    /// all, and a user who has fully unstaked — since "never negative" has to
+    /// hold at 0, not just above it.
+    #[test]
+    fn prop_credits_are_never_negative(
+        multiplier in any_multiplier(),
+        credit_rate in any_credit_rate(),
+        allocation_pct in any_allocation_pct(),
+        amount in any_deposit(),
+        elapsed in 0..=MAX_GAP,
+    ) {
+        let t = setup_for_props(multiplier, credit_rate);
+        let stranger = Address::generate(&t.env);
+
+        // No stake and no locked position.
+        prop_assert_eq!(t.client.get_credits(&stranger), 0);
+        prop_assert_eq!(t.client.calculate_credits(&stranger), 0);
+
+        t.client.set_boost(&t.user, &allocation_pct);
+        t.client.stake(&t.user, &amount);
+        t.client.lock_assets(&t.user, &amount);
+        advance_ledgers(&t.env, elapsed);
+
+        prop_assert!(t.client.get_credits(&t.user) >= 0);
+        prop_assert!(t.client.calculate_credits(&t.user) >= 0);
+        prop_assert!(t.client.get_banked_credits(&t.user) >= 0);
+
+        // Unstaking banks and clears the record; the getter must return to 0
+        // rather than to a negative residue.
+        prop_assert!(t.client.unstake(&t.user) >= 0);
+        prop_assert_eq!(t.client.get_credits(&t.user), 0);
+
+        // Same for the lock system, which reports credits at withdrawal time.
+        t.client.unlock_assets(&t.user, &amount);
+        prop_assert_eq!(t.client.calculate_credits(&t.user), 0);
+    }
+}
+
+// ── PROPERTY E — NOT IMPLEMENTED: needs maintainer confirmation (#75) ────────
+//
+// The obvious fourth invariant — "total credits are independent of checkpoint
+// frequency across a *multiplier* change", the analogue of
+// `test_credit_rate_change_does_not_retroactively_alter_staked_credits` — is
+// deliberately absent, because the contract's intended semantics here are not
+// settled and a property test either way would encode a guess as a passing
+// test.
+//
+// The observation. `checkpoint` treats its two admin-controlled inputs
+// asymmetrically:
+//
+//   * `credit_rate` is *snapshotted* into `UserStake.credit_rate` and the
+//     already-elapsed segment is priced at the snapshot, so a mid-flight
+//     `set_credit_rate` is not retroactive. That is asserted by
+//     `test_credit_rate_change_does_not_retroactively_alter_staked_credits`.
+//   * `global_multiplier` is *re-read* by `checkpoint` via
+//     `read_global_multiplier` and applied to the already-elapsed segment. It
+//     is not snapshotted anywhere, and `set_global_multiplier` cannot
+//     checkpoint other users.
+//
+// The consequence is directly observable. With `multiplier = 2`,
+// `allocation_pct = 100`, `amount = 1_000` and ten ledgers elapsed,
+// `get_credits` reports 20_000. Calling `set_global_multiplier(3)` and
+// advancing *zero* ledgers changes that reading to 30_000: the past segment
+// was repriced. A user who happened to checkpoint before the change keeps
+// 20_000 for that segment, so total credits *do* depend on checkpoint
+// frequency whenever a multiplier change is in flight.
+//
+// Why no test is attached. `test_admin_multiplier_change_applies_from_next_
+// checkpoint` is named as though snapshot semantics hold, but it inserts a
+// no-op `set_boost` checkpoint immediately before bumping the multiplier, so
+// it never exercises the mid-segment case. Nothing in the suite or the
+// contract settles which behaviour is intended.
+//
+// QUESTION FOR THE MAINTAINER: should `global_multiplier` be snapshotted into
+// `UserStake` alongside `credit_rate`, so that a multiplier change is priced
+// from the next checkpoint onward and matches both the rate's documented
+// semantics and the sibling test's name? Or is retroactive repricing of open
+// segments the intended behaviour? Once that is answered, this becomes a
+// strict-equality property in the same shape as Property B (with `multiplier`
+// varying mid-timeline) or an explicit regression test pinning the retroactive
+// behaviour — but not before.

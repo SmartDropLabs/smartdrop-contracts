@@ -18,3 +18,11 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+# Property-based tests for credit-accrual invariants (#75). Deliberately a
+# plain dev-dependency rather than part of the `testutils` feature above:
+# `testutils` is forwarded to dependents (`factory` enables it to get
+# `farming_pool::WASM`), whereas proptest is only ever needed by this crate's
+# own `src/test.rs`. Dev-dependencies are not built for
+# `cargo build --target wasm32v1-none --release`, so this cannot reach the
+# `#![no_std]` contract binary.
+proptest = "1"
