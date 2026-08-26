@@ -703,10 +703,148 @@ fn test_unstake_returns_tokens_and_credits() {
     t.client.stake(&t.user, &1_000);
     t.client.set_boost(&t.user, &50u32);
     advance_ledgers(&t.env, 10);
-    let credits = t.client.unstake(&t.user);
+    let credits = t.client.unstake(&t.user, &1_000);
     assert_eq!(credits, 15_000); // 1500 * 10
     assert_eq!(t.token.balance(&t.user), initial_balance);
     assert!(t.client.get_stake(&t.user).is_none());
+}
+
+// ── unstake partial withdrawal (#77) ────────────────────────────────────────
+//
+// `unstake` now takes an explicit `amount`, mirroring `unlock_assets`'
+// long-standing partial-withdrawal support. The tests below pin the two
+// halves of that behavior: a withdrawal smaller than the stake must leave a
+// live, still-accruing remainder, and a withdrawal equal to the stake must be
+// indistinguishable from the old full-withdrawal path.
+
+#[test]
+fn test_unstake_partial_keeps_remaining_stake() {
+    let t = setup(1, 1); // multiplier 1 => boost plays no part here
+    let initial_balance = t.token.balance(&t.user);
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+
+    let credits = t.client.unstake(&t.user, &400); // partial withdrawal
+
+    // The checkpoint runs before `amount` is deducted, so the whole 1_000 is
+    // credited for the elapsed window: 1000 * 1 * 10.
+    assert_eq!(credits, 10_000);
+
+    let stake = t
+        .client
+        .get_stake(&t.user)
+        .expect("stake should still exist");
+    assert_eq!(stake.amount, 600);
+    assert_eq!(stake.credits_banked, 10_000);
+
+    // Exactly `amount` moved — not the full staked balance.
+    assert_eq!(t.token.balance(&t.user), initial_balance - 600);
+    assert_eq!(t.token.balance(&t.contract_id), 600);
+
+    // The remainder keeps earning: 600 * 1 * 10 on top of the 10_000 banked.
+    advance_ledgers(&t.env, 10);
+    assert_eq!(t.client.get_credits(&t.user), 16_000);
+}
+
+#[test]
+fn test_unstake_partial_preserves_boost_allocation() {
+    // A partial unstake must leave `DataKey::UserBoost` intact and keep
+    // applying it to the remainder. `checkpoint` re-reads the allocation from
+    // persistent storage on every call rather than caching it in `UserStake`,
+    // so the surviving remainder cannot go stale — this test fails loudly if
+    // either half of that stops holding.
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &50u32);
+    advance_ledgers(&t.env, 10);
+
+    // Pre-withdrawal accrual at 50% allocation / 2x multiplier:
+    // boosted = 500, principal = 500, virtual = 1000 => total_stake 1500.
+    let credits = t.client.unstake(&t.user, &400);
+    assert_eq!(credits, 15_000); // 1500 * 1 * 10
+
+    // The allocation itself survives the partial withdrawal.
+    let config = t
+        .client
+        .get_boost_config(&t.user)
+        .expect("boost allocation should survive a partial unstake");
+    assert_eq!(config.allocation_pct, 50);
+    assert_eq!(config.multiplier, 2);
+
+    let stake = t
+        .client
+        .get_stake(&t.user)
+        .expect("stake should still exist");
+    assert_eq!(stake.amount, 600);
+
+    // And it still applies to the remainder. On 600: boosted = 300,
+    // principal = 300, virtual = 600 => total_stake 900, so 900 * 1 * 10.
+    // A cleared or stale boost would accrue the unboosted 600 * 1 * 10 = 6_000
+    // instead, landing on 21_000 rather than 24_000.
+    advance_ledgers(&t.env, 10);
+    assert_eq!(t.client.get_credits(&t.user), 24_000);
+}
+
+#[test]
+fn test_unstake_exact_full_amount_removes_stake_record() {
+    // amount == stake.amount is the boundary between the partial path and the
+    // old full-withdrawal path: it must take the `remove_user_stake` branch.
+    let t = setup(1, 1);
+    let initial_balance = t.token.balance(&t.user);
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+
+    let credits = t.client.unstake(&t.user, &1_000);
+
+    assert_eq!(credits, 10_000);
+    assert!(t.client.get_stake(&t.user).is_none());
+    assert_eq!(t.client.get_credits(&t.user), 0);
+    assert_eq!(t.token.balance(&t.user), initial_balance);
+    assert_eq!(t.token.balance(&t.contract_id), 0);
+}
+
+#[test]
+fn test_unstake_rejects_more_than_staked() {
+    // Mirrors test_unlock_assets_rejects_more_than_locked: one over the
+    // balance is the first rejected value.
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+    let result = t.client.try_unstake(&t.user, &1_001i128);
+    assert!(matches!(result, Err(Ok(PoolError::InvalidAmount))));
+
+    // Rejected before any state or token movement.
+    assert_eq!(t.client.get_stake(&t.user).unwrap().amount, 1_000);
+    assert_eq!(t.token.balance(&t.contract_id), 1_000);
+}
+
+#[test]
+fn test_unstake_rejects_zero_amount() {
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+    let result = t.client.try_unstake(&t.user, &0i128);
+    assert!(matches!(result, Err(Ok(PoolError::InvalidAmount))));
+    assert_eq!(t.client.get_stake(&t.user).unwrap().amount, 1_000);
+}
+
+#[test]
+fn test_unstake_rejects_negative_amount() {
+    // Without the `amount <= 0` guard this would *inflate* the stake
+    // (`stake.amount -= -100`), so assert the record is untouched.
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+    let result = t.client.try_unstake(&t.user, &-100i128);
+    assert!(matches!(result, Err(Ok(PoolError::InvalidAmount))));
+    assert_eq!(t.client.get_stake(&t.user).unwrap().amount, 1_000);
+    assert_eq!(t.token.balance(&t.contract_id), 1_000);
+}
+
+#[test]
+fn test_unstake_rejects_when_no_stake() {
+    // Previously an untyped `expect("no active stake")` panic; now the same
+    // typed error `emergency_withdraw` already returns.
+    let t = setup(1, 1);
+    let result = t.client.try_unstake(&t.user, &100i128);
+    assert!(matches!(result, Err(Ok(PoolError::NoActiveStake))));
 }
 
 #[test]
@@ -1351,7 +1489,7 @@ fn test_pause_blocks_unstake() {
     let t = setup(1, 1);
     t.client.stake(&t.user, &1_000);
     t.client.pause();
-    assert!(t.client.try_unstake(&t.user).is_err());
+    assert!(t.client.try_unstake(&t.user, &1_000i128).is_err());
 }
 
 #[test]
@@ -1360,7 +1498,7 @@ fn test_unpause_restores_unstake() {
     t.client.stake(&t.user, &1_000);
     t.client.pause();
     t.client.unpause();
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000i128);
     assert!(t.client.get_stake(&t.user).is_none());
 }
 
@@ -1852,10 +1990,10 @@ fn test_unstake_reentrant_transfer_is_rejected_and_final_state_is_correct() {
     seed_user_stake(&env, &farming_pool_id, &user, 500i128);
 
     let reentrant_args: soroban_sdk::Vec<Val> =
-        soroban_sdk::vec![&env, user.clone().into_val(&env)];
+        soroban_sdk::vec![&env, user.clone().into_val(&env), 200i128.into_val(&env)];
     token_client.configure_reentrant_call(&Symbol::new(&env, "unstake"), &reentrant_args);
 
-    client.unstake(&user);
+    client.unstake(&user, &500i128);
 
     assert!(token_client.reentry_was_rejected());
     assert!(client.get_stake(&user).is_none());
@@ -1881,7 +2019,7 @@ fn test_unstake_reverts_entirely_if_stake_token_naively_reenters() {
     seed_user_stake(&env, &farming_pool_id, &user, 500i128);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.unstake(&user);
+        client.unstake(&user, &500i128);
     }));
     assert!(
         result.is_err(),

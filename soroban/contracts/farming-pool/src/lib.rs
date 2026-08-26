@@ -710,27 +710,81 @@ impl FarmingPool {
         Ok(())
     }
 
-    pub fn unstake(env: Env, from: Address) -> Result<i128, PoolError> {
+    /// Withdraw `amount` from `from`'s stake, returning their total banked
+    /// credits. Mirrors `unlock_assets`' partial-withdrawal support (#77).
+    ///
+    /// # Breaking ABI change
+    ///
+    /// `amount` is a **new required third parameter**. Callers of the previous
+    /// two-argument `unstake(env, from)` — which always withdrew the entire
+    /// stake — must pass the full stake amount explicitly to preserve that
+    /// behavior. There is deliberately no `full_unstake` compatibility
+    /// wrapper: `unlock_assets`, the function this now mirrors, has never had
+    /// one, and a second funds-custody entrypoint would carry its own
+    /// permanent auth/pause/reentrancy surface. See the acceptance notes on
+    /// #77.
+    ///
+    /// # Arguments
+    ///
+    /// * `from` - Staker withdrawing; must authorize the call.
+    /// * `amount` - Quantity to withdraw. Must satisfy
+    ///   `0 < amount <= stake.amount`.
+    ///
+    /// # Partial withdrawals
+    ///
+    /// The stake is checkpointed *before* `amount` is deducted, so credits
+    /// accrued up to this call are banked against the pre-withdrawal balance.
+    /// When `amount < stake.amount` the residual stake record is retained via
+    /// `set_user_stake` and keeps accruing on the remainder; only a withdrawal
+    /// that zeroes the balance removes it. The user's `DataKey::UserBoost`
+    /// allocation is never touched here and needs no rewrite: `checkpoint`
+    /// reads it fresh from persistent storage on every call rather than
+    /// caching it in `UserStake`, so a surviving remainder keeps the existing
+    /// boost without going stale.
+    ///
+    /// # Returns
+    ///
+    /// Total credits banked for `from` after checkpointing. This is the full
+    /// banked balance, *not* a share prorated to `amount` — unchanged from the
+    /// previous behavior.
+    ///
+    /// # Errors
+    ///
+    /// * `PoolError::Paused` - Pool is paused.
+    /// * `PoolError::NotInitialized` - Pool has not been initialized.
+    /// * `PoolError::NoActiveStake` - `from` has no stake record. Previously a
+    ///   panic (`expect("no active stake")`); now a typed error.
+    /// * `PoolError::InvalidAmount` - `amount` was <= 0 or exceeded the stake.
+    pub fn unstake(env: Env, from: Address, amount: i128) -> Result<i128, PoolError> {
         from.require_auth();
         require_not_paused(&env)?;
 
         require_initialized(&env)?;
         bump_instance(&env);
 
-        let mut stake = get_user_stake(&env, &from).expect("no active stake");
+        let mut stake = get_user_stake(&env, &from).ok_or(PoolError::NoActiveStake)?;
+        if amount <= 0 || amount > stake.amount {
+            return Err(PoolError::InvalidAmount);
+        }
+
         checkpoint(&env, &from, &mut stake);
         let total_credits = stake.credits_banked;
+        stake.amount -= amount;
 
-        // Return staked tokens to caller.
+        // Return the withdrawn tokens to caller.
         // token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &env.current_contract_address(),
             &from,
-            &stake.amount,
+            &amount,
         );
 
-        remove_user_stake(&env, &from);
+        if stake.amount == 0 {
+            remove_user_stake(&env, &from);
+        } else {
+            set_user_stake(&env, &from, &stake);
+        }
         Ok(total_credits)
     }
 
