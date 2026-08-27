@@ -6,7 +6,7 @@ mod types;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
 use types::DataKey;
-pub use types::VestingError;
+pub use types::{AdminTransferred, VestingError};
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5 s/ledger).
 const TTL_THRESHOLD: u32 = 518_400;
@@ -280,6 +280,24 @@ impl VestingWallet {
         require_initialized(&env)?;
         bump_instance(&env);
         Ok(compute_vested(&env) - get_released(&env))
+    }
+
+    /// Transfer admin rights to `new_admin`. Current admin must authorise.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), VestingError> {
+        require_initialized(&env)?;
+        let current = get_admin(&env);
+        current.require_auth();
+        bump_instance(&env);
+
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("vest"), symbol_short!("adm_xfr")),
+            (current, new_admin),
+        );
+
+        Ok(())
     }
 }
 

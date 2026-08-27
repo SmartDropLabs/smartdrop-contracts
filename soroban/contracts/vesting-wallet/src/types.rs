@@ -8,6 +8,7 @@ pub enum VestingError {
     NotInitialized = 2,
     NotRevocable = 3,
     AlreadyRevoked = 4,
+    Unauthorized = 5,
 }
 
 /// Storage keys for all instance data in the vesting wallet.
@@ -33,4 +34,12 @@ pub enum DataKey {
     Revoked,
     /// Vested amount frozen at the moment of revocation.
     RevokedVested,
+}
+
+/// Emitted when admin rights are transferred.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferred {
+    pub old_admin: Address,
+    pub new_admin: Address,
 }

@@ -10,6 +10,8 @@ use types::{DataKey, FactoryError, ListPoolsResponse, PoolRecord};
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
 const TTL_THRESHOLD: u32 = 518_400;
 const TTL_EXTEND_TO: u32 = 1_036_800;
+// Bound the number of pool IDs examined per call.
+const MAX_POOL_SCAN_PER_CALL: u32 = 200;
 
 /// Ledgers per day at the network's ~5s/ledger target, used to convert
 /// `create_pool`'s caller-facing `daily_rate` into the pool's native
@@ -206,21 +208,23 @@ impl Factory {
 
     /// Return a page of pool records whose staking asset matches `asset`.
     ///
-    /// Scans registered pools starting from `start_id` and collects matching records.
-    /// `limit` is capped at 20 records so callers can page through large registries
-    /// without unbounded contract work. This prevents denial-of-service by design as
-    /// the registry grows organically.
+    /// Scans at most `MAX_POOL_SCAN_PER_CALL` pool IDs starting from `start_id`
+    /// and collects matching records from that bounded window. `limit` is capped
+    /// at 20 records so callers can page through large registries without
+    /// unbounded contract work. This prevents denial-of-service by design as the
+    /// registry grows organically.
     ///
     /// # Resource Limit Reasoning
-    /// Without pagination, this function performs an unbounded O(n) scan over every
-    /// pool ever registered, with no ceiling. As pool_count grows, the function gets
-    /// strictly more expensive per call and would eventually exceed Soroban's
-    /// per-transaction CPU-instruction and read-entry budgets, becoming permanently
-    /// unusable. The 20-record cap mirrors list_pools's design to prevent this.
+    /// Without a scan bound, this function would perform an unbounded O(n) walk
+    /// when matches are sparse or absent, because it would have to inspect the
+    /// entire registry to find up to 20 matching records. As pool_count grows,
+    /// the function gets strictly more expensive per call and would eventually
+    /// exceed Soroban's per-transaction CPU-instruction and read-entry budgets,
+    /// becoming permanently unusable. The scan window cap ensures each call only
+    /// examines a bounded number of pool IDs.
     ///
-    /// Scans every registered pool in O(n) and collects matching IDs.
-    /// Useful for frontends that need to surface all pools for a given token
-    /// without an off-chain indexer.
+    /// Callers can resume from `next_start_id` to continue scanning the registry
+    /// in bounded chunks until `next_start_id == total`.
     ///
     /// Guarded like `pool_count`: an empty result from an uninitialized factory
     /// would be indistinguishable from "no pools hold this asset".
@@ -228,9 +232,9 @@ impl Factory {
     /// Returns `NotInitialized` if the factory has not been initialized.
     /// # Secondary Index Consideration
     /// For very large registries, a secondary per-asset index (e.g., DataKey::AssetPools
-    /// maintained incrementally in create_pool) would avoid full-registry scans entirely.
-    /// This would be a more robust long-term fix but requires changes to create_pool's
-    /// write path and potentially a migration/backfill for existing pools.
+    /// maintained incrementally in create_pool) would avoid even bounded scans across
+    /// many empty IDs. This would be a more robust long-term fix but requires changes
+    /// to create_pool's write path and potentially a migration/backfill for existing pools.
     pub fn get_pools_by_asset(
         env: Env,
         asset: Address,
@@ -245,10 +249,11 @@ impl Factory {
             .get(&DataKey::PoolCount)
             .unwrap_or(0);
         let capped_limit = limit.min(20);
+        let scan_end = start_id.saturating_add(MAX_POOL_SCAN_PER_CALL).min(count);
         let mut records: Vec<(u32, PoolRecord)> = vec![&env];
-        let mut next_start_id = count;
+        let mut next_start_id = scan_end;
 
-        for pool_id in start_id..count {
+        for pool_id in start_id..scan_end {
             if records.len() >= capped_limit {
                 next_start_id = pool_id;
                 break;

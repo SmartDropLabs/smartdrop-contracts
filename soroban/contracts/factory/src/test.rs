@@ -694,6 +694,86 @@ fn test_get_pools_by_asset_paginates_large_matching_registry() {
 }
 
 #[test]
+fn test_get_pools_by_asset_bounds_scan_for_sparse_matches() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let wasm_hash = upload_farming_pool_wasm(&env);
+    let factory_addr = env.register(Factory, ());
+    let client = FactoryClient::new(&env, &factory_addr);
+    client.initialize(&admin, &wasm_hash);
+
+    let sparse_asset = Address::generate(&env);
+    let other_asset = Address::generate(&env);
+    for i in 0..500 {
+        let asset = if i == 499 {
+            sparse_asset.clone()
+        } else {
+            other_asset.clone()
+        };
+        client.create_pool(
+            &asset,
+            &(1_728_000 + i as u128 * 17_280),
+            &2u32,
+            &(10 + i as u64),
+            &0i128,
+        );
+    }
+
+    let page = client.get_pools_by_asset(&sparse_asset, &0u32, &20u32);
+
+    assert_eq!(page.records.len(), 0);
+    assert_eq!(page.next_start_id, 200);
+    assert_eq!(page.total, 500);
+}
+
+#[test]
+fn test_get_pools_by_asset_can_page_sparse_matches_to_completion() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let wasm_hash = upload_farming_pool_wasm(&env);
+    let factory_addr = env.register(Factory, ());
+    let client = FactoryClient::new(&env, &factory_addr);
+    client.initialize(&admin, &wasm_hash);
+
+    let sparse_asset = Address::generate(&env);
+    let other_asset = Address::generate(&env);
+    for i in 0..500 {
+        let asset = if i == 250 || i == 499 {
+            sparse_asset.clone()
+        } else {
+            other_asset.clone()
+        };
+        client.create_pool(
+            &asset,
+            &(1_728_000 + i as u128 * 17_280),
+            &2u32,
+            &(10 + i as u64),
+            &0i128,
+        );
+    }
+
+    let mut start_id = 0u32;
+    let mut found_ids: Vec<u32> = vec![&env];
+
+    loop {
+        let page = client.get_pools_by_asset(&sparse_asset, &start_id, &20u32);
+        for idx in 0..page.records.len() {
+            found_ids.push_back(page.records.get(idx).unwrap().0);
+        }
+        if page.next_start_id == page.total {
+            break;
+        }
+        start_id = page.next_start_id;
+    }
+
+    assert_eq!(found_ids.len(), 2);
+    assert_eq!(found_ids.get(0), Some(250));
+    assert_eq!(found_ids.get(1), Some(499));
+}
+
+#[test]
 fn test_create_pool_emits_pool_crtd_event() {
     let env = Env::default();
     env.mock_all_auths();

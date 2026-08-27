@@ -12,14 +12,17 @@ pub enum PoolError {
     InvalidGlobalMultiplier = 4,
     NotWhitelisted = 5,
     BelowMinimumStake = 6,
+    InvalidMinStakeAmount = 7,
     /// Returned by `emergency_withdraw` when the pool is not currently paused.
-    NotPaused = 7,
+    NotPaused = 8,
     /// Returned by `emergency_withdraw` when the user has no stake or locked position.
     NoActiveStake = 8,
     Paused = 9,
     /// `amount` was <= 0, or exceeded the caller's withdrawable balance.
     /// Returned by `unstake` (see #77).
     InvalidAmount = 10,
+    NoActiveStake = 9,
+    Paused = 10,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.
@@ -39,6 +42,8 @@ pub struct UserStake {
     pub credits_banked: i128,
     /// Credit rate snapshot used for accrual since `start_ledger`.
     pub credit_rate: i128,
+    /// Global multiplier snapshot captured at checkpoint time (#60).
+    pub multiplier: u32,
 }
 
 /// Recorded state for a user's locking position in the lock/unlock system.

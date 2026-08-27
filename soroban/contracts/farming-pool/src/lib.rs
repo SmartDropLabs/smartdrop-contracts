@@ -85,6 +85,7 @@ const SCHEMA_VERSION: u32 = 1;
 /// this derivation's 16x margin, hence `MAX_CREDIT_RATE` here is 10x smaller.)
 const MAX_GLOBAL_MULTIPLIER: u32 = 1_000;
 const MAX_CREDIT_RATE: i128 = 100_000_000;
+const MAX_STAKE_AMOUNT: i128 = 10i128.pow(18);
 
 fn bump_instance(env: &Env) {
     env.storage()
@@ -276,6 +277,7 @@ fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) {
     );
     stake.start_ledger = current;
     stake.credit_rate = read_credit_rate(env);
+    stake.multiplier = multiplier;
 }
 
 fn checkpoint_position(env: &Env, position: &mut Position) {
@@ -313,6 +315,9 @@ impl FarmingPool {
         }
         if credit_rate <= 0 || credit_rate > MAX_CREDIT_RATE {
             return Err(PoolError::InvalidCreditRate);
+        }
+        if min_stake_amount <= 0 || min_stake_amount > MAX_STAKE_AMOUNT {
+            return Err(PoolError::InvalidMinStakeAmount);
         }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -473,6 +478,13 @@ impl FarmingPool {
         let total_credits = position.total_credits;
         position.amount -= amount;
 
+        // Checks-Effects-Interactions: persist state before token transfer (#70).
+        if position.amount == 0 {
+            remove_position(&env, &user);
+        } else {
+            set_position(&env, &user, &position);
+        }
+
         // token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
@@ -480,12 +492,6 @@ impl FarmingPool {
             &user,
             &amount,
         );
-
-        if position.amount == 0 {
-            remove_position(&env, &user);
-        } else {
-            set_position(&env, &user, &position);
-        }
 
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("unlocked")),
@@ -692,6 +698,7 @@ impl FarmingPool {
                 start_ledger: current,
                 credits_banked: 0,
                 credit_rate: read_credit_rate(&env),
+                multiplier: read_global_multiplier(&env),
             }
         };
 
@@ -912,7 +919,7 @@ impl FarmingPool {
         };
 
         let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
-        let multiplier = read_global_multiplier(&env);
+        let multiplier = stake.multiplier;
         let elapsed = env.ledger().sequence().saturating_sub(stake.start_ledger);
         Ok(stake.credits_banked
             + compute_credits(
@@ -928,6 +935,10 @@ impl FarmingPool {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
         bump_instance(&env);
+
+        if amount <= 0 || amount > MAX_STAKE_AMOUNT {
+            return Err(PoolError::InvalidMinStakeAmount);
+        }
 
         env.storage()
             .instance()
