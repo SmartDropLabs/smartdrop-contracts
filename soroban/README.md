@@ -15,3 +15,12 @@ On-chain logic for SmartDrop targets **[Soroban](https://soroban.stellar.org/)**
 - Deploy to **Futurenet** or **Testnet**, then set `NEXT_PUBLIC_FACTORY_CONTRACT_ID` and `NEXT_PUBLIC_SOROBAN_RPC_URL` in the Next.js app
 
 Contract sources are not checked in yet; add a `contracts/` Rust crate here when you scaffold with `stellar contract init` and wire the front end to `invoke` / simulation responses.
+
+## Standalone vesting-wallet deployment
+
+The `vesting-wallet` contract is deployed independently from the factory. Its
+`initialize` entry point cannot identify the account that deployed the wallet,
+so the first valid initializer permanently controls the resulting schedule.
+Deployment tooling must batch deployment and initialization in one atomic
+Stellar transaction. Do not expose an uninitialized wallet between those
+operations or submit them as separate transactions.

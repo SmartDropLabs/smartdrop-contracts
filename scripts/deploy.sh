@@ -9,8 +9,8 @@ NETWORK="${NETWORK:-testnet}"
 SOURCE="${SOURCE:-default}"
 ADMIN="${ADMIN:-}"
 
-POOL_WASM="${ROOT_DIR}/soroban/target/wasm32-unknown-unknown/release/farming_pool.wasm"
-FACTORY_WASM="${ROOT_DIR}/soroban/target/wasm32-unknown-unknown/release/factory.wasm"
+POOL_WASM="${ROOT_DIR}/soroban/target/wasm32v1-none/release/farming_pool.wasm"
+FACTORY_WASM="${ROOT_DIR}/soroban/target/wasm32v1-none/release/factory.wasm"
 
 die() {
   echo "error: $*" >&2

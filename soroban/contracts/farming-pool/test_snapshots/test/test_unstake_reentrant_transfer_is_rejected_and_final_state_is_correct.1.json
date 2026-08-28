@@ -135,7 +135,7 @@
                         ]
                       },
                       "val": {
-                        "i128": "0"
+                        "i128": "1"
                       }
                     },
                     {
@@ -160,6 +160,18 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalStaked"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "-500"
                       }
                     }
                   ]

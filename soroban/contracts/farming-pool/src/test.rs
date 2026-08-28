@@ -163,6 +163,48 @@ fn test_stake_uninitialized_returns_not_initialized() {
 }
 
 #[test]
+fn test_stake_emits_event() {
+    let t = setup(2, 1);
+    let amount = 1_000i128;
+
+    t.client.stake(&t.user, &amount);
+
+    assert_eq!(
+        t.env.events().all().filter_by_contract(&t.contract_id),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("staked").into_val(&t.env)
+                ],
+                (t.user.clone(), amount).into_val(&t.env),
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_total_staked_tracks_locked_and_flexible_positions() {
+    let t = setup(2, 1);
+
+    assert_eq!(t.client.total_staked(), 0);
+    t.client.stake(&t.user, &1_000);
+    assert_eq!(t.client.total_staked(), 1_000);
+
+    t.client.lock_assets(&t.user, &500);
+    assert_eq!(t.client.total_staked(), 1_500);
+
+    t.client.unstake(&t.user);
+    assert_eq!(t.client.total_staked(), 500);
+
+    t.client.unlock_assets(&t.user, &500);
+    assert_eq!(t.client.total_staked(), 0);
+}
+
+#[test]
 fn test_pause_uninitialized_returns_not_initialized() {
     let (_env, client, _user) = setup_uninitialized();
     match client.try_pause() {
@@ -190,7 +232,13 @@ fn test_upgrade_preserves_stake_storage_and_enables_new_wasm() {
     t.client.stake(&t.user, &1_000);
     advance_ledgers(&t.env, 10);
 
-    let before = t.client.get_stake(&t.user).expect("stake must exist");
+    let before = t.env.as_contract(&t.contract_id, || {
+        t.env
+            .storage()
+            .persistent()
+            .get::<DataKey, UserStake>(&DataKey::UserStake(t.user.clone()))
+    });
+    let before = before.expect("stake storage must exist before upgrade");
     let new_wasm_hash = upload_upgrade_target_wasm(&t.env);
 
     t.client.upgrade(&new_wasm_hash);
@@ -455,6 +503,19 @@ fn test_set_credit_rate_updates_public_getters() {
 }
 
 #[test]
+fn test_min_lock_period_seconds() {
+    // 12 ledgers * ~5s/ledger = 60 seconds (#166).
+    let t = setup_with_lock_period(2, 1, 12);
+    assert_eq!(t.client.min_lock_period_seconds(), 60);
+    assert_eq!(t.client.get_min_lock_period_seconds(), 60);
+
+    // 30 ledgers -> 150 seconds; also confirms it tracks set_min_lock_period.
+    t.client.set_min_lock_period(&25u32);
+    assert_eq!(t.client.min_lock_period_seconds(), 125);
+    assert_eq!(t.client.get_min_lock_period_seconds(), 125);
+}
+
+#[test]
 fn test_set_credit_rate_rejects_zero_with_typed_error() {
     let t = setup(2, 1);
     let result = t.client.try_set_credit_rate(&0i128);
@@ -561,8 +622,23 @@ fn test_admin_multiplier_change_applies_from_next_checkpoint() {
     // effective_stake = 1500 → 15000 banked.
     t.client.set_boost(&t.user, &50u32);
     t.client.set_global_multiplier(&3u32);
+    // User checkpoints to adopt the new global multiplier
+    t.client.set_boost(&t.user, &50u32);
     advance_ledgers(&t.env, 10);
-    // Next 10 ledgers: effective_stake = 2000 (50% @ 3×) → 20000
+    // Next 10 ledgers: effective_stake = 2000 (50% @ 3×) → 20000 -> total 35,000
+    assert_eq!(t.client.get_credits(&t.user), 35_000);
+}
+
+#[test]
+fn test_admin_multiplier_change_applies_to_existing_stake_without_manual_checkpoint() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &50u32);
+    advance_ledgers(&t.env, 10);
+
+    t.client.set_global_multiplier(&3u32);
+    advance_ledgers(&t.env, 10);
+
     assert_eq!(t.client.get_credits(&t.user), 35_000);
 }
 
@@ -848,6 +924,24 @@ fn test_unstake_rejects_when_no_stake() {
 }
 
 #[test]
+fn test_flash_stake_unstake_in_same_ledger_yields_no_credits() {
+    // Regression for #169: stake has no lock period, so a user CAN immediately
+    // unstake — but an immediate round-trip in the same ledger must earn no
+    // credits, i.e. flash-staking provides no reward and no leverage.
+    let t = setup(2, 1);
+    let initial_balance = t.token.balance(&t.user);
+    t.client.set_boost(&t.user, &100u32);
+
+    t.client.stake(&t.user, &1_000);
+    let credits = t.client.unstake(&t.user);
+
+    assert_eq!(credits, 0, "flash staking must not mint credits");
+    assert_eq!(t.token.balance(&t.user), initial_balance, "principal fully returned");
+    assert!(t.client.get_stake(&t.user).is_none());
+    assert_eq!(t.client.get_credits(&t.user), 0);
+}
+
+#[test]
 fn test_additional_stake_checkpoints_credits() {
     // Stake 1000, earn 10 ledgers (= 10000 credits), then stake 500 more.
     // After checkpoint: banked = 10000, amount = 1500.
@@ -873,6 +967,121 @@ fn test_get_credits_zero_without_stake() {
 fn test_admin_getter_returns_current_admin() {
     let t = setup(2, 1);
     assert_eq!(t.client.admin(), t.admin);
+}
+
+#[test]
+fn test_propose_admin_does_not_change_admin_until_accepted() {
+    let (env, contract_id, client, old_admin, _user) = setup_without_mocked_auth();
+    let new_admin = Address::generate(&env);
+
+    client
+        .mock_auths(&[MockAuth {
+            address: &old_admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "propose_admin",
+                args: (&new_admin,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .propose_admin(&new_admin);
+    assert_eq!(client.admin(), old_admin);
+
+    client
+        .mock_auths(&[MockAuth {
+            address: &new_admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .accept_admin();
+    assert_eq!(client.admin(), new_admin);
+}
+
+#[test]
+fn test_accept_admin_requires_proposed_address_auth() {
+    let (env, contract_id, client, old_admin, user) = setup_without_mocked_auth();
+    let new_admin = Address::generate(&env);
+    client
+        .mock_auths(&[MockAuth {
+            address: &old_admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "propose_admin",
+                args: (&new_admin,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .propose_admin(&new_admin);
+
+    let current_admin_result = client
+        .mock_auths(&[MockAuth {
+            address: &old_admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_accept_admin();
+    assert!(current_admin_result.is_err(), "current admin may not accept");
+
+    let third_party_result = client
+        .mock_auths(&[MockAuth {
+            address: &user,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_accept_admin();
+    assert!(third_party_result.is_err(), "third parties may not accept");
+    assert_eq!(client.admin(), old_admin);
+}
+
+#[test]
+fn test_propose_admin_can_be_overwritten_or_cancelled_before_acceptance() {
+    let t = setup(2, 1);
+    let first_proposal = Address::generate(&t.env);
+    let second_proposal = Address::generate(&t.env);
+
+    t.client.propose_admin(&first_proposal);
+    t.client.propose_admin(&second_proposal);
+    t.client.accept_admin();
+    assert_eq!(t.client.admin(), second_proposal);
+
+    t.client.propose_admin(&second_proposal);
+    let result = t.client.try_accept_admin();
+    assert!(matches!(result, Err(Ok(PoolError::NoPendingAdmin))));
+    assert_eq!(t.client.admin(), second_proposal);
+}
+
+#[test]
+fn test_propose_admin_emits_event() {
+    let t = setup(2, 1);
+    let new_admin = Address::generate(&t.env);
+    t.client.propose_admin(&new_admin);
+    assert_eq!(
+        t.env.events().all(),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("adm_prop").into_val(&t.env)
+                ],
+                (t.admin.clone(), new_admin).into_val(&t.env),
+            )
+        ]
+    );
 }
 
 #[test]
@@ -1300,6 +1509,41 @@ fn test_unlock_allowed_well_past_min_lock_period() {
     assert!(t.client.get_user_position(&t.user).is_none());
 }
 
+#[test]
+fn test_lock_assets_topup_after_maturity_extends_unlock_ledger() {
+    let t = setup_with_lock_period(1, 1, 100);
+    t.client.lock_assets(&t.user, &100);
+    advance_ledgers(&t.env, 100);
+
+    t.client.lock_assets(&t.user, &500);
+    let position = t.client.get_user_position(&t.user).unwrap();
+    assert_eq!(position.unlock_ledger, 200);
+    assert!(t.client.try_unlock_assets(&t.user, &600).is_err());
+
+    advance_ledgers(&t.env, 99);
+    assert!(t.client.try_unlock_assets(&t.user, &600).is_err());
+    advance_ledgers(&t.env, 1);
+    t.client.unlock_assets(&t.user, &600);
+    assert!(t.client.get_user_position(&t.user).is_none());
+}
+
+#[test]
+fn test_lock_assets_topup_does_not_shorten_existing_unlock_ledger() {
+    let t = setup_with_lock_period(1, 1, 1_000);
+    t.client.lock_assets(&t.user, &1_000);
+    let original_position = t.client.get_user_position(&t.user).unwrap();
+
+    advance_ledgers(&t.env, 10);
+    t.client.set_min_lock_period(&5u32);
+    t.client.lock_assets(&t.user, &100);
+
+    let topped_up_position = t.client.get_user_position(&t.user).unwrap();
+    assert_eq!(
+        topped_up_position.unlock_ledger,
+        original_position.unlock_ledger
+    );
+}
+
 // ── calculate_credits tests ───────────────────────────────────────────────────
 
 #[test]
@@ -1390,6 +1634,29 @@ fn test_get_user_position_returns_correct_fields() {
 }
 
 #[test]
+fn test_get_user_position_returns_accrued_credits() {
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &1_000);
+    advance_ledgers(&t.env, 5);
+
+    let pos = t.client.get_user_position(&t.user).unwrap();
+    assert_eq!(pos.total_credits, 5_000);
+    assert_eq!(pos.amount, 1_000);
+}
+
+#[test]
+fn test_get_stake_returns_accrued_credits() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &50u32);
+    advance_ledgers(&t.env, 5);
+
+    let stake = t.client.get_stake(&t.user).unwrap();
+    assert_eq!(stake.credits_banked, 7_500);
+    assert_eq!(stake.amount, 1_000);
+}
+
+#[test]
 fn test_get_user_position_none_after_full_unlock() {
     let t = setup(1, 1);
     t.client.lock_assets(&t.user, &1_000);
@@ -1462,6 +1729,27 @@ fn test_unpause_emits_event() {
         !t.env.events().all().events().is_empty(),
         "unpause event not emitted"
     );
+}
+
+#[test]
+fn test_pause_staking_blocks_new_stakes_but_allows_withdrawals() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.pause_staking();
+
+    assert!(t.client.try_stake(&t.user, &100i128).is_err());
+    assert!(t.client.try_lock_assets(&t.user, &100i128).is_err());
+    t.client.unstake(&t.user);
+}
+
+#[test]
+fn test_pause_withdrawals_blocks_unstake_but_allows_new_stakes() {
+    let t = setup(2, 1);
+    t.client.pause_withdrawals();
+    t.client.stake(&t.user, &1_000);
+
+    assert!(t.client.try_unstake(&t.user).is_err());
+    assert!(t.client.try_unlock_assets(&t.user, &100i128).is_err());
 }
 
 #[test]
@@ -1592,8 +1880,13 @@ fn test_emergency_withdraw_while_paused() {
         t.client.get_stake(&t.user).is_none(),
         "stake should be cleared"
     );
-    // 5_000 (lock credits) + 3_000 (stake credits) preserved.
+    // 5_000 (lock credits) + 3_000 (stake credits) preserved as a combined total.
     assert_eq!(t.client.get_banked_credits(&t.user), 8_000);
+    // Individual histories must not be merged into a single figure (#145): the
+    // lock/unlock position and boost stake credits remain separately retrievable.
+    let split = t.client.get_banked_credits_split(&t.user);
+    assert_eq!(split.position_credits, 5_000);
+    assert_eq!(split.stake_credits, 3_000);
 }
 
 #[test]
@@ -1602,6 +1895,26 @@ fn test_emergency_withdraw_while_unpaused_returns_not_paused() {
     t.client.lock_assets(&t.user, &1_000);
     let result = t.client.try_emergency_withdraw(&t.user);
     assert!(matches!(result, Err(Ok(PoolError::NotPaused))));
+}
+
+#[test]
+fn test_emergency_withdraw_requires_user_auth() {
+    let (env, contract_id, client, _admin, user) = setup_without_mocked_auth();
+
+    // Attacker cannot withdraw user's funds without user's auth
+    let attacker = Address::generate(&env);
+    let unauth_result = client
+        .mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "emergency_withdraw",
+                args: (&user,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_emergency_withdraw(&user);
+    assert!(unauth_result.is_err(), "third party cannot trigger emergency withdraw without user auth");
 }
 
 // ── Whitelist system tests ───────────────────────────────────────────────────
@@ -1720,6 +2033,70 @@ fn test_batch_add_to_whitelist_exceeds_limit() {
         users.push_back(Address::generate(&t.env));
     }
     t.client.batch_add_to_whitelist(&users);
+}
+
+#[test]
+fn test_batch_remove_from_whitelist() {
+    let t = setup(2, 1);
+    t.client.enable_whitelist();
+
+    let user1 = Address::generate(&t.env);
+    let user2 = Address::generate(&t.env);
+    let user3 = Address::generate(&t.env);
+
+    let mut users = soroban_sdk::Vec::new(&t.env);
+    users.push_back(user1.clone());
+    users.push_back(user2.clone());
+    users.push_back(user3.clone());
+
+    t.client.batch_add_to_whitelist(&users);
+    assert!(t.client.is_whitelisted(&user1));
+    assert!(t.client.is_whitelisted(&user2));
+    assert!(t.client.is_whitelisted(&user3));
+
+    // Batch remove exactly mirrors the batch add (#167): all three gone at once.
+    t.client.batch_remove_from_whitelist(&users);
+    assert!(!t.client.is_whitelisted(&user1));
+    assert!(!t.client.is_whitelisted(&user2));
+    assert!(!t.client.is_whitelisted(&user3));
+
+    // Removed users can no longer stake.
+    let result_stake = t.client.try_stake(&user1, &100);
+    assert!(matches!(result_stake, Err(Ok(PoolError::NotWhitelisted))));
+}
+
+#[test]
+#[should_panic(expected = "max 50 addresses per call")]
+fn test_batch_remove_from_whitelist_exceeds_limit() {
+    let t = setup(2, 1);
+    let mut users = soroban_sdk::Vec::new(&t.env);
+    for _ in 0..51 {
+        users.push_back(Address::generate(&t.env));
+    }
+    t.client.batch_remove_from_whitelist(&users);
+}
+
+#[test]
+fn test_batch_remove_from_whitelist_requires_admin_auth() {
+    let (env, contract_id, client, _admin, user) = setup_without_mocked_auth();
+
+    let users = soroban_sdk::vec![&env, user.clone()];
+    let result = client
+        .mock_auths(&[MockAuth {
+            address: &user,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "batch_remove_from_whitelist",
+                args: (users.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_batch_remove_from_whitelist(&users);
+
+    assert!(
+        result.is_err(),
+        "non-admin batch_remove_from_whitelist must be rejected"
+    );
 }
 
 #[test]
@@ -1893,6 +2270,7 @@ fn seed_user_stake(env: &Env, contract_id: &Address, user: &Address, amount: i12
                 start_ledger: current,
                 credits_banked: 0,
                 credit_rate: read_credit_rate(env),
+                multiplier: read_global_multiplier(env),
             },
         );
     });

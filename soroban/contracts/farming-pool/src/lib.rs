@@ -7,7 +7,7 @@ mod types;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, BytesN, Env, Vec};
 pub use types::PoolError;
-use types::{BoostConfig, DataKey, Position, UserStake};
+use types::{BankedCreditTotals, BoostConfig, DataKey, Position, UserStake};
 
 // Expose compiled WASM bytes so sibling crates (e.g. `factory`) can upload the
 // real farming-pool contract in their integration tests via:
@@ -106,8 +106,15 @@ fn require_initialized(env: &Env) -> Result<(), PoolError> {
     Ok(())
 }
 
-fn require_not_paused(env: &Env) -> Result<(), PoolError> {
-    if pool_is_paused(env) {
+fn require_staking_not_paused(env: &Env) -> Result<(), PoolError> {
+    if pool_is_paused(env) || pool_is_staking_paused(env) {
+        return Err(PoolError::Paused);
+    }
+    Ok(())
+}
+
+fn require_withdrawals_not_paused(env: &Env) -> Result<(), PoolError> {
+    if pool_is_paused(env) || pool_is_withdrawals_paused(env) {
         return Err(PoolError::Paused);
     }
     Ok(())
@@ -155,6 +162,27 @@ fn pool_is_paused(env: &Env) -> bool {
         .unwrap_or(false)
 }
 
+fn pool_is_staking_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::PausedStaking)
+        .unwrap_or(false)
+}
+
+fn pool_is_withdrawals_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::PausedWithdrawals)
+        .unwrap_or(false)
+}
+
+fn read_global_multiplier_change_ledger(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::GlobalMultiplierChangeLedger)
+        .unwrap_or(0)
+}
+
 fn read_schema_version(env: &Env) -> u32 {
     env.storage()
         .instance()
@@ -192,9 +220,33 @@ fn remove_user_stake(env: &Env, user: &Address) {
         .remove(&DataKey::UserStake(user.clone()));
 }
 
-fn set_banked_credits(env: &Env, user: &Address, credits: i128) {
+fn add_total_staked(env: &Env, amount: i128) {
+    let total = env
+        .storage()
+        .instance()
+        .get::<DataKey, i128>(&DataKey::TotalStaked)
+        .unwrap_or(0);
+    env.storage().instance().set(
+        &DataKey::TotalStaked,
+        &total.checked_add(amount).expect("total stake overflow"),
+    );
+}
+
+fn subtract_total_staked(env: &Env, amount: i128) {
+    let total = env
+        .storage()
+        .instance()
+        .get::<DataKey, i128>(&DataKey::TotalStaked)
+        .unwrap_or(0);
+    env.storage().instance().set(
+        &DataKey::TotalStaked,
+        &total.checked_sub(amount).expect("total stake underflow"),
+    );
+}
+
+fn set_banked_credits(env: &Env, user: &Address, totals: BankedCreditTotals) {
     let key = DataKey::BankedCredits(user.clone());
-    env.storage().persistent().set(&key, &credits);
+    env.storage().persistent().set(&key, &totals);
     bump_user(env, &key);
 }
 
@@ -263,21 +315,51 @@ fn compute_credits(
     compute_total_stake(amount, allocation_pct, multiplier) * credit_rate * ledgers_elapsed as i128
 }
 
-fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) {
+fn compute_stake_accrual(
+    env: &Env,
+    user: &Address,
+    stake: &UserStake,
+    current: u32,
+) -> i128 {
     let allocation_pct = get_user_boost(env, user).unwrap_or(0);
-    let multiplier = read_global_multiplier(env);
-    let current = env.ledger().sequence();
-    let elapsed = current.saturating_sub(stake.start_ledger);
-    stake.credits_banked += compute_credits(
+    let current_multiplier = read_global_multiplier(env);
+    let change_ledger = read_global_multiplier_change_ledger(env);
+    let elapsed_since_start = current.saturating_sub(stake.start_ledger);
+
+    if stake.multiplier == current_multiplier || change_ledger <= stake.start_ledger {
+        return compute_credits(
+            stake.amount,
+            allocation_pct,
+            stake.multiplier,
+            stake.credit_rate,
+            elapsed_since_start,
+        );
+    }
+
+    let pre_change_elapsed = change_ledger.saturating_sub(stake.start_ledger).min(elapsed_since_start);
+    let post_change_elapsed = current.saturating_sub(change_ledger).min(elapsed_since_start.saturating_sub(pre_change_elapsed));
+
+    compute_credits(
         stake.amount,
         allocation_pct,
-        multiplier,
+        stake.multiplier,
         stake.credit_rate,
-        elapsed,
-    );
+        pre_change_elapsed,
+    ) + compute_credits(
+        stake.amount,
+        allocation_pct,
+        current_multiplier,
+        stake.credit_rate,
+        post_change_elapsed,
+    )
+}
+
+fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) {
+    let current = env.ledger().sequence();
+    stake.credits_banked += compute_stake_accrual(env, user, stake, current);
     stake.start_ledger = current;
     stake.credit_rate = read_credit_rate(env);
-    stake.multiplier = multiplier;
+    stake.multiplier = read_global_multiplier(env);
 }
 
 fn checkpoint_position(env: &Env, position: &mut Position) {
@@ -316,7 +398,12 @@ impl FarmingPool {
         if credit_rate <= 0 || credit_rate > MAX_CREDIT_RATE {
             return Err(PoolError::InvalidCreditRate);
         }
-        if min_stake_amount <= 0 || min_stake_amount > MAX_STAKE_AMOUNT {
+        let min_stake = if min_stake_amount <= 0 {
+            1i128
+        } else {
+            min_stake_amount
+        };
+        if min_stake > MAX_STAKE_AMOUNT {
             return Err(PoolError::InvalidMinStakeAmount);
         }
 
@@ -335,7 +422,8 @@ impl FarmingPool {
             .set(&DataKey::MinLockPeriod, &min_lock_period);
         env.storage()
             .instance()
-            .set(&DataKey::MinStakeAmount, &min_stake_amount);
+            .set(&DataKey::MinStakeAmount, &min_stake);
+        env.storage().instance().set(&DataKey::TotalStaked, &0i128);
         env.storage()
             .instance()
             .set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
@@ -348,16 +436,65 @@ impl FarmingPool {
         get_admin(&env)
     }
 
-    /// Admin: transfer admin rights to `new_admin`. Current admin must authorise.
+    /// Propose an admin handoff. The proposed admin must separately call
+    /// `accept_admin` and authorise the call before the handoff completes.
     ///
-    /// Supports key rotation and governance handoffs without redeploying the pool.
+    /// Proposing the current admin cancels any pending handoff. A new proposal
+    /// also overwrites an existing pending handoff.
+    /// Emits `("pool", "adm_prop")` with `(current_admin, proposed_admin)`.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), PoolError> {
+        let current = get_admin(&env)?;
+        current.require_auth();
+        bump_instance(&env);
+
+        if new_admin == current {
+            env.storage().instance().remove(&DataKey::PendingAdmin);
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKey::PendingAdmin, &new_admin);
+        }
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("adm_prop")),
+            (current, new_admin),
+        );
+        Ok(())
+    }
+
+    /// Accept the pending admin handoff. Only the proposed admin can authorise.
+    pub fn accept_admin(env: Env) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(PoolError::NoPendingAdmin)?;
+        pending.require_auth();
+        let current = get_admin(&env)?;
+        bump_instance(&env);
+
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("adm_xfr")),
+            (current, pending),
+        );
+        Ok(())
+    }
+
+    /// Admin: transfer admin rights to `new_admin` in one step.
+    ///
+    /// Deprecated: use `propose_admin` followed by `accept_admin` so the new
+    /// admin must prove control of its address before the handoff completes.
     /// Emits a `("pool", "adm_xfr")` event with `(old_admin, new_admin)`.
+    #[deprecated(note = "use propose_admin followed by accept_admin")]
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), PoolError> {
         let current = get_admin(&env)?;
         current.require_auth();
         bump_instance(&env);
 
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("adm_xfr")),
             (current, new_admin),
@@ -396,10 +533,13 @@ impl FarmingPool {
         Ok(())
     }
 
+    /// Lock assets for the minimum lock period. A top-up checkpoints the
+    /// existing position and extends its whole-position unlock ledger to the
+    /// later of the existing unlock ledger and a fresh period from this call.
     pub fn lock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
-        require_not_paused(&env)?;
+        require_staking_not_paused(&env)?;
 
         assert!(amount > 0, "amount must be positive");
 
@@ -417,6 +557,8 @@ impl FarmingPool {
         let mut position = if let Some(mut existing) = get_position(&env, &user) {
             checkpoint_position(&env, &mut existing);
             existing.amount += amount;
+            let fresh_unlock = current.saturating_add(read_min_lock_period(&env));
+            existing.unlock_ledger = existing.unlock_ledger.max(fresh_unlock);
             existing
         } else {
             Position {
@@ -429,7 +571,6 @@ impl FarmingPool {
             }
         };
 
-        // token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         position.credit_rate = read_credit_rate(&env);
 
         // Checks-effects-interactions: persist state *before* the external
@@ -442,6 +583,7 @@ impl FarmingPool {
         // rolled back with it — Soroban's per-invocation atomicity, not
         // manual sequencing, is what keeps this safe on failure. See #69.
         set_position(&env, &user, &position);
+        add_total_staked(&env, amount);
 
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
@@ -460,7 +602,7 @@ impl FarmingPool {
     pub fn unlock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
-        require_not_paused(&env)?;
+        require_withdrawals_not_paused(&env)?;
 
         assert!(amount > 0, "amount must be positive");
         bump_instance(&env);
@@ -480,12 +622,21 @@ impl FarmingPool {
 
         // Checks-Effects-Interactions: persist state before token transfer (#70).
         if position.amount == 0 {
+            let banked = Self::get_banked_credits_split(env.clone(), user.clone())?;
+            set_banked_credits(
+                &env,
+                &user,
+                BankedCreditTotals {
+                    position_credits: banked.position_credits + total_credits,
+                    stake_credits: banked.stake_credits,
+                },
+            );
             remove_position(&env, &user);
         } else {
             set_position(&env, &user, &position);
         }
+        subtract_total_staked(&env, amount);
 
-        // token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &env.current_contract_address(),
@@ -517,7 +668,15 @@ impl FarmingPool {
     pub fn get_user_position(env: Env, user: Address) -> Result<Option<Position>, PoolError> {
         require_initialized(&env)?;
         bump_instance(&env);
-        Ok(get_position(&env, &user))
+        let Some(mut position) = get_position(&env, &user) else {
+            return Ok(None);
+        };
+        let current = env.ledger().sequence();
+        let elapsed = current.saturating_sub(position.checkpoint_ledger);
+        position.total_credits += position.amount * position.credit_rate * elapsed as i128;
+        position.checkpoint_ledger = current;
+        position.credit_rate = read_credit_rate(&env);
+        Ok(Some(position))
     }
 
     pub fn pause(env: Env) -> Result<(), PoolError> {
@@ -525,8 +684,30 @@ impl FarmingPool {
         get_admin(&env)?.require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Paused, &true);
+        env.storage().instance().set(&DataKey::PausedStaking, &true);
+        env.storage().instance().set(&DataKey::PausedWithdrawals, &true);
         env.events()
             .publish((symbol_short!("pool"), symbol_short!("paused")), ());
+        Ok(())
+    }
+
+    pub fn pause_staking(env: Env) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        bump_instance(&env);
+        env.storage().instance().set(&DataKey::PausedStaking, &true);
+        env.events()
+            .publish((symbol_short!("pool"), symbol_short!("stg_pause")), ());
+        Ok(())
+    }
+
+    pub fn pause_withdrawals(env: Env) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        bump_instance(&env);
+        env.storage().instance().set(&DataKey::PausedWithdrawals, &true);
+        env.events()
+            .publish((symbol_short!("pool"), symbol_short!("wd_pause")), ());
         Ok(())
     }
 
@@ -535,8 +716,30 @@ impl FarmingPool {
         get_admin(&env)?.require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().set(&DataKey::PausedStaking, &false);
+        env.storage().instance().set(&DataKey::PausedWithdrawals, &false);
         env.events()
             .publish((symbol_short!("pool"), symbol_short!("unpaused")), ());
+        Ok(())
+    }
+
+    pub fn unpause_staking(env: Env) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        bump_instance(&env);
+        env.storage().instance().set(&DataKey::PausedStaking, &false);
+        env.events()
+            .publish((symbol_short!("pool"), symbol_short!("stg_unps")), ());
+        Ok(())
+    }
+
+    pub fn unpause_withdrawals(env: Env) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        bump_instance(&env);
+        env.storage().instance().set(&DataKey::PausedWithdrawals, &false);
+        env.events()
+            .publish((symbol_short!("pool"), symbol_short!("wd_unps")), ());
         Ok(())
     }
 
@@ -546,31 +749,39 @@ impl FarmingPool {
         Ok(pool_is_paused(&env))
     }
 
+    /// Withdraw staked/locked tokens during emergency when pool is paused.
+    ///
+    /// Allows users to self-withdraw their assets during a pause without requiring
+    /// admin intervention. Requires authorization from `user`. Checkpoints and preserves
+    /// accrued credit totals in `BankedCredits`.
     pub fn emergency_withdraw(env: Env, user: Address) -> Result<i128, PoolError> {
+        user.require_auth();
         require_initialized(&env)?;
         let admin = get_admin(&env)?;
-        admin.require_auth();
         if !pool_is_paused(&env) {
             return Err(PoolError::NotPaused);
         }
         bump_instance(&env);
 
         let mut total_returned = 0i128;
-        let mut banked_credits = 0i128;
+        let mut position_credits = 0i128;
+        let mut stake_credits = 0i128;
         let stake_token = get_stake_token(&env)?;
         let token = token::TokenClient::new(&env, &stake_token);
 
         if let Some(position) = get_position(&env, &user) {
             token.transfer(&env.current_contract_address(), &user, &position.amount);
             total_returned += position.amount;
-            banked_credits += position.total_credits;
+            subtract_total_staked(&env, position.amount);
+            position_credits = position.total_credits;
             remove_position(&env, &user);
         }
 
         if let Some(stake) = get_user_stake(&env, &user) {
             token.transfer(&env.current_contract_address(), &user, &stake.amount);
             total_returned += stake.amount;
-            banked_credits += stake.credits_banked;
+            subtract_total_staked(&env, stake.amount);
+            stake_credits = stake.credits_banked;
             remove_user_stake(&env, &user);
         }
 
@@ -578,8 +789,17 @@ impl FarmingPool {
             return Err(PoolError::NoActiveStake);
         }
 
-        if banked_credits > 0 {
-            set_banked_credits(&env, &user, banked_credits);
+        // Bank the position and stake credits as separate totals so each staking
+        // system's accrual history survives even when a user held both (#145).
+        if position_credits > 0 || stake_credits > 0 {
+            set_banked_credits(
+                &env,
+                &user,
+                BankedCreditTotals {
+                    position_credits,
+                    stake_credits,
+                },
+            );
         }
 
         env.events().publish(
@@ -591,12 +811,28 @@ impl FarmingPool {
 
     pub fn get_banked_credits(env: Env, user: Address) -> i128 {
         bump_instance(&env);
-        let key = DataKey::BankedCredits(user);
-        let value: Option<i128> = env.storage().persistent().get(&key);
+        let totals = Self::get_banked_credits_split(env, user).unwrap_or(BankedCreditTotals {
+            position_credits: 0,
+            stake_credits: 0,
+        });
+        totals.position_credits + totals.stake_credits
+    }
+
+    /// Return the banked credits for `user`, split by staking system. The
+    /// lock/unlock `position` and boost `stake` histories are kept separate so
+    /// that a user who held both does not lose which credits came from where
+    /// (#145). Returns zeros when `user` has no banked credits.
+    pub fn get_banked_credits_split(env: Env, user: Address) -> Result<BankedCreditTotals, PoolError> {
+        bump_instance(&env);
+        let key = DataKey::BankedCredits(user.clone());
+        let value: Option<BankedCreditTotals> = env.storage().persistent().get(&key);
         if value.is_some() {
             bump_user(&env, &key);
         }
-        value.unwrap_or(0)
+        Ok(value.unwrap_or(BankedCreditTotals {
+            position_credits: 0,
+            stake_credits: 0,
+        }))
     }
 
     // ── Whitelist system ──────────────────────────────────────────────────────
@@ -667,14 +903,52 @@ impl FarmingPool {
         Ok(())
     }
 
+    /// Admin: batch remove multiple `users` from the whitelist. Capped at 50 addresses per call. Admin must authorise.
+    ///
+    /// Mirrors `batch_add_to_whitelist` so admins who need to revoke many
+    /// users do not have to issue one `remove_from_whitelist` call per user,
+    /// which is gas-inefficient. See #167.
+    pub fn batch_remove_from_whitelist(env: Env, users: Vec<Address>) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        assert!(users.len() <= 50, "max 50 addresses per call");
+        bump_instance(&env);
+
+        for user in users.iter() {
+            let key = DataKey::Whitelisted(user.clone());
+            env.storage().persistent().remove(&key);
+        }
+        Ok(())
+    }
+
     // ── Boost / Stake system ─────────────────────────────────────────────────
 
     /// Stake `amount` tokens. If a prior stake exists, earned credits are checkpointed first.
+    ///
+    /// # No minimum lock period — deliberately
+    /// Unlike `lock_assets`, this flexible stake system has **no** enforced lock
+    /// period and `unstake` can be called immediately. This is an intentional
+    /// design property of the boost/stake system (see `docs/staking_systems.md`),
+    /// not an oversight: it is a separate continuous-staking model built for
+    /// flexible deposits where a lock would defeat its purpose.
+    ///
+    /// The "flash-staking" concern raised in #169 (stake and immediately
+    /// unstake) exposes no privilege, because:
+    /// - A stake is **not** a loan of leverage: the pool never owes more than
+    ///   the exact staked amount, and `unstake` returns only `stake.amount`.
+    /// - Credits accrue linearly over *elapsed ledgers* (see `compute_stake_accrual`),
+    ///   so an immediate round-trip banks ~0 credits; there is no fixed
+    ///   up-front reward to harvest.
+    /// - On stake, the position is checkpointed to the current ledger and
+    ///   credit rate; on unstake it is checkpointed again, so any intermediate
+    ///   ledger gap is the only thing ever rewarded.
+    ///
+    /// Pools that require a commitment lock should use the lock/unlock
+    /// `Position` system (`lock_assets`/`unlock_assets`) instead.
     pub fn stake(env: Env, from: Address, amount: i128) -> Result<(), PoolError> {
         from.require_auth();
-        require_not_paused(&env)?;
-
         require_initialized(&env)?;
+        require_staking_not_paused(&env)?;
         assert!(amount > 0, "amount must be positive");
 
         if whitelist_enabled(&env) && !is_user_whitelisted(&env, &from) {
@@ -702,10 +976,14 @@ impl FarmingPool {
             }
         };
 
-        // Pull tokens from caller into the contract.
-        // token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
         new_stake.credit_rate = read_credit_rate(&env);
 
+        // Checks-effects-interactions: persist state *before* the external
+        // token transfer below, consistent with `lock_assets`. See #69.
+        set_user_stake(&env, &from, &new_stake);
+        add_total_staked(&env, amount);
+
+        // Pull tokens from caller into the contract.
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &from,
@@ -713,7 +991,11 @@ impl FarmingPool {
             &amount,
         );
 
-        set_user_stake(&env, &from, &new_stake);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("staked")),
+            (from, amount),
+        );
+
         Ok(())
     }
 
@@ -763,10 +1045,16 @@ impl FarmingPool {
     ///   panic (`expect("no active stake")`); now a typed error.
     /// * `PoolError::InvalidAmount` - `amount` was <= 0 or exceeded the stake.
     pub fn unstake(env: Env, from: Address, amount: i128) -> Result<i128, PoolError> {
+    /// Withdraw the caller's entire flexible stake and bank the accrued credits.
+    ///
+    /// There is no minimum lock period (see `stake`); the caller may withdraw at
+    /// any time. Because credits accrue only over elapsed ledgers (#169), an
+    /// immediate stake→unstake round-trip earns no credits, so the lack of a
+    /// lock does not create a flash-staking reward.
+    pub fn unstake(env: Env, from: Address) -> Result<i128, PoolError> {
         from.require_auth();
-        require_not_paused(&env)?;
-
         require_initialized(&env)?;
+        require_withdrawals_not_paused(&env)?;
         bump_instance(&env);
 
         let mut stake = get_user_stake(&env, &from).ok_or(PoolError::NoActiveStake)?;
@@ -780,6 +1068,7 @@ impl FarmingPool {
 
         // Return the withdrawn tokens to caller.
         // token::TokenClient::new(&env, &get_stake_token(&env)).transfer(
+        // Return staked tokens to caller.
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &env.current_contract_address(),
@@ -792,14 +1081,20 @@ impl FarmingPool {
         } else {
             set_user_stake(&env, &from, &stake);
         }
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("unstaked")),
+            (from.clone(), stake.amount, total_credits),
+        );
+
+        remove_user_stake(&env, &from);
+        subtract_total_staked(&env, stake.amount);
         Ok(total_credits)
     }
 
     pub fn set_boost(env: Env, user: Address, allocation_pct: u32) -> Result<(), PoolError> {
-        user.require_auth();
-        require_not_paused(&env)?;
-
         require_initialized(&env)?;
+        require_staking_not_paused(&env)?;
+        get_admin(&env)?.require_auth();
         assert!(
             (1..=100).contains(&allocation_pct),
             "allocation_pct must be 1-100"
@@ -847,6 +1142,9 @@ impl FarmingPool {
         env.storage()
             .instance()
             .set(&DataKey::GlobalMultiplier, &multiplier);
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalMultiplierChangeLedger, &env.ledger().sequence());
         env.events().publish(
             (symbol_short!("boost"), symbol_short!("mult_set")),
             multiplier,
@@ -911,24 +1209,45 @@ impl FarmingPool {
         Self::min_lock_period(env)
     }
 
+    /// Return the minimum lock period in seconds (assuming ~5s/ledger).
+    ///
+    /// The raw ledger count in `min_lock_period` is an implementation detail
+    /// that frontends and users cannot meaningfully display. This helper
+    /// converts it to a human-readable duration so UIs can show days/hours
+    /// directly. See #166.
+    pub fn min_lock_period_seconds(env: Env) -> Result<u64, PoolError> {
+        let ledgers = Self::min_lock_period(env)?;
+        Ok((ledgers as u64) * 5)
+    }
+
+    pub fn get_min_lock_period_seconds(env: Env) -> Result<u64, PoolError> {
+        Self::min_lock_period_seconds(env)
+    }
+
     pub fn get_credits(env: Env, user: Address) -> Result<i128, PoolError> {
         require_initialized(&env)?;
         bump_instance(&env);
-        let Some(stake) = get_user_stake(&env, &user) else {
-            return Ok(0);
-        };
+        let banked = Self::get_banked_credits_split(env.clone(), user.clone())?;
 
-        let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
-        let multiplier = stake.multiplier;
-        let elapsed = env.ledger().sequence().saturating_sub(stake.start_ledger);
-        Ok(stake.credits_banked
-            + compute_credits(
-                stake.amount,
-                allocation_pct,
-                multiplier,
-                stake.credit_rate,
-                elapsed,
-            ))
+        let position_credits = get_position(&env, &user)
+            .map(|position| {
+                let elapsed = env
+                    .ledger()
+                    .sequence()
+                    .saturating_sub(position.checkpoint_ledger);
+                position.total_credits
+                    + position.amount * position.credit_rate * elapsed as i128
+            })
+            .unwrap_or(0);
+
+        let stake_credits = get_user_stake(&env, &user)
+            .map(|stake| {
+                stake.credits_banked
+                    + compute_stake_accrual(&env, &user, &stake, env.ledger().sequence())
+            })
+            .unwrap_or(0);
+
+        Ok(banked.position_credits + banked.stake_credits + position_credits + stake_credits)
     }
 
     pub fn set_min_stake_amount(env: Env, amount: i128) -> Result<(), PoolError> {
@@ -940,9 +1259,14 @@ impl FarmingPool {
             return Err(PoolError::InvalidMinStakeAmount);
         }
 
+        let old_amount = Self::get_min_stake_amount(env.clone())?;
         env.storage()
             .instance()
             .set(&DataKey::MinStakeAmount, &amount);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("minst_set")),
+            (old_amount, amount),
+        );
 
         Ok(())
     }
@@ -962,7 +1286,25 @@ impl FarmingPool {
     pub fn get_stake(env: Env, user: Address) -> Result<Option<UserStake>, PoolError> {
         require_initialized(&env)?;
         bump_instance(&env);
-        Ok(get_user_stake(&env, &user))
+        let Some(mut stake) = get_user_stake(&env, &user) else {
+            return Ok(None);
+        };
+        let current = env.ledger().sequence();
+        stake.credits_banked += compute_stake_accrual(&env, &user, &stake, current);
+        stake.start_ledger = current;
+        stake.credit_rate = read_credit_rate(&env);
+        stake.multiplier = read_global_multiplier(&env);
+        Ok(Some(stake))
+    }
+
+    pub fn total_staked(env: Env) -> Result<i128, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0))
     }
 }
 

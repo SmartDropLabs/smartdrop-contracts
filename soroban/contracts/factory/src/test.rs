@@ -96,6 +96,8 @@ fn setup_with_pool_records(count: u32) -> TestEnv {
                 credit_rate: 100 + pool_id as i128,
                 global_multiplier: 1 + pool_id,
                 min_lock_period: 10 + pool_id,
+                daily_rate: (100 + pool_id as u128) * 17280,
+                wasm_hash: soroban_sdk::BytesN::from_array(&t.env, &[0; 32]),
             };
             t.env
                 .storage()
@@ -461,7 +463,7 @@ fn test_upgrade_pool_hot_swaps_registered_pool_without_changing_factory_hash() {
                     symbol_short!("factory").into_val(&t.env),
                     symbol_short!("pool_upg").into_val(&t.env),
                 ],
-                (pool_id, pool_addr.clone(), new_wasm_hash.clone()).into_val(&t.env),
+                (pool_id, pool_addr.clone(), t.wasm_hash.clone(), new_wasm_hash.clone()).into_val(&t.env),
             )
         ]
     );
@@ -477,6 +479,23 @@ fn test_upgrade_pool_hot_swaps_registered_pool_without_changing_factory_hash() {
     );
     let record = t.client.get_pool(&pool_id);
     assert_eq!(record.address, pool_addr);
+}
+
+#[test]
+fn test_upgrade_pool_same_hash_returns_pool_upgrade_failed() {
+    let t = setup();
+    let pool_id = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &10u64,
+        &0i128,
+    );
+
+    assert_eq!(
+        t.client.try_upgrade_pool(&pool_id, &t.wasm_hash),
+        Err(Ok(FactoryError::PoolUpgradeFailed))
+    );
 }
 
 #[test]
@@ -518,6 +537,41 @@ fn test_upgrade_pool_requires_factory_admin_auth() {
         .try_upgrade_pool(&pool_id, &new_wasm_hash);
 
     assert!(result.is_err(), "only the factory admin may upgrade pools");
+}
+
+#[contract]
+struct NonUpgradableContract;
+
+#[contractimpl]
+impl NonUpgradableContract {
+    pub fn dummy(_env: Env) -> bool {
+        true
+    }
+}
+
+#[test]
+fn test_upgrade_pool_non_upgradable_pool_returns_pool_upgrade_failed() {
+    let t = setup();
+    let non_upgradable_addr = t.env.register(NonUpgradableContract, ());
+    let fake_record = PoolRecord {
+        address: non_upgradable_addr,
+        asset: Address::generate(&t.env),
+        credit_rate: 100,
+        global_multiplier: 1,
+        min_lock_period: 10,
+        daily_rate: 100 * 17280,
+        wasm_hash: soroban_sdk::BytesN::from_array(&t.env, &[0; 32]),
+    };
+    t.env.as_contract(&t.factory_addr, || {
+        t.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Pool(99), &fake_record);
+    });
+
+    let new_wasm_hash = upload_replacement_wasm(&t.env);
+    let result = t.client.try_upgrade_pool(&99u32, &new_wasm_hash);
+    assert_eq!(result, Err(Ok(FactoryError::PoolUpgradeFailed)));
 }
 
 // ── create_pool auth gate ─────────────────────────────────────────────────────
@@ -723,7 +777,7 @@ fn test_get_pools_by_asset_bounds_scan_for_sparse_matches() {
     let page = client.get_pools_by_asset(&sparse_asset, &0u32, &20u32);
 
     assert_eq!(page.records.len(), 0);
-    assert_eq!(page.next_start_id, 200);
+    assert_eq!(page.next_start_id, 50);
     assert_eq!(page.total, 500);
 }
 
@@ -771,6 +825,45 @@ fn test_get_pools_by_asset_can_page_sparse_matches_to_completion() {
     assert_eq!(found_ids.len(), 2);
     assert_eq!(found_ids.get(0), Some(250));
     assert_eq!(found_ids.get(1), Some(499));
+}
+
+#[test]
+fn test_get_pools_by_asset_range_custom_scan_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let wasm_hash = upload_farming_pool_wasm(&env);
+    let factory_addr = env.register(Factory, ());
+    let client = FactoryClient::new(&env, &factory_addr);
+    client.initialize(&admin, &wasm_hash);
+
+    let sparse_asset = Address::generate(&env);
+    let other_asset = Address::generate(&env);
+    for i in 0..100 {
+        let asset = if i == 90 {
+            sparse_asset.clone()
+        } else {
+            other_asset.clone()
+        };
+        client.create_pool(
+            &asset,
+            &(1_728_000 + i as u128 * 17_280),
+            &2u32,
+            &(10 + i as u64),
+            &0i128,
+        );
+    }
+
+    // With a scan_limit of 50, first call should only scan 0..50
+    let page1 = client.get_pools_by_asset_range(&sparse_asset, &0u32, &50u32, &20u32);
+    assert_eq!(page1.records.len(), 0);
+    assert_eq!(page1.next_start_id, 50);
+
+    // Second call scanning 50..100 should find the match at 90
+    let page2 = client.get_pools_by_asset_range(&sparse_asset, &page1.next_start_id, &50u32, &20u32);
+    assert_eq!(page2.records.len(), 1);
+    assert_eq!(page2.records.get(0).unwrap().0, 90);
+    assert_eq!(page2.next_start_id, 100);
 }
 
 #[test]
@@ -929,14 +1022,35 @@ fn test_create_pool_rejects_zero_daily_rate() {
 }
 
 #[test]
-fn test_create_pool_rejects_daily_rate_below_ledgers_per_day() {
+fn test_create_pool_rejects_dust_minimum_stake() {
     let t = setup();
     let asset = Address::generate(&t.env);
 
     let result = t
         .client
-        .try_create_pool(&asset, &17_279u128, &2u32, &25u64, &0i128);
-    assert_eq!(result, Err(Ok(FactoryError::InvalidCreditRate)));
+        .try_create_pool(&asset, &1_728_000u128, &2u32, &25u64, &1i128);
+
+    assert_eq!(result, Err(Ok(FactoryError::InvalidMinStakeAmount)));
+    assert_eq!(t.client.pool_count(), 0);
+}
+
+#[test]
+fn test_create_pool_accepts_daily_rate_below_ledgers_per_day_with_ceiling_rounding() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+
+    // Before #148 the daily_rate -> credit_rate conversion truncated, so a
+    // sub-LEDGERS_PER_DAY daily_rate (17_279) became 0 and was rejected. Now it
+    // uses ceiling division, so it rounds up to credit_rate = 1 and the pool is
+    // created successfully.
+    let pool_id = t
+        .client
+        .create_pool(&asset, &17_279u128, &2u32, &25u64, &0i128);
+    assert_eq!(pool_id, 0);
+
+    let pool_addr = t.client.get_pool(&pool_id).address;
+    let pool = FarmingPoolClient::new(&t.env, &pool_addr);
+    assert_eq!(pool.credit_rate(), 1);
 }
 
 #[test]
@@ -1008,6 +1122,34 @@ fn test_refresh_pool_ttls_restores_ttl_for_unqueried_pool() {
 }
 
 #[test]
+fn test_refresh_pool_ttls_stays_permissionless_for_any_caller() {
+    // #168: refresh_pool_ttls remains callable by anyone — the keep-alive
+    // mechanism must not be gated behind the admin, otherwise a factory whose
+    // only lifeline relies on a single admin becomes a single point of failure.
+    let t = setup_with_pool_records(3);
+    let stranger = Address::generate(&t.env);
+    // No admin auth provided at all: assert the refresh still succeeds.
+    assert_eq!(t.client.try_refresh_pool_ttls(&0u32, &3u32), Ok(Ok(())));
+    assert_eq!(
+        pool_record_ttl(&t.env, &t.factory_addr, 1),
+        TTL_EXTEND_TO,
+        "stranger-triggered keep-alive must still extend TTLs"
+    );
+    // Sanity: the stranger address is not the admin.
+    assert_ne!(t.client.admin(), stranger);
+}
+
+#[test]
+fn test_refresh_pool_ttls_requires_initialized_factory() {
+    // #168: an uninitialized factory has no registry to keep alive, so the
+    // permissionless refresh entry point must reject the call with a typed
+    // error rather than silently bumping instance state.
+    let (_env, client) = setup_uninitialized();
+    let result = client.try_refresh_pool_ttls(&0u32, &20u32);
+    assert!(matches!(result, Err(Ok(FactoryError::NotInitialized))));
+}
+
+#[test]
 fn test_create_pool_emits_pool_crtd_event_with_payload() {
     let t = setup();
     let asset = Address::generate(&t.env);
@@ -1027,7 +1169,7 @@ fn test_create_pool_emits_pool_crtd_event_with_payload() {
                     symbol_short!("factory").into_val(&t.env),
                     symbol_short!("pool_crtd").into_val(&t.env),
                 ],
-                (id, expected_address, asset, 300i128, 2u32, 30u32).into_val(&t.env),
+                (id, expected_address, asset, 300i128, 2u32, 30u32, 5_184_000u128, t.wasm_hash.clone()).into_val(&t.env),
             )
         ]
     );

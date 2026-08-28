@@ -12,6 +12,12 @@ pub use types::{AdminTransferred, VestingError};
 const TTL_THRESHOLD: u32 = 518_400;
 const TTL_EXTEND_TO: u32 = 1_036_800;
 
+// The vesting formula multiplies total_amount by the elapsed portion of the
+// schedule. Since valid ledger values are u32 and the largest valid duration
+// is u32::MAX, this ceiling guarantees that product fits in i128 for every
+// valid schedule: i128::MAX / u32::MAX.
+const MAX_TOTAL_AMOUNT: i128 = i128::MAX / 4_294_967_295i128;
+
 // ── Storage helpers ───────────────────────────────────────────────────────────
 
 fn bump_instance(env: &Env) {
@@ -84,29 +90,33 @@ fn is_revoked(env: &Env) -> bool {
 /// proportion in between (measured from start, not from cliff). If the
 /// schedule has been revoked, returns the frozen vested amount captured at
 /// the moment of revocation.
-fn compute_vested(env: &Env) -> i128 {
+fn compute_vested(env: &Env) -> Result<i128, VestingError> {
     if is_revoked(env) {
-        return env
+        return Ok(env
             .storage()
             .instance()
             .get(&DataKey::RevokedVested)
-            .unwrap_or(0);
+            .unwrap_or(0));
     }
 
-    let current = env.ledger().sequence() as i128;
-    let cliff = get_cliff_ledger(env) as i128;
-    let start = get_start_ledger(env) as i128;
-    let end = get_end_ledger(env) as i128;
+    let current = i128::from(env.ledger().sequence());
+    let cliff = i128::from(get_cliff_ledger(env));
+    let start = i128::from(get_start_ledger(env));
+    let end = i128::from(get_end_ledger(env));
     let total = get_total_amount(env);
 
     if current < cliff {
-        return 0;
+        return Ok(0);
     }
     if current >= end {
-        return total;
+        return Ok(total);
     }
 
-    total * (current - start) / (end - start)
+    total
+        .checked_mul(current - start)
+        .ok_or(VestingError::ArithmeticOverflow)?
+        .checked_div(end - start)
+        .ok_or(VestingError::ArithmeticOverflow)
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -120,6 +130,14 @@ impl VestingWallet {
     ///
     /// The caller (`admin`) must authorise this call; `total_amount` tokens are
     /// pulled from `admin` into the contract at initialisation time.
+    ///
+    /// WARNING: This wallet is a standalone contract and does not bind this
+    /// call to the account that deployed it. An uninitialised wallet can
+    /// therefore be front-run and permanently occupied by another caller.
+    /// Operators must submit deployment and this initialization in one atomic
+    /// transaction (for example, using a deployment flow that batches the
+    /// deploy and initialize operations) and must not expose an uninitialized
+    /// wallet between transactions.
     ///
     /// - `start_ledger`: ledger at which linear vesting begins.
     /// - `cliff_ledger`: ledger before which nothing is releasable (≥ start_ledger).
@@ -142,6 +160,10 @@ impl VestingWallet {
         assert!(total_amount > 0, "total_amount must be positive");
         assert!(cliff_ledger >= start_ledger, "cliff must be >= start");
         assert!(end_ledger > cliff_ledger, "end must be > cliff");
+        let duration = i128::from(end_ledger - start_ledger);
+        if total_amount > MAX_TOTAL_AMOUNT || total_amount.checked_mul(duration).is_none() {
+            return Err(VestingError::TotalAmountTooLarge);
+        }
 
         admin.require_auth();
 
@@ -176,6 +198,11 @@ impl VestingWallet {
             &total_amount,
         );
 
+        env.events().publish(
+            (symbol_short!("vest"), symbol_short!("init")),
+            (beneficiary, token, total_amount, start_ledger, end_ledger),
+        );
+
         bump_instance(&env);
         Ok(())
     }
@@ -188,9 +215,9 @@ impl VestingWallet {
         require_initialized(&env)?;
         bump_instance(&env);
 
-        let vested = compute_vested(&env);
+        let vested = compute_vested(&env)?;
         let released = get_released(&env);
-        let releasable = vested - released;
+        let releasable = vested.saturating_sub(released);
 
         if releasable == 0 {
             return Ok(0);
@@ -234,7 +261,7 @@ impl VestingWallet {
         admin.require_auth();
         bump_instance(&env);
 
-        let vested = compute_vested(&env);
+        let vested = compute_vested(&env)?;
         let total = get_total_amount(&env);
         let unvested = total - vested;
 
@@ -265,7 +292,7 @@ impl VestingWallet {
     pub fn vested_amount(env: Env) -> Result<i128, VestingError> {
         require_initialized(&env)?;
         bump_instance(&env);
-        Ok(compute_vested(&env))
+        compute_vested(&env)
     }
 
     /// Return the cumulative amount already transferred to the beneficiary.
@@ -279,7 +306,53 @@ impl VestingWallet {
     pub fn releasable(env: Env) -> Result<i128, VestingError> {
         require_initialized(&env)?;
         bump_instance(&env);
-        Ok(compute_vested(&env) - get_released(&env))
+        Ok(compute_vested(&env)? - get_released(&env))
+    }
+
+    /// Emergency recovery that deliberately bypasses vesting arithmetic.
+    ///
+    /// Admin-only. Transfers the wallet's raw token balance to the admin and
+    /// permanently marks the schedule revoked, so later release calls cannot
+    /// depend on `compute_vested`. This is a break-glass operation that ends
+    /// beneficiary claims and should only be used when normal arithmetic or
+    /// schedule processing is unavailable.
+    pub fn emergency_withdraw(env: Env) -> Result<i128, VestingError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+
+        let token = get_token(&env);
+        let amount = token::TokenClient::new(&env, &token)
+            .balance(&env.current_contract_address());
+        env.storage().instance().set(&DataKey::Revoked, &true);
+        env.storage().instance().set(&DataKey::RevokedVested, &0i128);
+
+        if amount > 0 {
+            token::TokenClient::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &admin,
+                &amount,
+            );
+        }
+        Ok(amount)
+    }
+
+    /// Transfer beneficiary rights to `new_beneficiary`. Admin must authorise.
+    pub fn transfer_beneficiary(
+        env: Env,
+        new_beneficiary: Address,
+    ) -> Result<(), VestingError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Beneficiary, &new_beneficiary);
+
+        Ok(())
     }
 
     /// Transfer admin rights to `new_admin`. Current admin must authorise.

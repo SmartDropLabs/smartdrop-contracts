@@ -182,6 +182,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "multiplier"
+                    },
+                    "val": {
+                      "u32": 2
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "start_ledger"
                     },
                     "val": {
@@ -268,7 +276,7 @@
                         ]
                       },
                       "val": {
-                        "i128": "0"
+                        "i128": "1"
                       }
                     },
                     {
@@ -276,6 +284,30 @@
                         "vec": [
                           {
                             "symbol": "Paused"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "bool": true
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "PausedStaking"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "bool": true
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "PausedWithdrawals"
                           }
                         ]
                       },
@@ -305,6 +337,18 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalStaked"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "0"
                       }
                     }
                   ]
