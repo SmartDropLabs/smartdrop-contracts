@@ -310,6 +310,14 @@ impl Factory {
             .instance()
             .get(&DataKey::PoolCount)
             .unwrap_or(0);
+        if start_id >= count {
+            return Ok(ListPoolsResponse {
+                records: vec![&env],
+                next_start_id: count,
+                total: count,
+                has_more: false,
+            });
+        }
         let capped_limit = if limit == 0 { 20 } else { limit.min(20) };
         let end = start_id.saturating_add(capped_limit).min(count);
         let mut records: Vec<(u32, PoolRecord)> = vec![&env];
@@ -352,6 +360,14 @@ impl Factory {
             .instance()
             .get(&DataKey::PoolCount)
             .unwrap_or(0);
+        if start_id >= count {
+            return Ok(ListPoolsResponse {
+                records: vec![&env],
+                next_start_id: count,
+                total: count,
+                has_more: false,
+            });
+        }
         let capped_limit = if limit == 0 { 20 } else { limit.min(20) };
         let end = start_id.saturating_add(capped_limit).min(count);
         let mut records: Vec<(u32, PoolRecord)> = vec![&env];
@@ -410,6 +426,14 @@ impl Factory {
             .instance()
             .get(&DataKey::PoolCount)
             .unwrap_or(0);
+        if start_id >= count {
+            return Ok(ListPoolsResponse {
+                records: vec![&env],
+                next_start_id: count,
+                total: count,
+                has_more: false,
+            });
+        }
         let capped_limit = if limit == 0 { 20 } else { limit.min(20) };
         let effective_scan = if scan_limit == 0 {
             MAX_POOL_SCAN_PER_CALL
