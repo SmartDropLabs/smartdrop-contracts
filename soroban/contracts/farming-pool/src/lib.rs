@@ -1604,6 +1604,11 @@ impl FarmingPool {
         }
         bump_instance(&env);
 
+        // Capture the previous value before overwriting it so the event can
+        // carry both terms — off-chain indexers need the old multiplier for
+        // audit trails and rollback scenarios (#250).
+        let old_multiplier = read_global_multiplier(&env);
+
         env.storage()
             .instance()
             .set(&DataKey::GlobalMultiplier, &multiplier);
@@ -1613,7 +1618,7 @@ impl FarmingPool {
         );
         env.events().publish(
             (symbol_short!("boost"), symbol_short!("mult_set")),
-            multiplier,
+            (old_multiplier, multiplier),
         );
         Ok(())
     }
