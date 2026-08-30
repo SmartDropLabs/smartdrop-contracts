@@ -80,6 +80,14 @@ fn bump_admin_pools(env: &Env, admin: &Address) {
     );
 }
 
+fn bump_pool_tvl(env: &Env, pool_id: u32) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::PoolTvl(pool_id),
+        TTL_THRESHOLD,
+        TTL_EXTEND_TO,
+    );
+}
+
 fn bump_wasm_pools(env: &Env, wasm_hash: &BytesN<32>) {
     env.storage().persistent().extend_ttl(
         &DataKey::PoolsByWasmHash(wasm_hash.clone()),
@@ -128,6 +136,26 @@ fn read_upgrade_count(env: &Env) -> u32 {
 }
 
 /// Build a 32-byte salt from a pool ID so each pool gets a unique, reproducible address.
+/// Live TVL of a single deployed pool, read straight from the pool via one
+/// cross-contract call to its `total_staked` getter.
+///
+/// `FarmingPool::total_staked` already covers every token held for a user —
+/// `lock_assets` credits both `TotalStaked` and `TotalLocked`, so
+/// `total_locked` is a subset of `total_staked`, not a separate term to add.
+/// Returns `PoolQueryFailed` if the pool does not answer the getter (e.g. an
+/// older WASM predating it).
+fn query_pool_tvl(env: &Env, pool: &Address) -> Result<i128, FactoryError> {
+    let no_args: Vec<Val> = vec![env];
+    match env.try_invoke_contract::<i128, soroban_sdk::Error>(
+        pool,
+        &Symbol::new(env, "total_staked"),
+        no_args,
+    ) {
+        Ok(Ok(v)) => Ok(v),
+        _ => Err(FactoryError::PoolQueryFailed),
+    }
+}
+
 fn pool_salt(env: &Env, pool_id: u32) -> BytesN<32> {
     let mut bytes = [0u8; 32];
     bytes[28..].copy_from_slice(&pool_id.to_be_bytes());
@@ -786,6 +814,26 @@ impl Factory {
         Ok(read_pool_tvl(&env, pool_id))
     }
 
+    /// Live TVL of one pool, read straight from the deployed pool contract
+    /// via its `total_staked` getter. Unlike the `total_tvl` accumulator this
+    /// always reflects the pool's current state, at the cost of a
+    /// cross-contract call.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized,
+    /// `PoolNotFound` for an unknown `pool_id`, or `PoolQueryFailed` if the
+    /// deployed pool does not answer the TVL getters.
+    pub fn pool_tvl(env: Env, pool_id: u32) -> Result<i128, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+        query_pool_tvl(&env, &record.address)
+    }
+
     /// Update the WASM hash used for future `create_pool` deployments. Admin-only.
     ///
     /// Allows the admin to point future pool deployments at a corrected or upgraded
@@ -981,6 +1029,15 @@ impl Factory {
             .persistent()
             .set(&DataKey::Pool(pool_id), &record);
         bump_pool(&env, pool_id);
+
+        // A freshly deployed pool holds nothing, so its contribution to
+        // `total_tvl` starts at 0. Recording the baseline explicitly keeps the
+        // first `sync_pool_tvl` a pure delta against a known value (#249).
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolTvl(pool_id), &0i128);
+        bump_pool_tvl(&env, pool_id);
+
         let asset_key = DataKey::AssetPools(asset.clone());
         let mut asset_pool_ids: Vec<u32> = env
             .storage()
