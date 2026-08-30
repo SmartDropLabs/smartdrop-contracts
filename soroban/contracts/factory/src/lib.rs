@@ -5,7 +5,9 @@ mod types;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, Symbol, Val, Vec,
 };
-use types::{DataKey, FactoryError, ListPoolsResponse, PoolRecord, PoolSort};
+use types::{DataKey, ListPoolsResponse, PoolRecord, PoolSort};
+
+pub use types::FactoryError;
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
 const TTL_THRESHOLD: u32 = 518_400;
@@ -170,6 +172,17 @@ fn read_admin_transfer_count(env: &Env) -> u32 {
     env.storage()
         .instance()
         .get(&DataKey::AdminTransferCount)
+        .unwrap_or(0)
+}
+
+fn read_total_tvl(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKey::TotalTvl).unwrap_or(0)
+}
+
+fn read_pool_tvl(env: &Env, pool_id: u32) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PoolTvl(pool_id))
         .unwrap_or(0)
 }
 
@@ -736,6 +749,41 @@ impl Factory {
         require_initialized(&env)?;
         bump_instance(&env);
         Ok(read_upgrade_count(&env))
+    }
+
+    /// Aggregate value locked across every pool this factory has created, in
+    /// the pools' staking-asset base units (#249).
+    ///
+    /// This is an O(1) read of an incrementally-maintained accumulator, not a
+    /// live fan-out across pools. Each pool contributes the TVL captured by its
+    /// most recent `sync_pool_tvl` call; `create_pool` seeds a new pool at 0.
+    /// Staking activity between syncs is not reflected until `sync_pool_tvl`
+    /// (or `sync_all_pool_tvls`) runs for that pool. This is deliberate: a
+    /// factory receives no callback from a pool's stake / unstake, and a true
+    /// live sum would need an unbounded cross-contract fan-out that does not
+    /// fit Soroban's per-invocation footprint limit. Dashboards that need a
+    /// fresh figure should run `sync_all_pool_tvls` first.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn total_tvl(env: Env) -> Result<i128, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(read_total_tvl(&env))
+    }
+
+    /// The per-pool TVL term currently folded into `total_tvl` for `pool_id` —
+    /// the value captured by the last `sync_pool_tvl` for this pool, or 0 if it
+    /// has never been synced since creation.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized, or
+    /// `PoolNotFound` if `pool_id` has not been created.
+    pub fn pool_tvl_synced(env: Env, pool_id: u32) -> Result<i128, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        if !env.storage().persistent().has(&DataKey::Pool(pool_id)) {
+            return Err(FactoryError::PoolNotFound);
+        }
+        Ok(read_pool_tvl(&env, pool_id))
     }
 
     /// Update the WASM hash used for future `create_pool` deployments. Admin-only.
