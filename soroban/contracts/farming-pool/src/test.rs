@@ -1091,6 +1091,53 @@ fn test_transfer_admin_changes_admin() {
 }
 
 #[test]
+fn test_set_global_multiplier_emits_old_and_new() {
+    let t = setup(2, 1);
+
+    // Pool was initialized with global_multiplier = 2.
+    t.client.set_global_multiplier(&5);
+
+    assert_eq!(
+        t.env.events().all(),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("boost").into_val(&t.env),
+                    soroban_sdk::symbol_short!("mult_set").into_val(&t.env)
+                ],
+                (2u32, 5u32).into_val(&t.env),
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_set_global_multiplier_event_reports_previous_value() {
+    let t = setup(2, 1);
+
+    t.client.set_global_multiplier(&5);
+    t.client.set_global_multiplier(&3);
+
+    // The most recent event pairs the just-superseded value (5) with the new
+    // one (3), not the pool's original multiplier.
+    let events = t.env.events().all();
+    let (contract, topics, data) = events.last().unwrap();
+    assert_eq!(contract, t.contract_id);
+    assert_eq!(
+        topics,
+        soroban_sdk::vec![
+            &t.env,
+            soroban_sdk::symbol_short!("boost").into_val(&t.env),
+            soroban_sdk::symbol_short!("mult_set").into_val(&t.env)
+        ]
+    );
+    assert_eq!(data, (5u32, 3u32).into_val(&t.env));
+}
+
+#[test]
 fn test_transfer_admin_emits_event() {
     let t = setup(2, 1);
     let new_admin = Address::generate(&t.env);
