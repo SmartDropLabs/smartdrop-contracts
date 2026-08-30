@@ -426,6 +426,35 @@ fn test_revoked_uninitialized_returns_not_initialized() {
 }
 
 #[test]
+fn test_beneficiary_getter_returns_configured_address() {
+    let t = setup(50, 200, 1_000);
+    assert_eq!(t.client.beneficiary(), t.beneficiary);
+}
+
+#[test]
+fn test_beneficiary_getter_tracks_transfer_beneficiary() {
+    let t = setup(50, 200, 1_000);
+    let new_beneficiary = Address::generate(&t.env);
+
+    t.client.transfer_beneficiary(&new_beneficiary);
+
+    assert_eq!(t.client.beneficiary(), new_beneficiary);
+}
+
+#[test]
+fn test_beneficiary_uninitialized_returns_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    assert!(matches!(
+        client.try_beneficiary(),
+        Err(Ok(VestingError::NotInitialized))
+    ));
+}
+
+#[test]
 fn test_revoke_sends_unvested_to_admin() {
     // No cliff, period = 200, total = 1000. Revoke at ledger 100 (50% vested).
     let t = setup_revocable(0, 200, 1_000);
