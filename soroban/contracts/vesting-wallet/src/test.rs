@@ -151,6 +151,12 @@ fn test_double_initialize_returns_error() {
 }
 
 #[test]
+fn test_token_getter_returns_initialized_token_address() {
+    let t = setup(0, 100, 1_000);
+    assert_eq!(t.client.token(), t.token_address);
+}
+
+#[test]
 #[should_panic(expected = "start must be in the future")]
 fn test_initialize_rejects_start_ledger_in_the_past() {
     let env = Env::default();

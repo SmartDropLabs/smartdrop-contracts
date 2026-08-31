@@ -432,16 +432,11 @@ impl VestingWallet {
         Ok(())
     }
 
-    /// Return the beneficiary address of the vesting schedule.
-    ///
-    /// `get_beneficiary` has always existed as an internal helper; this exposes
-    /// it as a first-class read so frontends can display the recipient without
-    /// probing a failing call or unpacking `get_vesting_schedule`. Returns
-    /// `NotInitialized` if the wallet has not been initialized (#247).
-    pub fn beneficiary(env: Env) -> Result<Address, VestingError> {
+    /// Return the token address for the vesting schedule.
+    pub fn token(env: Env) -> Result<Address, VestingError> {
         require_initialized(&env)?;
         bump_instance(&env);
-        Ok(get_beneficiary(&env))
+        Ok(get_token(&env))
     }
 
     /// Return the current admin address.

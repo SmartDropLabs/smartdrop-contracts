@@ -263,6 +263,44 @@ fn test_total_distributed_credits_accumulates_across_users_and_systems() {
 }
 
 #[test]
+fn test_total_credits_earned_tracks_lifetime_credits_across_withdrawals() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+
+    advance_ledgers(&t.env, 10);
+    assert_eq!(t.client.get_credits(&t.user), 10_000);
+    assert_eq!(t.client.total_credits_earned(&t.user), 0);
+
+    t.client.unstake(&t.user);
+    assert_eq!(t.client.total_credits_earned(&t.user), 10_000);
+
+    advance_ledgers(&t.env, 5);
+    t.client.stake(&t.user, &500);
+    advance_ledgers(&t.env, 5);
+    t.client.unstake(&t.user);
+    assert_eq!(t.client.total_credits_earned(&t.user), 12_500);
+}
+
+#[test]
+fn test_total_banked_credits_tracks_current_bank_across_users() {
+    let t = setup(2, 1);
+    let other = Address::generate(&t.env);
+    t.token_sac.mint(&other, &1_000_000_000i128);
+
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+    assert_eq!(t.client.total_banked_credits(), 0);
+
+    t.client.unstake(&t.user);
+    assert_eq!(t.client.total_banked_credits(), 0);
+
+    t.client.stake(&other, &2_000);
+    advance_ledgers(&t.env, 5);
+    t.client.unstake(&other);
+    assert_eq!(t.client.total_banked_credits(), 0);
+}
+
+#[test]
 fn test_pause_uninitialized_returns_not_initialized() {
     let (_env, client, _user) = setup_uninitialized();
     match client.try_pause() {

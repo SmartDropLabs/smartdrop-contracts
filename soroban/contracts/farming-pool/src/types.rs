@@ -131,6 +131,10 @@ pub enum DataKey {
     TotalBoostAlloc,
     /// Count of users with a non-zero boost allocation currently set.
     BoostUserCount,
+    /// Aggregate of credits currently banked across all users.
+    TotalBankedCredits,
+    /// Cumulative credits earned by a user across their entire lifetime.
+    TotalCreditsEarned(Address),
 }
 
 /// Paginated response for `get_whitelisted_users`.

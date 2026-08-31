@@ -401,6 +401,17 @@ fn test_list_pools_returns_empty_when_start_is_beyond_count() {
 }
 
 #[test]
+fn test_list_pools_returns_empty_when_start_equals_count() {
+    let t = setup_with_pool_records(3);
+    let page = t.client.list_pools(&3u32, &5u32);
+
+    assert_eq!(page.records.len(), 0);
+    assert_eq!(page.next_start_id, 3);
+    assert_eq!(page.total, 3);
+    assert!(!page.has_more);
+}
+
+#[test]
 fn test_list_pools_caps_limit_at_twenty() {
     let t = setup_with_pool_records(25);
     let page = t.client.list_pools(&0u32, &100u32);

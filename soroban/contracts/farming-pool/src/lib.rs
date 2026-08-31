@@ -391,6 +391,44 @@ fn add_total_credits(env: &Env, amount: i128) {
     );
 }
 
+fn read_total_banked_credits(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::TotalBankedCredits)
+        .unwrap_or(0)
+}
+
+fn add_total_banked_credits(env: &Env, amount: i128) {
+    let total = read_total_banked_credits(env);
+    env.storage().instance().set(
+        &DataKey::TotalBankedCredits,
+        &total.checked_add(amount).expect("total banked credits overflow"),
+    );
+}
+
+fn subtract_total_banked_credits(env: &Env, amount: i128) {
+    let total = read_total_banked_credits(env);
+    env.storage().instance().set(
+        &DataKey::TotalBankedCredits,
+        &total.checked_sub(amount).expect("total banked credits underflow"),
+    );
+}
+
+fn read_total_credits_earned(env: &Env, user: &Address) -> i128 {
+    let key = DataKey::TotalCreditsEarned(user.clone());
+    env.storage().persistent().get(&key).unwrap_or(0)
+}
+
+fn add_total_credits_earned(env: &Env, user: &Address, amount: i128) {
+    let key = DataKey::TotalCreditsEarned(user.clone());
+    let total = env.storage().persistent().get::<DataKey, i128>(&key).unwrap_or(0);
+    env.storage().persistent().set(
+        &key,
+        &total.checked_add(amount).expect("user lifetime credits overflow"),
+    );
+    bump_user(env, &key);
+}
+
 fn read_total_deposits(env: &Env) -> i128 {
     env.storage()
         .instance()
@@ -633,6 +671,10 @@ fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) {
     stake.credits_banked += accrued;
     add_total_credits(env, accrued);
     add_total_distributed_credits(env, accrued);
+    if accrued > 0 {
+        add_total_banked_credits(env, accrued);
+        add_total_credits_earned(env, user, accrued);
+    }
     stake.start_ledger = current;
     stake.credit_rate = read_credit_rate(env);
     stake.multiplier = read_global_multiplier(env);
@@ -653,6 +695,10 @@ fn checkpoint_position(env: &Env, user: &Address, position: &mut Position) {
     position.total_credits += delta;
     add_total_credits(env, delta);
     add_total_distributed_credits(env, delta);
+    if delta > 0 {
+        add_total_banked_credits(env, delta);
+        add_total_credits_earned(env, user, delta);
+    }
     position.checkpoint_ledger = current;
     position.credit_rate = read_credit_rate(env);
 
@@ -721,6 +767,9 @@ impl FarmingPool {
         env.storage().instance().set(&DataKey::TotalStaked, &0i128);
         env.storage().instance().set(&DataKey::TotalLocked, &0i128);
         env.storage().instance().set(&DataKey::TotalCredits, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalBankedCredits, &0i128);
         env.storage()
             .instance()
             .set(&DataKey::TotalDeposits, &0i128);
@@ -1514,6 +1563,9 @@ impl FarmingPool {
         let mut stake = get_user_stake(&env, &from).expect("no active stake");
         checkpoint(&env, &from, &mut stake);
         let total_credits = stake.credits_banked;
+        if total_credits > 0 {
+            subtract_total_banked_credits(&env, total_credits);
+        }
 
         // Return staked tokens to caller.
         let stake_token = get_stake_token(&env)?;
@@ -1856,6 +1908,21 @@ impl FarmingPool {
             .instance()
             .get(&DataKey::TotalDistributedCredits)
             .unwrap_or(0))
+    }
+
+    /// Return the total credits currently banked across all users.
+    pub fn total_banked_credits(env: Env) -> Result<i128, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(read_total_banked_credits(&env))
+    }
+
+    /// Return the cumulative credits earned by `user` across their lifetime,
+    /// including amounts already withdrawn.
+    pub fn total_credits_earned(env: Env, user: Address) -> Result<i128, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(read_total_credits_earned(&env, &user))
     }
 
     /// Return the running total of all tokens deposited into the pool.
