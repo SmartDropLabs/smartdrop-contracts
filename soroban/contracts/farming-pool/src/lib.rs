@@ -1656,6 +1656,11 @@ impl FarmingPool {
         }
         bump_instance(&env);
 
+        // Capture the previous value before overwriting it so the event can
+        // carry both terms — off-chain indexers need the old multiplier for
+        // audit trails and rollback scenarios (#250).
+        let old_multiplier = read_global_multiplier(&env);
+
         env.storage()
             .instance()
             .set(&DataKey::GlobalMultiplier, &multiplier);
@@ -1665,7 +1670,7 @@ impl FarmingPool {
         );
         env.events().publish(
             (symbol_short!("boost"), symbol_short!("mult_set")),
-            multiplier,
+            (old_multiplier, multiplier),
         );
         Ok(())
     }
@@ -2005,6 +2010,23 @@ impl FarmingPool {
 
     pub fn get_total_locked(env: Env) -> Result<i128, PoolError> {
         Self::total_locked(env)
+    }
+
+    /// Return the number of addresses currently on the whitelist (#248).
+    ///
+    /// Admins use this for capacity planning without paging the full list via
+    /// `get_whitelisted_users`. The value is derived from the canonical
+    /// `WhitelistedUsers` list that every add / remove / batch path already
+    /// maintains (and dedupes), rather than a parallel counter that could
+    /// silently drift out of step with that list.
+    pub fn whitelist_count(env: Env) -> Result<u32, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(get_whitelisted_users_list(&env).len())
+    }
+
+    pub fn get_whitelist_count(env: Env) -> Result<u32, PoolError> {
+        Self::whitelist_count(env)
     }
 }
 

@@ -64,7 +64,7 @@ use soroban_sdk::{
     Address, Env,
 };
 
-use factory::{Factory, FactoryClient};
+use factory::{Factory, FactoryClient, FactoryError};
 use farming_pool::{FarmingPoolClient, PoolError};
 
 /// Real, compiled farming-pool WASM — see the module doc comment above for
@@ -373,4 +373,166 @@ fn end_to_end_create_pool_then_lock_and_unlock() {
     assert_eq!(token.balance(&user), INITIAL_MINT);
     assert_eq!(token.balance(&pool_address), 0);
     assert!(pool_client.get_user_position(&user).is_none());
+}
+
+/// Builds an initialised factory (real farming-pool WASM) with one pool and
+/// returns the factory client, the pool's live client, the pool id, and the
+/// pool address.
+fn factory_with_pool(
+    env: &Env,
+    admin: &Address,
+    asset: &Address,
+    daily_rate: u128,
+) -> (FactoryClient<'static>, FarmingPoolClient<'static>, u32, Address) {
+    let wasm_hash = env.deployer().upload_contract_wasm(FARMING_POOL_WASM);
+    let factory_addr = env.register(Factory, ());
+    let factory_client = FactoryClient::new(env, &factory_addr);
+    factory_client.initialize(admin, &wasm_hash);
+    let pool_id = factory_client.create_pool(asset, &daily_rate, &1u32, &1u64, &0i128);
+    let pool_address = factory_client.get_pool(&pool_id).address;
+    let pool_client = FarmingPoolClient::new(env, &pool_address);
+    let factory_client = unsafe {
+        core::mem::transmute::<FactoryClient<'_>, FactoryClient<'static>>(factory_client)
+    };
+    let pool_client = unsafe {
+        core::mem::transmute::<FarmingPoolClient<'_>, FarmingPoolClient<'static>>(pool_client)
+    };
+    (factory_client, pool_client, pool_id, pool_address)
+}
+
+/// #249: a brand-new factory reports zero aggregate TVL, and a freshly created
+/// pool is seeded at zero — so `total_tvl` stays zero until something is staked
+/// *and* the pool is synced.
+#[test]
+fn total_tvl_starts_at_zero_for_new_factory_and_pool() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin);
+
+    let (factory_client, _pool_client, pool_id, _pool_address) =
+        factory_with_pool(&env, &admin, &asset.address(), 17_280u128);
+
+    assert_eq!(factory_client.total_tvl(), 0);
+    assert_eq!(factory_client.pool_tvl_synced(&pool_id), 0);
+    assert_eq!(factory_client.pool_tvl(&pool_id), 0);
+}
+
+/// #249: `total_tvl` tracks staked + locked balances once the pool is synced,
+/// and follows the balance back down after a withdrawal + re-sync.
+#[test]
+fn total_tvl_tracks_stake_and_lock_after_sync() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin);
+    let token_sac = StellarAssetClient::new(&env, &asset.address());
+    const MINT: i128 = 1_000_000_000;
+    token_sac.mint(&user, &MINT);
+
+    let (factory_client, pool_client, pool_id, _pool_address) =
+        factory_with_pool(&env, &admin, &asset.address(), 17_280u128);
+
+    let stake_amount: i128 = 5_000_000;
+    let lock_amount: i128 = 3_000_000;
+    pool_client.stake(&user, &stake_amount);
+    pool_client.lock_assets(&user, &lock_amount);
+
+    // Live read sees the deposits immediately; the accumulator does not.
+    assert_eq!(factory_client.pool_tvl(&pool_id), stake_amount + lock_amount);
+    assert_eq!(factory_client.total_tvl(), 0);
+
+    let synced = factory_client.sync_pool_tvl(&pool_id);
+    assert_eq!(synced, stake_amount + lock_amount);
+    assert_eq!(factory_client.total_tvl(), stake_amount + lock_amount);
+    assert_eq!(
+        factory_client.pool_tvl_synced(&pool_id),
+        stake_amount + lock_amount
+    );
+
+    // A no-op re-sync leaves the aggregate unchanged.
+    factory_client.sync_pool_tvl(&pool_id);
+    assert_eq!(factory_client.total_tvl(), stake_amount + lock_amount);
+
+    // Withdraw the flexible stake, then re-sync: aggregate drops to the locked
+    // portion only.
+    pool_client.unstake(&user);
+    assert_eq!(factory_client.total_tvl(), stake_amount + lock_amount);
+    factory_client.sync_pool_tvl(&pool_id);
+    assert_eq!(factory_client.total_tvl(), lock_amount);
+    assert_eq!(factory_client.pool_tvl_synced(&pool_id), lock_amount);
+}
+
+/// #249: `sync_all_pool_tvls` folds every pool into the aggregate in one pass
+/// and returns a cursor past the end of the registry.
+#[test]
+fn sync_all_pool_tvls_aggregates_every_pool() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin);
+    let token_sac = StellarAssetClient::new(&env, &asset.address());
+    const MINT: i128 = 1_000_000_000;
+    token_sac.mint(&user, &MINT);
+
+    let wasm_hash = env.deployer().upload_contract_wasm(FARMING_POOL_WASM);
+    let factory_addr = env.register(Factory, ());
+    let factory_client = FactoryClient::new(&env, &factory_addr);
+    factory_client.initialize(&admin, &wasm_hash);
+
+    let pool0 = factory_client.create_pool(&asset.address(), &17_280u128, &1u32, &1u64, &0i128);
+    let pool1 = factory_client.create_pool(&asset.address(), &17_280u128, &1u32, &1u64, &0i128);
+
+    let addr0 = factory_client.get_pool(&pool0).address;
+    let addr1 = factory_client.get_pool(&pool1).address;
+    let client0 = FarmingPoolClient::new(&env, &addr0);
+    let client1 = FarmingPoolClient::new(&env, &addr1);
+
+    let amount0: i128 = 2_000_000;
+    let amount1: i128 = 7_000_000;
+    client0.stake(&user, &amount0);
+    client1.stake(&user, &amount1);
+
+    let cursor = factory_client.sync_all_pool_tvls(&0, &50);
+    assert_eq!(cursor, 2);
+    assert_eq!(factory_client.total_tvl(), amount0 + amount1);
+    assert_eq!(factory_client.pool_tvl_synced(&pool0), amount0);
+    assert_eq!(factory_client.pool_tvl_synced(&pool1), amount1);
+}
+
+/// #249: the TVL views reject an unknown pool id with a typed error.
+#[test]
+fn tvl_views_reject_unknown_pool() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin);
+
+    let (factory_client, _pool_client, _pool_id, _pool_address) =
+        factory_with_pool(&env, &admin, &asset.address(), 17_280u128);
+
+    assert_eq!(
+        factory_client.try_pool_tvl(&99),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
+    assert_eq!(
+        factory_client.try_pool_tvl_synced(&99),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
+    assert_eq!(
+        factory_client.try_sync_pool_tvl(&99),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
 }

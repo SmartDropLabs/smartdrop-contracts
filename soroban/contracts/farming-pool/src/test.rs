@@ -1129,6 +1129,53 @@ fn test_transfer_admin_changes_admin() {
 }
 
 #[test]
+fn test_set_global_multiplier_emits_old_and_new() {
+    let t = setup(2, 1);
+
+    // Pool was initialized with global_multiplier = 2.
+    t.client.set_global_multiplier(&5);
+
+    assert_eq!(
+        t.env.events().all(),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("boost").into_val(&t.env),
+                    soroban_sdk::symbol_short!("mult_set").into_val(&t.env)
+                ],
+                (2u32, 5u32).into_val(&t.env),
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_set_global_multiplier_event_reports_previous_value() {
+    let t = setup(2, 1);
+
+    t.client.set_global_multiplier(&5);
+    t.client.set_global_multiplier(&3);
+
+    // The most recent event pairs the just-superseded value (5) with the new
+    // one (3), not the pool's original multiplier.
+    let events = t.env.events().all();
+    let (contract, topics, data) = events.last().unwrap();
+    assert_eq!(contract, t.contract_id);
+    assert_eq!(
+        topics,
+        soroban_sdk::vec![
+            &t.env,
+            soroban_sdk::symbol_short!("boost").into_val(&t.env),
+            soroban_sdk::symbol_short!("mult_set").into_val(&t.env)
+        ]
+    );
+    assert_eq!(data, (5u32, 3u32).into_val(&t.env));
+}
+
+#[test]
 fn test_transfer_admin_emits_event() {
     let t = setup(2, 1);
     let new_admin = Address::generate(&t.env);
@@ -2113,6 +2160,60 @@ fn test_disable_whitelist_restores_open_access() {
     // Stake succeeds now
     t.client.stake(&t.user, &1_000);
     assert_eq!(t.client.get_stake(&t.user).unwrap().amount, 1_000);
+}
+
+#[test]
+fn test_whitelist_count_reflects_adds_and_removes() {
+    let t = setup(2, 1);
+    assert_eq!(t.client.whitelist_count(), 0);
+    assert_eq!(t.client.get_whitelist_count(), 0);
+
+    let user1 = Address::generate(&t.env);
+    let user2 = Address::generate(&t.env);
+
+    t.client.add_to_whitelist(&user1);
+    assert_eq!(t.client.whitelist_count(), 1);
+
+    t.client.add_to_whitelist(&user2);
+    assert_eq!(t.client.whitelist_count(), 2);
+
+    // Re-adding an existing entry must not double-count.
+    t.client.add_to_whitelist(&user1);
+    assert_eq!(t.client.whitelist_count(), 2);
+
+    t.client.remove_from_whitelist(&user1);
+    assert_eq!(t.client.whitelist_count(), 1);
+
+    // Removing a non-member is a no-op for the count.
+    t.client.remove_from_whitelist(&Address::generate(&t.env));
+    assert_eq!(t.client.whitelist_count(), 1);
+
+    t.client.remove_from_whitelist(&user2);
+    assert_eq!(t.client.whitelist_count(), 0);
+}
+
+#[test]
+fn test_whitelist_count_matches_get_whitelisted_users_total() {
+    let t = setup(2, 1);
+
+    let mut users = soroban_sdk::Vec::new(&t.env);
+    for _ in 0..5 {
+        users.push_back(Address::generate(&t.env));
+    }
+    t.client.batch_add_to_whitelist(&users);
+
+    let listed = t.client.get_whitelisted_users(&0u32, &100u32);
+    assert_eq!(t.client.whitelist_count(), listed.total);
+    assert_eq!(t.client.whitelist_count(), 5);
+}
+
+#[test]
+fn test_whitelist_count_uninitialized_returns_not_initialized() {
+    let (_env, client, _admin) = setup_uninitialized();
+    assert!(matches!(
+        client.try_whitelist_count(),
+        Err(Ok(PoolError::NotInitialized))
+    ));
 }
 
 #[test]
