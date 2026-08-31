@@ -432,6 +432,13 @@ impl VestingWallet {
         Ok(())
     }
 
+    /// Return the token address for the vesting schedule.
+    pub fn token(env: Env) -> Result<Address, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(get_token(&env))
+    }
+
     /// Return the current admin address.
     pub fn admin(env: Env) -> Result<Address, VestingError> {
         require_initialized(&env)?;
