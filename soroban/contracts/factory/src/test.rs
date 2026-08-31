@@ -1187,6 +1187,38 @@ fn test_create_pool_rejects_min_lock_period_out_of_u32_range() {
     assert_eq!(result, Err(Ok(FactoryError::MinLockPeriodOutOfRange)));
 }
 
+// ── #132: factory-side upper ceiling on min_lock_period ───────────────────────
+
+#[test]
+fn test_create_pool_rejects_min_lock_period_above_ceiling() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+
+    // MAX_MIN_LOCK_PERIOD + 1, still fits in u32 (12_614_401 << u32::MAX), so
+    // the u32-range check passes and only the new ceiling check fires.
+    let above_ceiling = (MAX_MIN_LOCK_PERIOD + 1) as u64;
+    let result = t
+        .client
+        .try_create_pool(&asset, &1_728_000u128, &2u32, &above_ceiling, &0i128);
+    assert_eq!(result, Err(Ok(FactoryError::MinLockPeriodAboveCeiling)));
+}
+
+#[test]
+fn test_create_pool_accepts_min_lock_period_exactly_at_ceiling() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+
+    let pool_id = t.client.create_pool(
+        &asset,
+        &1_728_000u128,
+        &2u32,
+        &(MAX_MIN_LOCK_PERIOD as u64),
+        &0i128,
+    );
+    let record = t.client.get_pool(&pool_id);
+    assert_eq!(record.min_lock_period, MAX_MIN_LOCK_PERIOD);
+}
+
 #[test]
 fn test_get_pool_bumps_pool_record_ttl() {
     let t = setup();

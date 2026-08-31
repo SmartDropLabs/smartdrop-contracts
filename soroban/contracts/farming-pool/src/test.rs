@@ -864,6 +864,71 @@ fn test_initialize_rejects_credit_rate_above_ceiling() {
     assert!(matches!(result, Err(Ok(PoolError::InvalidCreditRate))));
 }
 
+// ── #132: upper ceiling on min_lock_period ────────────────────────────────────
+
+#[test]
+fn test_set_min_lock_period_rejects_above_ceiling() {
+    let t = setup(1, 1);
+    let result = t.client.try_set_min_lock_period(&(MAX_MIN_LOCK_PERIOD + 1));
+    assert!(matches!(
+        result,
+        Err(Ok(PoolError::MinLockPeriodAboveCeiling))
+    ));
+}
+
+#[test]
+fn test_set_min_lock_period_accepts_exactly_the_ceiling() {
+    let t = setup(1, 1);
+    t.client.set_min_lock_period(&MAX_MIN_LOCK_PERIOD);
+    assert_eq!(t.client.min_lock_period(), MAX_MIN_LOCK_PERIOD);
+}
+
+#[test]
+fn test_initialize_rejects_min_lock_period_above_ceiling() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin);
+    let contract_id = env.register(FarmingPool, ());
+    let client = FarmingPoolClient::new(&env, &contract_id);
+
+    let result = client.try_initialize(
+        &admin,
+        &asset.address(),
+        &1u32,
+        &1i128,
+        &(MAX_MIN_LOCK_PERIOD + 1),
+        &1i128,
+    );
+    assert!(matches!(
+        result,
+        Err(Ok(PoolError::MinLockPeriodAboveCeiling))
+    ));
+}
+
+#[test]
+fn test_initialize_accepts_min_lock_period_exactly_at_ceiling() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin);
+    let contract_id = env.register(FarmingPool, ());
+    let client = FarmingPoolClient::new(&env, &contract_id);
+
+    client
+        .initialize(
+            &admin,
+            &asset.address(),
+            &1u32,
+            &1i128,
+            &MAX_MIN_LOCK_PERIOD,
+            &1i128,
+        );
+    assert_eq!(client.min_lock_period(), MAX_MIN_LOCK_PERIOD);
+}
+
 /// Ties the #89 fix to its own derivation: at both ceilings simultaneously
 /// (`MAX_GLOBAL_MULTIPLIER`, `MAX_CREDIT_RATE`), full boost allocation (100%,
 /// `compute_total_stake`'s worst case), the derivation's `amount_max`, and

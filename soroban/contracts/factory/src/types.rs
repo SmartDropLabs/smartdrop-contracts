@@ -142,4 +142,6 @@ pub enum FactoryError {
     /// deployed pool did not answer the `total_staked` getter (e.g. a pool
     /// deployed from an older WASM that predates it).
     PoolQueryFailed = 17,
+    /// `create_pool`'s `min_lock_period` exceeded `MAX_MIN_LOCK_PERIOD`. See #132.
+    MinLockPeriodAboveCeiling = 18,
 }

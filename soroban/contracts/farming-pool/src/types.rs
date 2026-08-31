@@ -22,6 +22,8 @@ pub enum PoolError {
     NoPendingAdmin = 11,
     /// Returned by `batch_add_to_whitelist` or `batch_remove_from_whitelist` when batch exceeds 50 users.
     BatchTooLarge = 12,
+    /// `min_lock_period` exceeded `MAX_MIN_LOCK_PERIOD`. See #132.
+    MinLockPeriodAboveCeiling = 13,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.
