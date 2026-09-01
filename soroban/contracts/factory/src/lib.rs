@@ -5,7 +5,9 @@ mod types;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, Symbol, Val, Vec,
 };
-use types::{DataKey, FactoryError, ListPoolsResponse, PoolRecord, PoolSort};
+use types::{DataKey, ListPoolsResponse, PoolRecord, PoolSort};
+
+pub use types::FactoryError;
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
 const TTL_THRESHOLD: u32 = 518_400;
@@ -78,6 +80,14 @@ fn bump_admin_pools(env: &Env, admin: &Address) {
     );
 }
 
+fn bump_pool_tvl(env: &Env, pool_id: u32) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::PoolTvl(pool_id),
+        TTL_THRESHOLD,
+        TTL_EXTEND_TO,
+    );
+}
+
 fn bump_wasm_pools(env: &Env, wasm_hash: &BytesN<32>) {
     env.storage().persistent().extend_ttl(
         &DataKey::PoolsByWasmHash(wasm_hash.clone()),
@@ -126,6 +136,52 @@ fn read_upgrade_count(env: &Env) -> u32 {
 }
 
 /// Build a 32-byte salt from a pool ID so each pool gets a unique, reproducible address.
+/// Live TVL of a single deployed pool, read straight from the pool via one
+/// cross-contract call to its `total_staked` getter.
+///
+/// `FarmingPool::total_staked` already covers every token held for a user —
+/// `lock_assets` credits both `TotalStaked` and `TotalLocked`, so
+/// `total_locked` is a subset of `total_staked`, not a separate term to add.
+/// Returns `PoolQueryFailed` if the pool does not answer the getter (e.g. an
+/// older WASM predating it).
+fn query_pool_tvl(env: &Env, pool: &Address) -> Result<i128, FactoryError> {
+    let no_args: Vec<Val> = vec![env];
+    match env.try_invoke_contract::<i128, soroban_sdk::Error>(
+        pool,
+        &Symbol::new(env, "total_staked"),
+        no_args,
+    ) {
+        Ok(Ok(v)) => Ok(v),
+        _ => Err(FactoryError::PoolQueryFailed),
+    }
+}
+
+/// Re-read one pool's live TVL and fold the change into the `total_tvl`
+/// accumulator: `total_tvl += live - previous_snapshot`, then store `live` as
+/// the new snapshot. Emits `tvl_sync = (pool_id, old_snapshot, live)` when the
+/// value moved. Returns the pool's live TVL.
+fn apply_tvl_sync(env: &Env, pool_id: u32, pool: &Address) -> Result<i128, FactoryError> {
+    let live = query_pool_tvl(env, pool)?;
+    let previous = read_pool_tvl(env, pool_id);
+    if live != previous {
+        let aggregate = read_total_tvl(env)
+            .saturating_add(live)
+            .saturating_sub(previous);
+        env.storage().instance().set(&DataKey::TotalTvl, &aggregate);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolTvl(pool_id), &live);
+        bump_pool_tvl(env, pool_id);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("tvl_sync")),
+            (pool_id, previous, live),
+        );
+    }
+    Ok(live)
+}
+
 fn pool_salt(env: &Env, pool_id: u32) -> BytesN<32> {
     let mut bytes = [0u8; 32];
     bytes[28..].copy_from_slice(&pool_id.to_be_bytes());
@@ -170,6 +226,17 @@ fn read_admin_transfer_count(env: &Env) -> u32 {
     env.storage()
         .instance()
         .get(&DataKey::AdminTransferCount)
+        .unwrap_or(0)
+}
+
+fn read_total_tvl(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKey::TotalTvl).unwrap_or(0)
+}
+
+fn read_pool_tvl(env: &Env, pool_id: u32) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PoolTvl(pool_id))
         .unwrap_or(0)
 }
 
@@ -763,6 +830,121 @@ impl Factory {
         Ok(read_upgrade_count(&env))
     }
 
+    /// Aggregate value locked across every pool this factory has created, in
+    /// the pools' staking-asset base units (#249).
+    ///
+    /// This is an O(1) read of an incrementally-maintained accumulator, not a
+    /// live fan-out across pools. Each pool contributes the TVL captured by its
+    /// most recent `sync_pool_tvl` call; `create_pool` seeds a new pool at 0.
+    /// Staking activity between syncs is not reflected until `sync_pool_tvl`
+    /// (or `sync_all_pool_tvls`) runs for that pool. This is deliberate: a
+    /// factory receives no callback from a pool's stake / unstake, and a true
+    /// live sum would need an unbounded cross-contract fan-out that does not
+    /// fit Soroban's per-invocation footprint limit. Dashboards that need a
+    /// fresh figure should run `sync_all_pool_tvls` first.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn total_tvl(env: Env) -> Result<i128, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(read_total_tvl(&env))
+    }
+
+    /// The per-pool TVL term currently folded into `total_tvl` for `pool_id` —
+    /// the value captured by the last `sync_pool_tvl` for this pool, or 0 if it
+    /// has never been synced since creation.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized, or
+    /// `PoolNotFound` if `pool_id` has not been created.
+    pub fn pool_tvl_synced(env: Env, pool_id: u32) -> Result<i128, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        if !env.storage().persistent().has(&DataKey::Pool(pool_id)) {
+            return Err(FactoryError::PoolNotFound);
+        }
+        Ok(read_pool_tvl(&env, pool_id))
+    }
+
+    /// Live TVL of one pool, read straight from the deployed pool contract
+    /// via its `total_staked` getter. Unlike the `total_tvl` accumulator this
+    /// always reflects the pool's current state, at the cost of a
+    /// cross-contract call.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized,
+    /// `PoolNotFound` for an unknown `pool_id`, or `PoolQueryFailed` if the
+    /// deployed pool does not answer the TVL getters.
+    pub fn pool_tvl(env: Env, pool_id: u32) -> Result<i128, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+        query_pool_tvl(&env, &record.address)
+    }
+
+    /// Refresh one pool's contribution to `total_tvl` and return its live TVL.
+    ///
+    /// Permissionless — dashboards, keepers, or the pool's own users can call
+    /// it to keep the aggregate current. Reads the pool's live TVL, adjusts the
+    /// `total_tvl` accumulator by the delta versus this pool's last-synced
+    /// value, and stores the new snapshot. Emits a `tvl_sync` event carrying
+    /// `(pool_id, old_snapshot, new_tvl)` when the value changed.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized,
+    /// `PoolNotFound` for an unknown `pool_id`, or `PoolQueryFailed` if the
+    /// deployed pool does not answer the TVL getters.
+    pub fn sync_pool_tvl(env: Env, pool_id: u32) -> Result<i128, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+        apply_tvl_sync(&env, pool_id, &record.address)
+    }
+
+    /// Batch-refresh a contiguous range of pools' `total_tvl` contributions,
+    /// starting at `start_id` and covering at most
+    /// `min(limit, MAX_POOL_SCAN_PER_CALL)` pool IDs. Pools that fail to answer
+    /// the TVL getters are skipped rather than aborting the batch. Returns the
+    /// next `start_id` to pass for continued paging, or a value `>= pool_count`
+    /// once the registry is exhausted. Permissionless, mirroring
+    /// `refresh_pool_ttls`.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn sync_all_pool_tvls(
+        env: Env,
+        start_id: u32,
+        limit: u32,
+    ) -> Result<u32, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
+        let window = limit.min(MAX_POOL_SCAN_PER_CALL);
+        let end = start_id.saturating_add(window).min(count);
+        let mut pool_id = start_id;
+        while pool_id < end {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            {
+                let _ = apply_tvl_sync(&env, pool_id, &record.address);
+            }
+            pool_id += 1;
+        }
+        Ok(end)
+    }
+
     /// Update the WASM hash used for future `create_pool` deployments. Admin-only.
     ///
     /// Allows the admin to point future pool deployments at a corrected or upgraded
@@ -963,6 +1145,15 @@ impl Factory {
             .persistent()
             .set(&DataKey::Pool(pool_id), &record);
         bump_pool(&env, pool_id);
+
+        // A freshly deployed pool holds nothing, so its contribution to
+        // `total_tvl` starts at 0. Recording the baseline explicitly keeps the
+        // first `sync_pool_tvl` a pure delta against a known value (#249).
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolTvl(pool_id), &0i128);
+        bump_pool_tvl(&env, pool_id);
+
         let asset_key = DataKey::AssetPools(asset.clone());
         let mut asset_pool_ids: Vec<u32> = env
             .storage()

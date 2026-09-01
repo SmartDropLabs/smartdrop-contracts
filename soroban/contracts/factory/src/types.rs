@@ -25,6 +25,12 @@ pub enum DataKey {
     PoolsByAdmin(Address),
     /// List of pool IDs currently running a specific WASM hash.
     PoolsByWasmHash(BytesN<32>),
+    /// Aggregate value locked across every pool, maintained incrementally by
+    /// `sync_pool_tvl` so `total_tvl` is an O(1) read (#249).
+    TotalTvl,
+    /// Last-synced TVL for a single pool, keyed by pool ID. This is the term
+    /// currently folded into `TotalTvl` for that pool (#249).
+    PoolTvl(u32),
 }
 
 /// On-chain record for a registered farming pool.
@@ -134,4 +140,8 @@ pub enum FactoryError {
     MinLockPeriodTooShort = 15,
     /// `initialize` was called with a zero-address admin, which would permanently lock the factory.
     InvalidAdmin = 16,
+    /// A pool's TVL could not be read during `total_tvl` maintenance because the
+    /// deployed pool did not answer the `total_staked` getter (e.g. a pool
+    /// deployed from an older WASM that predates it).
+    PoolQueryFailed = 17,
 }
