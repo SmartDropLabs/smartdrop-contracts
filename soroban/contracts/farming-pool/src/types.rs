@@ -117,6 +117,10 @@ pub enum DataKey {
     UnstakeCount,
     TotalCredits,
     EmergencyWithdrawalCount,
+    /// Running count of active stakes.
+    ActiveStakeCount,
+    /// Running count of credit rate updates performed.
+    CreditRateChangeCount,
     /// Running count of `set_boost` calls performed (#230).
     BoostCount,
     /// Total tokens currently locked in time-locked `Position`s (#232).
