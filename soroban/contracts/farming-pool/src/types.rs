@@ -20,8 +20,10 @@ pub enum PoolError {
     Paused = 10,
     /// Returned by `accept_admin` when no admin handoff is pending.
     NoPendingAdmin = 11,
+    /// Returned by `unlock_assets` when the minimum lock period has not elapsed.
+    MinimumLockNotElapsed = 12,
     /// Returned by `batch_add_to_whitelist` or `batch_remove_from_whitelist` when batch exceeds 50 users.
-    BatchTooLarge = 12,
+    BatchTooLarge = 13,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.
