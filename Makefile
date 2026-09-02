@@ -1,7 +1,7 @@
 .PHONY: build test deploy-testnet deploy-mainnet
 
 build:
-	cd soroban && cargo build --target wasm32-unknown-unknown --release
+	cd soroban && cargo build --target wasm32v1-none --release
 
 test:
 	# Pre-build farming-pool WASM; factory tests embed it via farming_pool::WASM.

@@ -4,3 +4,5 @@ soroban/target
 **/*.rs.bk
 .env
 .DS_Store
+issue.md
+pr.md

@@ -62,7 +62,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "i128": "1000"
+                  "i128": "500"
                 }
               ]
             }
@@ -81,7 +81,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                     },
                     {
-                      "i128": "1000"
+                      "i128": "500"
                     }
                   ]
                 }
@@ -105,7 +105,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "i128": "400"
+                  "i128": "200"
                 }
               ]
             }
@@ -114,6 +114,7 @@
         }
       ]
     ],
+    [],
     [],
     []
   ],
@@ -253,7 +254,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "600"
+                      "i128": "300"
                     }
                   },
                   {
@@ -285,7 +286,7 @@
                       "symbol": "total_credits"
                     },
                     "val": {
-                      "i128": "10000"
+                      "i128": "5000"
                     }
                   },
                   {
@@ -359,6 +360,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "LockCount"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "MinLockPeriod"
                           }
                         ]
@@ -371,12 +384,120 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "MinStakeAmount"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "100"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "SchemaVersion"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "StakeToken"
                           }
                         ]
                       },
                       "val": {
                         "address": "CCABDO7UZXYE4W6GVSEGSNNZTKSLFQGKXXQTH6OX7M7GKZ4Z6CUJNGZN"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "StakedUserCount"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalCredits"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "5000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalDeposits"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "0"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalDistributedCredits"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "5000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalLocked"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "300"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalStaked"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "300"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalWithdrawals"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "0"
                       }
                     }
                   ]
@@ -413,7 +534,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "999999400"
+                      "i128": "999999700"
                     }
                   },
                   {
@@ -465,7 +586,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "600"
+                      "i128": "300"
                     }
                   },
                   {
