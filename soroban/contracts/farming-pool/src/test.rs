@@ -420,28 +420,28 @@ fn test_transfer_admin_uninitialized_returns_not_initialized() {
 #[test]
 fn test_effective_stake_no_boost() {
     // Without boost, effective stake equals staked amount (allocation_pct = 0 → multiplier has no effect).
-    let stake = compute_total_stake(1_000, 0, 5);
+    let stake = compute_total_stake(1_000, 0, 5).unwrap();
     assert_eq!(stake, 1_000);
 }
 
 #[test]
 fn test_effective_stake_full_allocation_2x() {
     // 100% allocation at 2× multiplier: virtual_stake = 1000 * 2 = 2000, principal = 0.
-    let stake = compute_total_stake(1_000, 100, 2);
+    let stake = compute_total_stake(1_000, 100, 2).unwrap();
     assert_eq!(stake, 2_000);
 }
 
 #[test]
 fn test_effective_stake_half_allocation_2x() {
     // 50% allocation at 2×: principal = 500, virtual = 500*2 = 1000. total = 1500.
-    let stake = compute_total_stake(1_000, 50, 2);
+    let stake = compute_total_stake(1_000, 50, 2).unwrap();
     assert_eq!(stake, 1_500);
 }
 
 #[test]
 fn test_effective_stake_25pct_allocation_3x() {
     // 25% allocation at 3×: boosted = 250, principal = 750, virtual = 750. total = 1500.
-    let stake = compute_total_stake(1_000, 25, 3);
+    let stake = compute_total_stake(1_000, 25, 3).unwrap();
     assert_eq!(stake, 1_500);
 }
 
@@ -449,7 +449,7 @@ fn test_effective_stake_25pct_allocation_3x() {
 fn test_effective_stake_1pct_allocation_10x() {
     // Minimal allocation at high multiplier.
     // boosted = 10, principal = 990, virtual = 100. total = 1090.
-    let stake = compute_total_stake(1_000, 1, 10);
+    let stake = compute_total_stake(1_000, 1, 10).unwrap();
     assert_eq!(stake, 1_090);
 }
 
@@ -1696,6 +1696,189 @@ fn test_calculate_credits_reflects_partial_unlock_checkpoint() {
     t.client.unlock_assets(&t.user, &400); // banks 10000 into pos.total_credits
     advance_ledgers(&t.env, 5);
     assert_eq!(t.client.calculate_credits(&t.user), 13_000);
+}
+
+// ── Position credit accrual unit tests ────────────────────────────────────────
+
+#[test]
+fn test_compute_position_credits_zero_elapsed() {
+    // No time elapsed → no credits accrued regardless of amount/rate.
+    assert_eq!(compute_position_credits(1_000, 1, 0).unwrap(), 0);
+    assert_eq!(compute_position_credits(5_000, 100, 0).unwrap(), 0);
+}
+
+#[test]
+fn test_compute_position_credits_positive() {
+    // amount * credit_rate * elapsed
+    assert_eq!(compute_position_credits(500, 2, 20).unwrap(), 20_000);
+}
+
+#[test]
+fn test_compute_position_credits_combinations() {
+    let cases = [
+        (1_000, 1, 10, 10_000),
+        (2_000, 3, 5, 30_000),
+        (750, 4, 100, 300_000),
+        (1, 1, 1, 1),
+        (1_000, 1, 1_000_000, 1_000_000_000),
+    ];
+    for (amount, credit_rate, elapsed, expected) in cases {
+        assert_eq!(
+            compute_position_credits(amount, credit_rate, elapsed).unwrap(),
+            expected,
+            "amount={amount}, credit_rate={credit_rate}, elapsed={elapsed}"
+        );
+    }
+}
+
+// ── credit overflow tests ─────────────────────────────────────────────────────
+
+#[test]
+fn test_compute_total_stake_overflow_returns_credit_overflow() {
+    // amount * allocation_pct overflows i128.
+    assert_eq!(
+        compute_total_stake(i128::MAX, 2, 1),
+        Err(PoolError::CreditOverflow)
+    );
+    // boosted * multiplier overflows i128.
+    assert_eq!(
+        compute_total_stake(i128::MAX / 100, 100, 201),
+        Err(PoolError::CreditOverflow)
+    );
+}
+
+#[test]
+fn test_compute_credits_overflow_returns_credit_overflow() {
+    // total_stake * credit_rate overflows i128.
+    assert_eq!(
+        compute_credits(2, 0, 1, i128::MAX, 1),
+        Err(PoolError::CreditOverflow)
+    );
+    // product * ledgers_elapsed overflows i128.
+    assert_eq!(
+        compute_credits(i128::MAX / 2, 0, 1, 2, 2),
+        Err(PoolError::CreditOverflow)
+    );
+}
+
+#[test]
+fn test_compute_position_credits_overflow_returns_credit_overflow() {
+    // amount * credit_rate overflows i128.
+    assert_eq!(
+        compute_position_credits(2, i128::MAX, 1),
+        Err(PoolError::CreditOverflow)
+    );
+}
+
+#[test]
+fn test_calculate_credits_overflow_returns_credit_overflow() {
+    // MAX_CREDIT_RATE with a huge user-supplied amount overflows the accrual.
+    let t = setup(1, 100_000_000);
+    let huge = i128::MAX / 10;
+    t.token_sac.mint(&t.user, &huge);
+    t.client.lock_assets(&t.user, &huge);
+    advance_ledgers(&t.env, 1);
+    assert!(matches!(
+        t.client.try_calculate_credits(&t.user),
+        Err(Ok(PoolError::CreditOverflow))
+    ));
+}
+
+#[test]
+fn test_lock_assets_checkpoint_overflow_returns_credit_overflow() {
+    let t = setup(1, 100_000_000);
+    let huge = i128::MAX / 10;
+    t.token_sac.mint(&t.user, &huge);
+    t.client.lock_assets(&t.user, &huge);
+    advance_ledgers(&t.env, 1);
+    // Second lock triggers checkpoint_position, which overflows.
+    assert!(matches!(
+        t.client.try_lock_assets(&t.user, &100),
+        Err(Ok(PoolError::CreditOverflow))
+    ));
+}
+
+#[test]
+fn test_get_credits_overflow_returns_credit_overflow() {
+    let t = setup(1, 100_000_000);
+    let huge = i128::MAX / 10;
+    t.token_sac.mint(&t.user, &huge);
+    t.client.stake(&t.user, &huge);
+    advance_ledgers(&t.env, 1);
+    assert!(matches!(
+        t.client.try_get_credits(&t.user),
+        Err(Ok(PoolError::CreditOverflow))
+    ));
+}
+
+#[test]
+fn test_unstake_overflow_returns_credit_overflow_and_preserves_stake() {
+    let t = setup(1, 100_000_000);
+    let huge = i128::MAX / 10;
+    t.token_sac.mint(&t.user, &huge);
+    t.client.stake(&t.user, &huge);
+    advance_ledgers(&t.env, 1);
+    assert!(matches!(
+        t.client.try_unstake(&t.user),
+        Err(Ok(PoolError::CreditOverflow))
+    ));
+    // Stake is preserved so the user can recover after the admin fixes the rate.
+    assert!(t.client.get_stake(&t.user).is_some());
+}
+
+#[test]
+fn test_unlock_assets_overflow_returns_credit_overflow_and_preserves_position() {
+    let t = setup(1, 100_000_000);
+    let huge = i128::MAX / 10;
+    t.token_sac.mint(&t.user, &huge);
+    t.client.lock_assets(&t.user, &huge);
+    advance_ledgers(&t.env, 1);
+    assert!(matches!(
+        t.client.try_unlock_assets(&t.user, &huge),
+        Err(Ok(PoolError::CreditOverflow))
+    ));
+    assert!(t.client.get_user_position(&t.user).is_some());
+}
+
+#[test]
+fn test_position_banked_vs_previewed_credits_match() {
+    // The value banked by checkpoint_position and previewed by calculate_credits
+    // must come from the same calculation.
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+
+    // Preview before checkpointing.
+    let previewed = t.client.calculate_credits(&t.user);
+    assert_eq!(previewed, 10_000); // 1000 * 1 * 10
+
+    // Checkpoint via a second lock, banking the same accrued credits.
+    t.client.lock_assets(&t.user, &100);
+    let pos = t
+        .client
+        .get_user_position(&t.user)
+        .expect("position should exist");
+    assert_eq!(pos.total_credits, previewed);
+
+    // Nothing further accrues since the checkpoint.
+    assert_eq!(t.client.calculate_credits(&t.user), previewed);
+}
+
+#[test]
+fn test_position_multi_checkpoint_accrual() {
+    // Each checkpoint banks credits via the shared formula; the total is the sum.
+    // Amounts must stay at/above the default min_stake_amount (100) to pass the
+    // lock/min-stake gate.
+    let t = setup(1, 2);
+    t.client.lock_assets(&t.user, &1_000);
+    advance_ledgers(&t.env, 5);
+    t.client.lock_assets(&t.user, &100); // banks 1000 * 2 * 5 = 10_000
+    advance_ledgers(&t.env, 5);
+    t.client.lock_assets(&t.user, &100); // banks 1100 * 2 * 5 = 11_000
+    advance_ledgers(&t.env, 5);
+    t.client.unlock_assets(&t.user, &100); // banks 1200 * 2 * 5 = 12_000
+
+    assert_eq!(t.client.calculate_credits(&t.user), 33_000);
 }
 
 // ── get_user_position tests ───────────────────────────────────────────────────

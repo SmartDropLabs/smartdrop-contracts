@@ -616,11 +616,24 @@ fn set_whitelisted_users_list(env: &Env, users: &Vec<Address>) {
 ///   total_stake     = principal_stake + virtual_stake
 ///
 /// With no boost (allocation_pct = 0) total_stake == amount.
-fn compute_total_stake(amount: i128, allocation_pct: u32, multiplier: u32) -> i128 {
-    let boosted = amount * allocation_pct as i128 / 100;
-    let principal = amount - boosted;
-    let virtual_stake = boosted * multiplier as i128;
-    principal + virtual_stake
+fn compute_total_stake(
+    amount: i128,
+    allocation_pct: u32,
+    multiplier: u32,
+) -> Result<i128, PoolError> {
+    let boosted = amount
+        .checked_mul(allocation_pct as i128)
+        .ok_or(PoolError::CreditOverflow)?
+        / 100;
+    let principal = amount
+        .checked_sub(boosted)
+        .ok_or(PoolError::CreditOverflow)?;
+    let virtual_stake = boosted
+        .checked_mul(multiplier as i128)
+        .ok_or(PoolError::CreditOverflow)?;
+    principal
+        .checked_add(virtual_stake)
+        .ok_or(PoolError::CreditOverflow)
 }
 
 fn compute_credits(
@@ -629,8 +642,29 @@ fn compute_credits(
     multiplier: u32,
     credit_rate: i128,
     ledgers_elapsed: u32,
-) -> i128 {
-    compute_total_stake(amount, allocation_pct, multiplier) * credit_rate * ledgers_elapsed as i128
+) -> Result<i128, PoolError> {
+    let total_stake = compute_total_stake(amount, allocation_pct, multiplier)?;
+    total_stake
+        .checked_mul(credit_rate)
+        .and_then(|v| v.checked_mul(ledgers_elapsed as i128))
+        .ok_or(PoolError::CreditOverflow)
+}
+
+/// Credits accrued by a `Position` over `elapsed` ledgers at `credit_rate`.
+///
+/// Single source of truth for Position credit accrual, shared by the
+/// checkpointing path (`checkpoint_position`) and the preview path
+/// (`calculate_credits`). Deliberately separate from `compute_credits`, which
+/// applies UserStake boost/multiplier semantics that Positions do not have.
+fn compute_position_credits(
+    amount: i128,
+    credit_rate: i128,
+    elapsed: u32,
+) -> Result<i128, PoolError> {
+    amount
+        .checked_mul(credit_rate)
+        .and_then(|v| v.checked_mul(elapsed as i128))
+        .ok_or(PoolError::CreditOverflow)
 }
 
 fn compute_stake_accrual(env: &Env, user: &Address, stake: &UserStake, current: u32) -> i128 {
@@ -1531,7 +1565,7 @@ impl FarmingPool {
         let was_staked = is_user_staked(&env, &from);
         let current = env.ledger().sequence();
         let mut new_stake = if let Some(mut existing) = get_user_stake(&env, &from) {
-            checkpoint(&env, &from, &mut existing);
+            checkpoint(&env, &from, &mut existing)?;
             existing.amount += amount;
             existing
         } else {
@@ -1588,7 +1622,7 @@ impl FarmingPool {
 
         let was_staked = is_user_staked(&env, &from);
         let mut stake = get_user_stake(&env, &from).expect("no active stake");
-        checkpoint(&env, &from, &mut stake);
+        checkpoint(&env, &from, &mut stake)?;
         let total_credits = stake.credits_banked;
         if total_credits > 0 {
             subtract_total_banked_credits(&env, total_credits);
