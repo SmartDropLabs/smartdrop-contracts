@@ -1099,7 +1099,8 @@ impl FarmingPool {
             .ledger()
             .sequence()
             .saturating_sub(position.checkpoint_ledger);
-        Ok(position.total_credits + position.amount * position.credit_rate * elapsed as i128)
+        Ok(position.total_credits
+            + compute_position_credits(position.amount, position.credit_rate, elapsed))
     }
 
     /// Return current accrued credits for a user's time-locked `Position`.
