@@ -63,3 +63,13 @@ SOURCE=alice ADMIN=G... make deploy-testnet
 ```
 
 On success, `.contract-ids.json` contains the factory contract ID and installed pool WASM hash (gitignored).
+
+### Standalone vesting-wallet deployment
+
+`vesting-wallet` is not deployed by `scripts/deploy.sh` and its standalone
+`initialize` call is not bound to the account that deployed the contract. An
+uninitialized wallet can therefore be front-run and permanently occupied by a
+different caller. Deployers must use a Stellar transaction flow that atomically
+batches the wallet deployment and its `initialize` invocation; never publish an
+uninitialized vesting-wallet address or submit deployment and initialization as
+separate transactions.

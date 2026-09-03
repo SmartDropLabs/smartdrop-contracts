@@ -5,30 +5,50 @@ mod types;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, Symbol, Val, Vec,
 };
-use types::{DataKey, FactoryError, ListPoolsResponse, PoolRecord};
+use types::{DataKey, ListPoolsResponse, PoolRecord, PoolSort};
+
+pub use types::FactoryError;
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
 const TTL_THRESHOLD: u32 = 518_400;
 const TTL_EXTEND_TO: u32 = 1_036_800;
+// Bound the number of pool IDs examined per call to stay within Soroban's 100 footprint entries limit.
+const MAX_POOL_SCAN_PER_CALL: u32 = 50;
 
 /// Ledgers per day at the network's ~5s/ledger target, used to convert
 /// `create_pool`'s caller-facing `daily_rate` into the pool's native
 /// per-ledger `credit_rate`. See `daily_rate_to_credit_rate`.
 const LEDGERS_PER_DAY: u128 = 17_280;
+// Minimum stake in the asset's smallest units. This is 0.1 token for the
+// standard 7-decimal Stellar asset convention and prevents dust positions.
+const MIN_STAKE_AMOUNT: i128 = 1_000_000;
+// Minimum lock period in ledgers required to prevent flash-loan-style attacks.
+const MIN_LOCK_PERIOD: u32 = 1;
 
 /// Convert a "credits per day" figure into the deployed pool's native
 /// "credits per ledger" `credit_rate`.
 ///
 /// `daily_rate` is kept as `create_pool`'s public unit because a per-day
 /// figure is what off-chain/product code already reasons about; ledger-level
-/// rates are an implementation detail of `FarmingPool`. Returns
-/// `InvalidCreditRate` if the conversion truncates to zero (`initialize`
-/// requires `credit_rate > 0`) or does not fit in `i128`.
+/// rates are an implementation detail of `FarmingPool`.
+///
+/// Conversion uses **ceiling** division (`(daily_rate + LEDGERS_PER_DAY - 1) /
+/// LEDGERS_PER_DAY`) rather than truncation. Truncation silently dropped valid
+/// small daily rates: e.g. `daily_rate = 17_279` divided by `LEDGERS_PER_DAY =
+/// 17_280` truncated to `0`, which `FarmingPool::initialize` then rejects with
+/// `InvalidCreditRate` (see #148). Ceiling division guarantees that *any*
+/// non-zero `daily_rate` yields a positive `credit_rate` of at least `1`
+/// (≈ `LEDGERS_PER_DAY` credits/day). The smallest `daily_rate` that converts
+/// to exactly `1` ledger credit is `LEDGERS_PER_DAY` itself; smaller values
+/// still round up to `1` and therefore over-accrue slightly, so callers
+/// wanting an exact daily rate should pass a multiple of `LEDGERS_PER_DAY`.
+/// Returns `InvalidCreditRate` only if `daily_rate == 0` or the rounded
+/// `credit_rate` does not fit in `i128`.
 fn daily_rate_to_credit_rate(daily_rate: u128) -> Result<i128, FactoryError> {
-    let per_ledger = daily_rate / LEDGERS_PER_DAY;
-    if per_ledger == 0 {
+    if daily_rate == 0 {
         return Err(FactoryError::InvalidCreditRate);
     }
+    let per_ledger = daily_rate.div_ceil(LEDGERS_PER_DAY);
     i128::try_from(per_ledger).map_err(|_| FactoryError::InvalidCreditRate)
 }
 
@@ -42,6 +62,38 @@ fn bump_pool(env: &Env, pool_id: u32) {
     env.storage()
         .persistent()
         .extend_ttl(&DataKey::Pool(pool_id), TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+fn bump_asset_pools(env: &Env, asset: &Address) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::AssetPools(asset.clone()),
+        TTL_THRESHOLD,
+        TTL_EXTEND_TO,
+    );
+}
+
+fn bump_admin_pools(env: &Env, admin: &Address) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::PoolsByAdmin(admin.clone()),
+        TTL_THRESHOLD,
+        TTL_EXTEND_TO,
+    );
+}
+
+fn bump_pool_tvl(env: &Env, pool_id: u32) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::PoolTvl(pool_id),
+        TTL_THRESHOLD,
+        TTL_EXTEND_TO,
+    );
+}
+
+fn bump_wasm_pools(env: &Env, wasm_hash: &BytesN<32>) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::PoolsByWasmHash(wasm_hash.clone()),
+        TTL_THRESHOLD,
+        TTL_EXTEND_TO,
+    );
 }
 
 /// Reject any call that lands on a factory whose state was never seeded.
@@ -75,11 +127,124 @@ fn load_wasm_hash(env: &Env) -> Result<BytesN<32>, FactoryError> {
         .ok_or(FactoryError::NotInitialized)
 }
 
+/// Read the running count of successful `upgrade_pool` calls (#258).
+fn read_upgrade_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::UpgradeCount)
+        .unwrap_or(0)
+}
+
 /// Build a 32-byte salt from a pool ID so each pool gets a unique, reproducible address.
+/// Live TVL of a single deployed pool, read straight from the pool via one
+/// cross-contract call to its `total_staked` getter.
+///
+/// `FarmingPool::total_staked` already covers every token held for a user —
+/// `lock_assets` credits both `TotalStaked` and `TotalLocked`, so
+/// `total_locked` is a subset of `total_staked`, not a separate term to add.
+/// Returns `PoolQueryFailed` if the pool does not answer the getter (e.g. an
+/// older WASM predating it).
+fn query_pool_tvl(env: &Env, pool: &Address) -> Result<i128, FactoryError> {
+    let no_args: Vec<Val> = vec![env];
+    match env.try_invoke_contract::<i128, soroban_sdk::Error>(
+        pool,
+        &Symbol::new(env, "total_staked"),
+        no_args,
+    ) {
+        Ok(Ok(v)) => Ok(v),
+        _ => Err(FactoryError::PoolQueryFailed),
+    }
+}
+
+/// Re-read one pool's live TVL and fold the change into the `total_tvl`
+/// accumulator: `total_tvl += live - previous_snapshot`, then store `live` as
+/// the new snapshot. Emits `tvl_sync = (pool_id, old_snapshot, live)` when the
+/// value moved. Returns the pool's live TVL.
+fn apply_tvl_sync(env: &Env, pool_id: u32, pool: &Address) -> Result<i128, FactoryError> {
+    let live = query_pool_tvl(env, pool)?;
+    let previous = read_pool_tvl(env, pool_id);
+    if live != previous {
+        let aggregate = read_total_tvl(env)
+            .saturating_add(live)
+            .saturating_sub(previous);
+        env.storage().instance().set(&DataKey::TotalTvl, &aggregate);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolTvl(pool_id), &live);
+        bump_pool_tvl(env, pool_id);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("tvl_sync")),
+            (pool_id, previous, live),
+        );
+    }
+    Ok(live)
+}
+
 fn pool_salt(env: &Env, pool_id: u32) -> BytesN<32> {
     let mut bytes = [0u8; 32];
     bytes[28..].copy_from_slice(&pool_id.to_be_bytes());
     BytesN::from_array(env, &bytes)
+}
+
+fn validate_asset(env: &Env, asset: &Address) -> Result<(), FactoryError> {
+    let args: Vec<Val> = vec![&env, env.current_contract_address().into_val(env)];
+    match env.try_invoke_contract::<i128, soroban_sdk::Error>(
+        asset,
+        &Symbol::new(env, "balance"),
+        args,
+    ) {
+        Ok(Ok(balance)) if balance >= 0 => Ok(()),
+        Ok(_) => Err(FactoryError::InvalidAsset),
+        Err(_) => Ok(()),
+    }
+}
+
+fn sort_precedes(sort: PoolSort, left: &(u32, PoolRecord), right: &(u32, PoolRecord)) -> bool {
+    let ordering = match sort {
+        PoolSort::PoolId => left.0.cmp(&right.0),
+        PoolSort::CreditRate => left.1.credit_rate.cmp(&right.1.credit_rate),
+        PoolSort::GlobalMultiplier => left.1.global_multiplier.cmp(&right.1.global_multiplier),
+        PoolSort::MinLockPeriod => left.1.min_lock_period.cmp(&right.1.min_lock_period),
+    };
+    ordering.is_lt() || (ordering.is_eq() && left.0 < right.0)
+}
+
+fn insert_sorted(records: &mut Vec<(u32, PoolRecord)>, record: (u32, PoolRecord), sort: PoolSort) {
+    let mut insert_at: u32 = records.len();
+    for (index, existing) in records.iter().enumerate() {
+        if sort_precedes(sort, &record, &existing) {
+            insert_at = index as u32;
+            break;
+        }
+    }
+    records.insert(insert_at, record);
+}
+
+fn read_admin_transfer_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::AdminTransferCount)
+        .unwrap_or(0)
+}
+
+fn read_total_tvl(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKey::TotalTvl).unwrap_or(0)
+}
+
+fn read_pool_tvl(env: &Env, pool_id: u32) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PoolTvl(pool_id))
+        .unwrap_or(0)
+}
+
+fn increment_admin_transfer_count(env: &Env) {
+    let count = read_admin_transfer_count(env);
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminTransferCount, &(count + 1));
 }
 
 #[contract]
@@ -99,6 +264,17 @@ impl Factory {
     ) -> Result<(), FactoryError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(FactoryError::AlreadyInitialized);
+        }
+        if admin
+            == Address::from_string(&soroban_sdk::String::from_str(
+                &env,
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            ))
+        {
+            return Err(FactoryError::InvalidAdmin);
+        }
+        if pool_wasm_hash == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(FactoryError::InvalidWasmHash);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -151,6 +327,13 @@ impl Factory {
     ///
     /// Returns `NotInitialized` if the factory has not been initialized, or
     /// `PoolNotFound` if `pool_id` has not been created yet.
+    ///
+    /// # TTL keep-alive
+    /// On success, extends the persistent TTL of the requested pool record (and
+    /// the factory instance) when remaining TTL falls below `TTL_THRESHOLD`.
+    /// Pools that are never individually queried should be kept alive via
+    /// paginated `list_pools` reads, asset-range queries, or the permissionless
+    /// `refresh_pool_ttls` function.
     pub fn get_pool(env: Env, pool_id: u32) -> Result<PoolRecord, FactoryError> {
         require_initialized(&env)?;
         bump_instance(&env);
@@ -172,6 +355,15 @@ impl Factory {
     /// Guarded like `pool_count`: an empty page from an uninitialized factory
     /// would be indistinguishable from an initialized but empty registry.
     ///
+    /// # TTL keep-alive
+    /// Extends the persistent TTL of every pool record returned in this page
+    /// (plus the factory instance). Unlike `get_pool`, which bumps one record
+    /// per call, each paginated read refreshes all pools in the window. Indexers
+    /// that page through the registry therefore keep listed pools alive more
+    /// aggressively than pools accessed only via `get_pool(id)`. For deliberate
+    /// full-registry maintenance independent of read patterns, use
+    /// `refresh_pool_ttls`.
+    ///
     /// Returns `NotInitialized` if the factory has not been initialized.
     pub fn list_pools(
         env: Env,
@@ -185,7 +377,15 @@ impl Factory {
             .instance()
             .get(&DataKey::PoolCount)
             .unwrap_or(0);
-        let capped_limit = limit.min(20);
+        if start_id >= count {
+            return Ok(ListPoolsResponse {
+                records: vec![&env],
+                next_start_id: count,
+                total: count,
+                has_more: false,
+            });
+        }
+        let capped_limit = if limit == 0 { 20 } else { limit.min(20) };
         let end = start_id.saturating_add(capped_limit).min(count);
         let mut records: Vec<(u32, PoolRecord)> = vec![&env];
 
@@ -197,44 +397,93 @@ impl Factory {
             }
         }
 
+        let has_more = end < count;
         Ok(ListPoolsResponse {
             records,
             next_start_id: if end < count { end } else { count },
             total: count,
+            has_more,
         })
     }
 
-    /// Return a page of pool records whose staking asset matches `asset`.
+    /// Return a page of pool records sorted by a supported stored field.
     ///
-    /// Scans registered pools starting from `start_id` and collects matching records.
-    /// `limit` is capped at 20 records so callers can page through large registries
-    /// without unbounded contract work. This prevents denial-of-service by design as
-    /// the registry grows organically.
+    /// `start_id` and `limit` retain the same bounded ID-window semantics as
+    /// `list_pools`; sorting is applied to the records found in that window.
+    /// Use `PoolSort::PoolId` for behavior equivalent to `list_pools`.
+    /// Records with equal sort values are ordered by ascending pool ID.
+    /// Creation time, TVL, and asset ordering are not available from the
+    /// factory's current on-chain record and should be supplied by an indexer.
+    pub fn list_pools_sorted(
+        env: Env,
+        start_id: u32,
+        limit: u32,
+        sort: PoolSort,
+    ) -> Result<ListPoolsResponse, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
+        if start_id >= count {
+            return Ok(ListPoolsResponse {
+                records: vec![&env],
+                next_start_id: count,
+                total: count,
+                has_more: false,
+            });
+        }
+        let capped_limit = if limit == 0 { 20 } else { limit.min(20) };
+        let end = start_id.saturating_add(capped_limit).min(count);
+        let mut records: Vec<(u32, PoolRecord)> = vec![&env];
+
+        for pool_id in start_id..end {
+            let key = DataKey::Pool(pool_id);
+            if let Some(record) = env.storage().persistent().get::<DataKey, PoolRecord>(&key) {
+                bump_pool(&env, pool_id);
+                insert_sorted(&mut records, (pool_id, record), sort);
+            }
+        }
+
+        let has_more = end < count;
+        Ok(ListPoolsResponse {
+            records,
+            next_start_id: if end < count { end } else { count },
+            total: count,
+            has_more,
+        })
+    }
+
+    /// Return a page of pool records whose staking asset matches `asset`, scanning up to `scan_limit` pool IDs.
     ///
-    /// # Resource Limit Reasoning
-    /// Without pagination, this function performs an unbounded O(n) scan over every
-    /// pool ever registered, with no ceiling. As pool_count grows, the function gets
-    /// strictly more expensive per call and would eventually exceed Soroban's
-    /// per-transaction CPU-instruction and read-entry budgets, becoming permanently
-    /// unusable. The 20-record cap mirrors list_pools's design to prevent this.
+    /// Scans at most `scan_limit` (capped at `MAX_POOL_SCAN_PER_CALL` = 50) pool IDs starting from
+    /// `start_id` and collects matching records from that bounded window. `limit` is capped at 20
+    /// records so callers can page through large registries without unbounded contract work.
     ///
-    /// Scans every registered pool in O(n) and collects matching IDs.
-    /// Useful for frontends that need to surface all pools for a given token
-    /// without an off-chain indexer.
+    /// # Resource Limit & Gas Economics
+    /// Without a scan bound, asset-matching queries perform an unbounded O(n) walk across the registry,
+    /// inspecting every pool ID until `limit` matches are found or the registry is exhausted. As
+    /// `pool_count` scales to thousands of pools, sparse queries would exceed Soroban's per-transaction
+    /// footprint limits (100 entries) and CPU instruction budget. Bounding each call to at most 50 IDs
+    /// guarantees bounded predictable gas and CPU consumption per call.
     ///
-    /// Guarded like `pool_count`: an empty result from an uninitialized factory
-    /// would be indistinguishable from "no pools hold this asset".
+    /// # Caller Range Scanning & Pagination
+    /// Callers can specify `scan_limit` (up to 50) to tune the scan window. Callers resume pagination
+    /// using `next_start_id` until `next_start_id == total`.
+    ///
+    /// # Indexer Recommendation
+    /// For off-chain applications (such as frontends and analytics) requiring zero-gas instant lookups
+    /// across thousands of pools, developers should index the `(symbol_short!("factory"), symbol_short!("pool_crtd"))`
+    /// events emitted by `create_pool`, which include `asset` and `pool_id` in their payload.
     ///
     /// Returns `NotInitialized` if the factory has not been initialized.
-    /// # Secondary Index Consideration
-    /// For very large registries, a secondary per-asset index (e.g., DataKey::AssetPools
-    /// maintained incrementally in create_pool) would avoid full-registry scans entirely.
-    /// This would be a more robust long-term fix but requires changes to create_pool's
-    /// write path and potentially a migration/backfill for existing pools.
-    pub fn get_pools_by_asset(
+    pub fn get_pools_by_asset_range(
         env: Env,
         asset: Address,
         start_id: u32,
+        scan_limit: u32,
         limit: u32,
     ) -> Result<ListPoolsResponse, FactoryError> {
         require_initialized(&env)?;
@@ -244,11 +493,59 @@ impl Factory {
             .instance()
             .get(&DataKey::PoolCount)
             .unwrap_or(0);
-        let capped_limit = limit.min(20);
+        if start_id >= count {
+            return Ok(ListPoolsResponse {
+                records: vec![&env],
+                next_start_id: count,
+                total: count,
+                has_more: false,
+            });
+        }
+        let capped_limit = if limit == 0 { 20 } else { limit.min(20) };
+        let effective_scan = if scan_limit == 0 {
+            MAX_POOL_SCAN_PER_CALL
+        } else {
+            scan_limit.min(MAX_POOL_SCAN_PER_CALL)
+        };
+        let scan_end = start_id.saturating_add(effective_scan).min(count);
         let mut records: Vec<(u32, PoolRecord)> = vec![&env];
-        let mut next_start_id = count;
+        let mut next_start_id = scan_end;
 
-        for pool_id in start_id..count {
+        let asset_key = DataKey::AssetPools(asset.clone());
+        if let Some(asset_ids) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u32>>(&asset_key)
+        {
+            bump_asset_pools(&env, &asset);
+            for pool_id in asset_ids.iter() {
+                if pool_id < start_id {
+                    continue;
+                }
+                if pool_id >= scan_end {
+                    next_start_id = scan_end;
+                    break;
+                }
+                if records.len() >= capped_limit {
+                    next_start_id = pool_id;
+                    break;
+                }
+                let key = DataKey::Pool(pool_id);
+                if let Some(record) = env.storage().persistent().get::<DataKey, PoolRecord>(&key) {
+                    bump_pool(&env, pool_id);
+                    records.push_back((pool_id, record));
+                }
+            }
+            let has_more = next_start_id < count;
+            return Ok(ListPoolsResponse {
+                records,
+                next_start_id,
+                total: count,
+                has_more,
+            });
+        }
+
+        for pool_id in start_id..scan_end {
             if records.len() >= capped_limit {
                 next_start_id = pool_id;
                 break;
@@ -262,11 +559,52 @@ impl Factory {
             }
         }
 
+        let has_more = next_start_id < count;
         Ok(ListPoolsResponse {
             records,
             next_start_id,
             total: count,
+            has_more,
         })
+    }
+
+    /// Return a page of pool records whose staking asset matches `asset`.
+    ///
+    /// Scans at most `MAX_POOL_SCAN_PER_CALL` (50) pool IDs starting from `start_id`
+    /// and collects matching records from that bounded window. Equivalent to calling
+    /// `get_pools_by_asset_range(env, asset, start_id, MAX_POOL_SCAN_PER_CALL, limit)`.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn get_pools_by_asset(
+        env: Env,
+        asset: Address,
+        start_id: u32,
+        limit: u32,
+    ) -> Result<ListPoolsResponse, FactoryError> {
+        Self::get_pools_by_asset_range(env, asset, start_id, MAX_POOL_SCAN_PER_CALL, limit)
+    }
+
+    /// Return the list of pool IDs created by `admin`.
+    pub fn get_pools_by_admin(env: Env, admin: Address) -> Result<Vec<u32>, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let admin_key = DataKey::PoolsByAdmin(admin.clone());
+        if env.storage().persistent().has(&admin_key) {
+            bump_admin_pools(&env, &admin);
+        }
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&admin_key)
+            .unwrap_or_else(|| vec![&env]))
+    }
+
+    /// Return the number of pools created by `admin` (#236).
+    ///
+    /// Equivalent to `get_pools_by_admin(admin).len()`, exposed directly so
+    /// callers who only need the count avoid paying for the full ID list.
+    pub fn get_admin_pool_count(env: Env, admin: Address) -> Result<u32, FactoryError> {
+        Ok(Self::get_pools_by_admin(env, admin)?.len())
     }
 
     /// Refresh TTLs for a range of pool records to prevent archival.
@@ -295,7 +633,33 @@ impl Factory {
     /// Operators should call this function across the full ID range at least once
     /// every ~45 days (between TTL_THRESHOLD of ~30 days and TTL_EXTEND_TO of
     /// ~60 days) to ensure all pool records remain accessible.
+    ///
+    /// # Security implications of being permissionless (#168)
+    /// Any caller may extend pool-record TTLs. The blast radius is intentionally
+    /// bounded and non-hazardous:
+    /// - A refresh only **extends** TTLs; it can never shorten them, prune
+    ///   records, or mutate pool data. It therefore cannot corrupt state.
+    /// - Each call is capped at 20 pool IDs and fees are paid by the caller, so
+    ///   an attacker cannot cheaply undercut rational keepers nor permanently
+    ///   pin a pool against archival — every ~45-day cycle requires a fresh
+    ///   low-value call and re-accruing storage rent.
+    /// - Pool records that should be retired are at most kept alive (not
+    ///   protected in any other way): they remain stale and can be ignored by
+    ///   frontends, and the pool's on-chain asset transfers are unaffected.
+    /// - The maximum consequential cost of abuse is bounded storage-rent for
+    ///   stale records, which is recovered through fees paid by the refresher.
+    ///
+    /// This is why the function deliberately remains permissionless: an
+    /// admin-gated or rate-limited variant would reintroduce the archival risk
+    /// it exists to prevent (a factory whose only keep-alive relies on a single
+    /// admin becomes a single point of failure). For pools that must be
+    /// decommissioned, the durable admin path is to stop refreshing them and
+    /// let their TTL lapse, or archive/white-list them off-chain rather than
+    /// relying on attacker interference.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
     pub fn refresh_pool_ttls(env: Env, start_id: u32, limit: u32) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
         bump_instance(&env);
         let count: u32 = env
             .storage()
@@ -309,6 +673,11 @@ impl Factory {
                 bump_pool(&env, pool_id);
             }
         }
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("ttl_ref")),
+            (start_id, end),
+        );
         Ok(())
     }
 
@@ -324,6 +693,7 @@ impl Factory {
         current.require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        increment_admin_transfer_count(&env);
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("factory"), symbol_short!("adm_xfr")),
@@ -332,10 +702,38 @@ impl Factory {
         Ok(())
     }
 
+    /// Return the total number of admin transfers performed.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn admin_transfer_count(env: Env) -> Result<u32, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(read_admin_transfer_count(&env))
+    }
+
+    pub fn get_admin_transfer_count(env: Env) -> Result<u32, FactoryError> {
+        Self::admin_transfer_count(env)
+    }
+
     /// Upgrade one registered farming pool in place. Admin-only.
     ///
     /// This deliberately does not update the factory-level `WasmHash`; it is a
     /// pool-by-pool hot swap for a pre-installed WASM hash.
+    ///
+    /// A pool's admin is fixed to the factory's admin *at creation time*
+    /// (see `create_pool`'s docs) and does not follow later `transfer_admin`
+    /// calls on either the factory or the pool itself. The pool's own
+    /// `upgrade` entry point independently requires its stored admin's
+    /// authorization, so once the two admins diverge, this factory-admin-gated
+    /// call would silently also need a second signature from the pool's
+    /// (possibly unrelated) admin to succeed. Rather than let that surface as
+    /// an opaque missing-authorization host trap, check the pool's current
+    /// admin against the factory's admin up front and fail with a typed
+    /// `PoolAdminMismatch` error when they no longer match.
+    ///
+    /// Furthermore, if the deployed pool does not support upgrades (e.g. an older
+    /// deployment lacking an `upgrade` entry point) or if invocation fails, `try_invoke_contract`
+    /// catches the failure and returns a typed `PoolUpgradeFailed` error instead of panicking.
     pub fn upgrade_pool(
         env: Env,
         pool_id: u32,
@@ -346,24 +744,205 @@ impl Factory {
         bump_instance(&env);
 
         let key = DataKey::Pool(pool_id);
-        let record = env
+        let mut record = env
             .storage()
             .persistent()
             .get::<DataKey, PoolRecord>(&key)
             .ok_or(FactoryError::PoolNotFound)?;
         bump_pool(&env, pool_id);
 
+        let pool_admin_args: Vec<Val> = vec![&env];
+        let pool_admin_res = env.try_invoke_contract::<Address, soroban_sdk::Error>(
+            &record.address,
+            &Symbol::new(&env, "admin"),
+            pool_admin_args,
+        );
+        let pool_admin = match pool_admin_res {
+            Ok(Ok(addr)) => addr,
+            _ => return Err(FactoryError::PoolUpgradeFailed),
+        };
+        if pool_admin != admin {
+            return Err(FactoryError::PoolAdminMismatch);
+        }
+        if new_wasm_hash == record.wasm_hash {
+            return Err(FactoryError::PoolUpgradeFailed);
+        }
+
         let upgrade_args: Vec<Val> = vec![&env, new_wasm_hash.clone().into_val(&env)];
-        let _: () =
-            env.invoke_contract(&record.address, &Symbol::new(&env, "upgrade"), upgrade_args);
+        let upgrade_res = env.try_invoke_contract::<(), soroban_sdk::Error>(
+            &record.address,
+            &Symbol::new(&env, "upgrade"),
+            upgrade_args,
+        );
+        match upgrade_res {
+            Ok(Ok(())) => {}
+            _ => return Err(FactoryError::PoolUpgradeFailed),
+        }
+
+        let old_hash = record.wasm_hash.clone();
+        record.wasm_hash = new_wasm_hash.clone();
+        env.storage().persistent().set(&key, &record);
+
+        let old_wasm_key = DataKey::PoolsByWasmHash(old_hash.clone());
+        if let Some(old_pool_ids) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u32>>(&old_wasm_key)
+        {
+            let mut new_old_ids: Vec<u32> = vec![&env];
+            for id in old_pool_ids.iter() {
+                if id != pool_id {
+                    new_old_ids.push_back(id);
+                }
+            }
+            env.storage().persistent().set(&old_wasm_key, &new_old_ids);
+        }
+
+        let new_wasm_key = DataKey::PoolsByWasmHash(new_wasm_hash.clone());
+        let mut new_pool_ids: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&new_wasm_key)
+            .unwrap_or_else(|| vec![&env]);
+        new_pool_ids.push_back(pool_id);
+        env.storage().persistent().set(&new_wasm_key, &new_pool_ids);
+        bump_wasm_pools(&env, &new_wasm_hash);
+
+        env.storage().instance().set(
+            &DataKey::UpgradeCount,
+            &read_upgrade_count(&env).saturating_add(1),
+        );
 
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("factory"), symbol_short!("pool_upg")),
-            (pool_id, record.address, new_wasm_hash),
+            (pool_id, record.address, old_hash, new_wasm_hash),
         );
 
         Ok(())
+    }
+
+    /// Total number of successful `upgrade_pool` calls performed by this
+    /// factory, for pool-version tracking and analytics (#258).
+    pub fn upgrade_count(env: Env) -> Result<u32, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(read_upgrade_count(&env))
+    }
+
+    /// Aggregate value locked across every pool this factory has created, in
+    /// the pools' staking-asset base units (#249).
+    ///
+    /// This is an O(1) read of an incrementally-maintained accumulator, not a
+    /// live fan-out across pools. Each pool contributes the TVL captured by its
+    /// most recent `sync_pool_tvl` call; `create_pool` seeds a new pool at 0.
+    /// Staking activity between syncs is not reflected until `sync_pool_tvl`
+    /// (or `sync_all_pool_tvls`) runs for that pool. This is deliberate: a
+    /// factory receives no callback from a pool's stake / unstake, and a true
+    /// live sum would need an unbounded cross-contract fan-out that does not
+    /// fit Soroban's per-invocation footprint limit. Dashboards that need a
+    /// fresh figure should run `sync_all_pool_tvls` first.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn total_tvl(env: Env) -> Result<i128, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(read_total_tvl(&env))
+    }
+
+    /// The per-pool TVL term currently folded into `total_tvl` for `pool_id` —
+    /// the value captured by the last `sync_pool_tvl` for this pool, or 0 if it
+    /// has never been synced since creation.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized, or
+    /// `PoolNotFound` if `pool_id` has not been created.
+    pub fn pool_tvl_synced(env: Env, pool_id: u32) -> Result<i128, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        if !env.storage().persistent().has(&DataKey::Pool(pool_id)) {
+            return Err(FactoryError::PoolNotFound);
+        }
+        Ok(read_pool_tvl(&env, pool_id))
+    }
+
+    /// Live TVL of one pool, read straight from the deployed pool contract
+    /// via its `total_staked` getter. Unlike the `total_tvl` accumulator this
+    /// always reflects the pool's current state, at the cost of a
+    /// cross-contract call.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized,
+    /// `PoolNotFound` for an unknown `pool_id`, or `PoolQueryFailed` if the
+    /// deployed pool does not answer the TVL getters.
+    pub fn pool_tvl(env: Env, pool_id: u32) -> Result<i128, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+        query_pool_tvl(&env, &record.address)
+    }
+
+    /// Refresh one pool's contribution to `total_tvl` and return its live TVL.
+    ///
+    /// Permissionless — dashboards, keepers, or the pool's own users can call
+    /// it to keep the aggregate current. Reads the pool's live TVL, adjusts the
+    /// `total_tvl` accumulator by the delta versus this pool's last-synced
+    /// value, and stores the new snapshot. Emits a `tvl_sync` event carrying
+    /// `(pool_id, old_snapshot, new_tvl)` when the value changed.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized,
+    /// `PoolNotFound` for an unknown `pool_id`, or `PoolQueryFailed` if the
+    /// deployed pool does not answer the TVL getters.
+    pub fn sync_pool_tvl(env: Env, pool_id: u32) -> Result<i128, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+        apply_tvl_sync(&env, pool_id, &record.address)
+    }
+
+    /// Batch-refresh a contiguous range of pools' `total_tvl` contributions,
+    /// starting at `start_id` and covering at most
+    /// `min(limit, MAX_POOL_SCAN_PER_CALL)` pool IDs. Pools that fail to answer
+    /// the TVL getters are skipped rather than aborting the batch. Returns the
+    /// next `start_id` to pass for continued paging, or a value `>= pool_count`
+    /// once the registry is exhausted. Permissionless, mirroring
+    /// `refresh_pool_ttls`.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn sync_all_pool_tvls(
+        env: Env,
+        start_id: u32,
+        limit: u32,
+    ) -> Result<u32, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
+        let window = limit.min(MAX_POOL_SCAN_PER_CALL);
+        let end = start_id.saturating_add(window).min(count);
+        let mut pool_id = start_id;
+        while pool_id < end {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            {
+                let _ = apply_tvl_sync(&env, pool_id, &record.address);
+            }
+            pool_id += 1;
+        }
+        Ok(end)
     }
 
     /// Update the WASM hash used for future `create_pool` deployments. Admin-only.
@@ -371,6 +950,8 @@ impl Factory {
     /// Allows the admin to point future pool deployments at a corrected or upgraded
     /// farming-pool build without redeploying the factory itself. Existing deployed
     /// pools are unaffected — Soroban contract bytecode is immutable once deployed.
+    /// Validates that `new_hash` is non-zero. Callers/admins must verify that the target
+    /// WASM has been uploaded to the chain before calling this function.
     ///
     /// Emits a `wasm_set` event with `(old_hash, new_hash)` so that the previous
     /// hash is discoverable off-chain for rollback scenarios.
@@ -380,6 +961,10 @@ impl Factory {
         admin.require_auth();
         bump_instance(&env);
 
+        if new_hash == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(FactoryError::InvalidWasmHash);
+        }
+
         let old_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
         env.storage().instance().set(&DataKey::WasmHash, &new_hash);
         #[allow(deprecated)]
@@ -388,6 +973,54 @@ impl Factory {
             (old_hash, new_hash),
         );
         Ok(())
+    }
+
+    /// Pause pool creation. Admin-only.
+    ///
+    /// Prevents future `create_pool` calls during maintenance or security emergencies.
+    /// Emits a `pause_cr` event.
+    pub fn pause_pool_creation(env: Env) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolCreationPaused, &true);
+        #[allow(deprecated)]
+        env.events()
+            .publish((symbol_short!("factory"), symbol_short!("pause_cr")), admin);
+        Ok(())
+    }
+
+    /// Resume pool creation. Admin-only.
+    ///
+    /// Allows `create_pool` calls after a pause. Emits an `unps_cr` event.
+    pub fn unpause_pool_creation(env: Env) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolCreationPaused, &false);
+        #[allow(deprecated)]
+        env.events()
+            .publish((symbol_short!("factory"), symbol_short!("unps_cr")), admin);
+        Ok(())
+    }
+
+    /// Return whether pool creation is currently paused.
+    pub fn is_pool_creation_paused(env: Env) -> Result<bool, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCreationPaused)
+            .unwrap_or(false))
     }
 
     /// Create, deploy, and initialize a new farming pool. Admin-only.
@@ -410,10 +1043,16 @@ impl Factory {
     /// smallest-diff option that avoids the larger "factory proxies every
     /// admin action" design surface.
     ///
-    /// The `pool_crtd` event includes `asset`, `credit_rate`,
+    /// The `pool_crtd` event includes `admin`, `asset`, `credit_rate`,
     /// `global_multiplier`, and `min_lock_period` alongside `pool_id` and
     /// `pool_address` so off-chain indexers can reconstruct the full pool
-    /// state without a follow-up RPC call.
+    /// state — including who created it — without a follow-up RPC call (#233).
+    ///
+    /// On failure, no event is emitted: a validation failure reverts this
+    /// invocation, and Soroban discards contract events published by reverted
+    /// calls. Callers must handle the returned `FactoryError` directly (and,
+    /// off-chain, can monitor for failed creation attempts via failed
+    /// transaction diagnostics rather than contract events).
     pub fn create_pool(
         env: Env,
         asset: Address,
@@ -424,8 +1063,24 @@ impl Factory {
     ) -> Result<u32, FactoryError> {
         require_initialized(&env)?;
         let admin = load_admin(&env)?;
+        // Reject a zero-address admin before any auth checks to avoid misleading Unauthorized errors.
+        let zero_admin = Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"));
+        if admin == zero_admin {
+            return Err(FactoryError::InvalidAdmin);
+        }
         admin.require_auth();
         bump_instance(&env);
+
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCreationPaused)
+            .unwrap_or(false);
+        if paused {
+            return Err(FactoryError::PoolCreationPaused);
+        }
+
+        validate_asset(&env, &asset)?;
 
         if global_multiplier < 1 {
             return Err(FactoryError::InvalidGlobalMultiplier);
@@ -434,6 +1089,17 @@ impl Factory {
         let min_lock_period: u32 = min_lock_period
             .try_into()
             .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
+        if min_lock_period < MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodTooShort);
+        }
+        let effective_min_stake = if min_stake_amount <= 0 {
+            MIN_STAKE_AMOUNT
+        } else {
+            min_stake_amount
+        };
+        if effective_min_stake < MIN_STAKE_AMOUNT {
+            return Err(FactoryError::InvalidMinStakeAmount);
+        }
 
         let pool_id: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap();
         let next_count = pool_id
@@ -447,7 +1113,7 @@ impl Factory {
         let pool_address = env
             .deployer()
             .with_current_contract(salt)
-            .deploy_v2(wasm_hash, ());
+            .deploy_v2(wasm_hash.clone(), ());
 
         // Call the freshly deployed pool's `initialize` directly via
         // `invoke_contract` rather than depending on the `farming-pool`
@@ -462,7 +1128,7 @@ impl Factory {
             global_multiplier.into_val(&env),
             credit_rate.into_val(&env),
             min_lock_period.into_val(&env),
-            min_stake_amount.into_val(&env),
+            effective_min_stake.into_val(&env),
         ];
         let _: () = env.invoke_contract(&pool_address, &Symbol::new(&env, "initialize"), init_args);
 
@@ -472,11 +1138,41 @@ impl Factory {
             credit_rate,
             global_multiplier,
             min_lock_period,
+            daily_rate,
+            wasm_hash: wasm_hash.clone(),
         };
         env.storage()
             .persistent()
             .set(&DataKey::Pool(pool_id), &record);
         bump_pool(&env, pool_id);
+
+        // A freshly deployed pool holds nothing, so its contribution to
+        // `total_tvl` starts at 0. Recording the baseline explicitly keeps the
+        // first `sync_pool_tvl` a pure delta against a known value (#249).
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolTvl(pool_id), &0i128);
+        bump_pool_tvl(&env, pool_id);
+
+        let asset_key = DataKey::AssetPools(asset.clone());
+        let mut asset_pool_ids: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&asset_key)
+            .unwrap_or_else(|| vec![&env]);
+        asset_pool_ids.push_back(pool_id);
+        env.storage().persistent().set(&asset_key, &asset_pool_ids);
+        bump_asset_pools(&env, &asset);
+
+        let admin_key = DataKey::PoolsByAdmin(admin.clone());
+        let mut admin_pool_ids: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&admin_key)
+            .unwrap_or_else(|| vec![&env]);
+        admin_pool_ids.push_back(pool_id);
+        env.storage().persistent().set(&admin_key, &admin_pool_ids);
+        bump_admin_pools(&env, &admin);
         env.storage()
             .instance()
             .set(&DataKey::PoolCount, &next_count);
@@ -488,10 +1184,13 @@ impl Factory {
             (
                 pool_id,
                 pool_address,
+                admin,
                 asset,
                 credit_rate,
                 global_multiplier,
                 min_lock_period,
+                daily_rate,
+                wasm_hash,
             ),
         );
 

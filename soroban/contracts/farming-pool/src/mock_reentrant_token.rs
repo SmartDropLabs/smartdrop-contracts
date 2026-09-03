@@ -21,6 +21,11 @@ enum DataKey {
     Target,
     ReentrantUser,
     ReentryWasRejected,
+    /// Overrides which function `transfer` reenters with, set via
+    /// `configure_reentrant_call`. Absent by default, in which case
+    /// `transfer` falls back to calling `get_user_position(reentrant_user)`,
+    /// preserving every existing caller's behavior unchanged.
+    ReentrantCall,
 }
 
 #[contract]
@@ -38,22 +43,43 @@ impl MockReentrantToken {
             .set(&DataKey::ReentrantUser, &reentrant_user);
     }
 
+    /// Overrides the function `transfer` attempts to reenter with —
+    /// `function`/`args` are invoked on `target` instead of the default
+    /// `get_user_position(reentrant_user)`. Lets a test target the *same*
+    /// state-mutating function currently executing (e.g. `unlock_assets`
+    /// reentering `unlock_assets`) rather than only a read-only getter,
+    /// which more directly validates protection against the realistic
+    /// worst-case reentry attempt (#128). Call after `configure`.
+    pub fn configure_reentrant_call(env: Env, function: Symbol, args: Vec<Val>) {
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrantCall, &(function, args));
+    }
+
     /// Matches the token interface's `transfer(from, to, amount)` exactly —
     /// this is the only function `token::TokenClient::transfer` invokes.
     pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
         let target: Address = env.storage().instance().get(&DataKey::Target).unwrap();
-        let reentrant_user: Address = env
+        let (function, args): (Symbol, Vec<Val>) = match env
             .storage()
             .instance()
-            .get(&DataKey::ReentrantUser)
-            .unwrap();
+            .get::<_, (Symbol, Vec<Val>)>(&DataKey::ReentrantCall)
+        {
+            Some(call) => call,
+            None => {
+                let reentrant_user: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::ReentrantUser)
+                    .unwrap();
+                (
+                    Symbol::new(&env, "get_user_position"),
+                    soroban_sdk::vec![&env, reentrant_user.into_val(&env)],
+                )
+            }
+        };
 
-        let args: Vec<Val> = soroban_sdk::vec![&env, reentrant_user.into_val(&env)];
-        let result = env.try_invoke_contract::<Val, soroban_sdk::Error>(
-            &target,
-            &Symbol::new(&env, "get_user_position"),
-            args,
-        );
+        let result = env.try_invoke_contract::<Val, soroban_sdk::Error>(&target, &function, args);
 
         // Ok(_) means the reentrant call actually went through (host allowed
         // it); Err(_) covers both a typed contract error and the host
@@ -93,17 +119,36 @@ impl MockNaiveReentrantToken {
             .set(&DataKey::ReentrantUser, &reentrant_user);
     }
 
+    /// See [`MockReentrantToken::configure_reentrant_call`].
+    pub fn configure_reentrant_call(env: Env, function: Symbol, args: Vec<Val>) {
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrantCall, &(function, args));
+    }
+
     pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
         let target: Address = env.storage().instance().get(&DataKey::Target).unwrap();
-        let reentrant_user: Address = env
+        let (function, args): (Symbol, Vec<Val>) = match env
             .storage()
             .instance()
-            .get(&DataKey::ReentrantUser)
-            .unwrap();
+            .get::<_, (Symbol, Vec<Val>)>(&DataKey::ReentrantCall)
+        {
+            Some(call) => call,
+            None => {
+                let reentrant_user: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::ReentrantUser)
+                    .unwrap();
+                (
+                    Symbol::new(&env, "get_user_position"),
+                    soroban_sdk::vec![&env, reentrant_user.into_val(&env)],
+                )
+            }
+        };
 
-        let args: Vec<Val> = soroban_sdk::vec![&env, reentrant_user.into_val(&env)];
         // No try_invoke_contract here — a rejected reentry traps this call
         // (and the whole transaction) immediately.
-        let _: Val = env.invoke_contract(&target, &Symbol::new(&env, "get_user_position"), args);
+        let _: Val = env.invoke_contract(&target, &function, args);
     }
 }

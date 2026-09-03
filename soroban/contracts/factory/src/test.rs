@@ -30,19 +30,52 @@ mod farming_pool_wasm {
     soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/farming_pool.wasm");
 }
 
-/// A distinct, valid contract WASM used to prove that `upgrade_pool` changes
-/// the registered pool's executable hash rather than merely re-installing its
-/// current farming-pool WASM.
-mod replacement_wasm {
-    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/factory.wasm");
-}
+const ADD_I32_WASM: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x10, 0x03, 0x60, 0x02, 0x7e, 0x7e, 0x01,
+    0x7e, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7e, 0x60, 0x00, 0x00, 0x02, 0x0d, 0x02, 0x01, 0x78, 0x01,
+    0x31, 0x00, 0x00, 0x01, 0x76, 0x01, 0x67, 0x00, 0x00, 0x03, 0x04, 0x03, 0x00, 0x01, 0x02, 0x05,
+    0x03, 0x01, 0x00, 0x10, 0x06, 0x19, 0x03, 0x7f, 0x01, 0x41, 0x80, 0x80, 0xc0, 0x00, 0x0b, 0x7f,
+    0x00, 0x41, 0x80, 0x80, 0xc0, 0x00, 0x0b, 0x7f, 0x00, 0x41, 0x80, 0x80, 0xc0, 0x00, 0x0b, 0x07,
+    0x2f, 0x05, 0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00, 0x03, 0x61, 0x64, 0x64, 0x00,
+    0x02, 0x01, 0x5f, 0x00, 0x04, 0x0a, 0x5f, 0x5f, 0x64, 0x61, 0x74, 0x61, 0x5f, 0x65, 0x6e, 0x64,
+    0x03, 0x01, 0x0b, 0x5f, 0x5f, 0x68, 0x65, 0x61, 0x70, 0x5f, 0x62, 0x61, 0x73, 0x65, 0x03, 0x02,
+    0x0a, 0xe3, 0x01, 0x03, 0xc5, 0x01, 0x02, 0x04, 0x7f, 0x01, 0x7e, 0x23, 0x00, 0x41, 0x20, 0x6b,
+    0x22, 0x03, 0x24, 0x00, 0x02, 0x40, 0x20, 0x00, 0x42, 0xff, 0x01, 0x83, 0x42, 0x05, 0x52, 0x20,
+    0x01, 0x42, 0xff, 0x01, 0x83, 0x42, 0x05, 0x52, 0x72, 0x45, 0x04, 0x40, 0x20, 0x00, 0x42, 0x20,
+    0x88, 0xa7, 0x21, 0x04, 0x20, 0x01, 0x42, 0x20, 0x88, 0xa7, 0x21, 0x05, 0x20, 0x03, 0x42, 0x8e,
+    0xd2, 0xa9, 0x13, 0x37, 0x03, 0x08, 0x42, 0x02, 0x21, 0x06, 0x41, 0x01, 0x21, 0x02, 0x03, 0x40,
+    0x20, 0x02, 0x04, 0x40, 0x20, 0x02, 0x41, 0x01, 0x6b, 0x21, 0x02, 0x42, 0x8e, 0xd2, 0xa9, 0x13,
+    0x21, 0x06, 0x0c, 0x01, 0x0b, 0x0b, 0x20, 0x03, 0x20, 0x06, 0x37, 0x03, 0x10, 0x20, 0x03, 0x41,
+    0x10, 0x6a, 0x22, 0x02, 0x41, 0x01, 0x10, 0x03, 0x20, 0x03, 0x20, 0x01, 0x42, 0x80, 0x80, 0x80,
+    0x80, 0x70, 0x83, 0x42, 0x05, 0x84, 0x37, 0x03, 0x18, 0x20, 0x03, 0x20, 0x00, 0x42, 0x80, 0x80,
+    0x80, 0x80, 0x70, 0x83, 0x42, 0x05, 0x84, 0x37, 0x03, 0x10, 0x20, 0x02, 0x41, 0x02, 0x10, 0x03,
+    0x10, 0x00, 0x1a, 0x20, 0x05, 0x41, 0x00, 0x48, 0x20, 0x04, 0x20, 0x05, 0x6a, 0x22, 0x02, 0x20,
+    0x04, 0x48, 0x47, 0x0d, 0x01, 0x20, 0x03, 0x41, 0x20, 0x6a, 0x24, 0x00, 0x20, 0x02, 0xad, 0x42,
+    0x20, 0x86, 0x42, 0x05, 0x84, 0x0f, 0x0b, 0x00, 0x0b, 0x00, 0x0b, 0x16, 0x00, 0x20, 0x00, 0xad,
+    0x42, 0x20, 0x86, 0x42, 0x04, 0x84, 0x20, 0x01, 0xad, 0x42, 0x20, 0x86, 0x42, 0x04, 0x84, 0x10,
+    0x01, 0x0b, 0x03, 0x00, 0x01, 0x0b, 0x00, 0x4b, 0x0e, 0x63, 0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63,
+    0x74, 0x73, 0x70, 0x65, 0x63, 0x76, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x01, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x01, 0x62, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x00, 0x00, 0x05, 0x00, 0x1e, 0x11, 0x63, 0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63, 0x74, 0x65, 0x6e,
+    0x76, 0x6d, 0x65, 0x74, 0x61, 0x76, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x73, 0x0e, 0x63, 0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63, 0x74, 0x6d, 0x65,
+    0x74, 0x61, 0x76, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x72, 0x73, 0x76, 0x65,
+    0x72, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x31, 0x2e, 0x37, 0x34, 0x2e, 0x30, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x72, 0x73, 0x73, 0x64, 0x6b, 0x76, 0x65, 0x72,
+    0x00, 0x00, 0x00, 0x33, 0x32, 0x30, 0x2e, 0x30, 0x2e, 0x30, 0x2d, 0x72, 0x63, 0x32, 0x23, 0x37,
+    0x63, 0x31, 0x35, 0x34, 0x62, 0x34, 0x66, 0x65, 0x36, 0x61, 0x33, 0x37, 0x64, 0x37, 0x63, 0x61,
+    0x37, 0x31, 0x37, 0x37, 0x33, 0x34, 0x32, 0x64, 0x65, 0x64, 0x62, 0x36, 0x39, 0x66, 0x33, 0x31,
+    0x30, 0x38, 0x30, 0x39, 0x35, 0x65, 0x66, 0x00,
+];
 
 fn upload_farming_pool_wasm(env: &Env) -> BytesN<32> {
     env.deployer().upload_contract_wasm(farming_pool_wasm::WASM)
 }
 
 fn upload_replacement_wasm(env: &Env) -> BytesN<32> {
-    env.deployer().upload_contract_wasm(replacement_wasm::WASM)
+    env.deployer().upload_contract_wasm(ADD_I32_WASM)
 }
 
 /// Builds an initialised factory using the real farming-pool WASM.
@@ -96,6 +129,8 @@ fn setup_with_pool_records(count: u32) -> TestEnv {
                 credit_rate: 100 + pool_id as i128,
                 global_multiplier: 1 + pool_id,
                 min_lock_period: 10 + pool_id,
+                daily_rate: (100 + pool_id as u128) * 17280,
+                wasm_hash: soroban_sdk::BytesN::from_array(&t.env, &[0; 32]),
             };
             t.env
                 .storage()
@@ -149,6 +184,23 @@ fn test_double_initialize_returns_error() {
     assert_eq!(
         t.client.try_initialize(&t.admin, &t.wasm_hash),
         Err(Ok(FactoryError::AlreadyInitialized))
+    );
+}
+
+#[test]
+fn test_initialize_rejects_zero_address_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let wasm_hash = upload_farming_pool_wasm(&env);
+    let factory_addr = env.register(Factory, ());
+    let client = FactoryClient::new(&env, &factory_addr);
+    let zero_admin = Address::from_string(&soroban_sdk::String::from_str(
+        &env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+    assert_eq!(
+        client.try_initialize(&zero_admin, &wasm_hash),
+        Err(Ok(FactoryError::InvalidAdmin))
     );
 }
 
@@ -247,6 +299,27 @@ fn test_pool_wasm_hash_returns_stored_hash() {
     assert_eq!(t.client.pool_wasm_hash(), t.wasm_hash);
 }
 
+#[test]
+fn test_initialize_rejects_zero_wasm_hash() {
+    let (env, client) = setup_uninitialized();
+    let admin = Address::generate(&env);
+    let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+    assert_eq!(
+        client.try_initialize(&admin, &zero_hash),
+        Err(Ok(FactoryError::InvalidWasmHash))
+    );
+}
+
+#[test]
+fn test_set_pool_wasm_hash_rejects_zero_hash() {
+    let t = setup();
+    let zero_hash = BytesN::from_array(&t.env, &[0u8; 32]);
+    assert_eq!(
+        t.client.try_set_pool_wasm_hash(&zero_hash),
+        Err(Ok(FactoryError::InvalidWasmHash))
+    );
+}
+
 // ── pool_count ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -274,6 +347,7 @@ fn test_list_pools_returns_first_page() {
     assert_eq!(page.records.len(), 10);
     assert_eq!(page.next_start_id, 10);
     assert_eq!(page.total, 25);
+    assert!(page.has_more);
 
     assert_eq!(
         page.records
@@ -297,6 +371,7 @@ fn test_list_pools_returns_second_page() {
     assert_eq!(page.records.len(), 10);
     assert_eq!(page.next_start_id, 20);
     assert_eq!(page.total, 25);
+    assert!(page.has_more);
     assert_eq!(page.records.get(0).map(|record| record.0), Some(10));
     assert_eq!(page.records.get(9).map(|record| record.0), Some(19));
 }
@@ -309,6 +384,7 @@ fn test_list_pools_returns_partial_last_page() {
     assert_eq!(page.records.len(), 5);
     assert_eq!(page.next_start_id, 25);
     assert_eq!(page.total, 25);
+    assert!(!page.has_more);
     assert_eq!(page.records.get(0).map(|record| record.0), Some(20));
     assert_eq!(page.records.get(4).map(|record| record.0), Some(24));
 }
@@ -321,6 +397,18 @@ fn test_list_pools_returns_empty_when_start_is_beyond_count() {
     assert_eq!(page.records.len(), 0);
     assert_eq!(page.next_start_id, 3);
     assert_eq!(page.total, 3);
+    assert!(!page.has_more);
+}
+
+#[test]
+fn test_list_pools_returns_empty_when_start_equals_count() {
+    let t = setup_with_pool_records(3);
+    let page = t.client.list_pools(&3u32, &5u32);
+
+    assert_eq!(page.records.len(), 0);
+    assert_eq!(page.next_start_id, 3);
+    assert_eq!(page.total, 3);
+    assert!(!page.has_more);
 }
 
 #[test]
@@ -331,7 +419,25 @@ fn test_list_pools_caps_limit_at_twenty() {
     assert_eq!(page.records.len(), 20);
     assert_eq!(page.next_start_id, 20);
     assert_eq!(page.total, 25);
+    assert!(page.has_more);
     assert_eq!(page.records.get(19).map(|record| record.0), Some(19));
+}
+
+#[test]
+fn test_list_pools_has_more_flag_accuracy() {
+    let t = setup_with_pool_records(5);
+
+    // First page (limit 3 of 5) -> has_more is true
+    let page1 = t.client.list_pools(&0u32, &3u32);
+    assert_eq!(page1.records.len(), 3);
+    assert_eq!(page1.next_start_id, 3);
+    assert!(page1.has_more);
+
+    // Next page (start 3, limit 3 of 5) -> has_more is false (reaches end: 5)
+    let page2 = t.client.list_pools(&page1.next_start_id, &3u32);
+    assert_eq!(page2.records.len(), 2);
+    assert_eq!(page2.next_start_id, 5);
+    assert!(!page2.has_more);
 }
 
 // ── get_pools_by_asset ────────────────────────────────────────────────────────
@@ -461,7 +567,13 @@ fn test_upgrade_pool_hot_swaps_registered_pool_without_changing_factory_hash() {
                     symbol_short!("factory").into_val(&t.env),
                     symbol_short!("pool_upg").into_val(&t.env),
                 ],
-                (pool_id, pool_addr.clone(), new_wasm_hash.clone()).into_val(&t.env),
+                (
+                    pool_id,
+                    pool_addr.clone(),
+                    t.wasm_hash.clone(),
+                    new_wasm_hash.clone()
+                )
+                    .into_val(&t.env),
             )
         ]
     );
@@ -477,6 +589,23 @@ fn test_upgrade_pool_hot_swaps_registered_pool_without_changing_factory_hash() {
     );
     let record = t.client.get_pool(&pool_id);
     assert_eq!(record.address, pool_addr);
+}
+
+#[test]
+fn test_upgrade_pool_same_hash_returns_pool_upgrade_failed() {
+    let t = setup();
+    let pool_id = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &10u64,
+        &0i128,
+    );
+
+    assert_eq!(
+        t.client.try_upgrade_pool(&pool_id, &t.wasm_hash),
+        Err(Ok(FactoryError::PoolUpgradeFailed))
+    );
 }
 
 #[test]
@@ -518,6 +647,41 @@ fn test_upgrade_pool_requires_factory_admin_auth() {
         .try_upgrade_pool(&pool_id, &new_wasm_hash);
 
     assert!(result.is_err(), "only the factory admin may upgrade pools");
+}
+
+#[contract]
+struct NonUpgradableContract;
+
+#[contractimpl]
+impl NonUpgradableContract {
+    pub fn dummy(_env: Env) -> bool {
+        true
+    }
+}
+
+#[test]
+fn test_upgrade_pool_non_upgradable_pool_returns_pool_upgrade_failed() {
+    let t = setup();
+    let non_upgradable_addr = t.env.register(NonUpgradableContract, ());
+    let fake_record = PoolRecord {
+        address: non_upgradable_addr,
+        asset: Address::generate(&t.env),
+        credit_rate: 100,
+        global_multiplier: 1,
+        min_lock_period: 10,
+        daily_rate: 100 * 17280,
+        wasm_hash: soroban_sdk::BytesN::from_array(&t.env, &[0; 32]),
+    };
+    t.env.as_contract(&t.factory_addr, || {
+        t.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Pool(99), &fake_record);
+    });
+
+    let new_wasm_hash = upload_replacement_wasm(&t.env);
+    let result = t.client.try_upgrade_pool(&99u32, &new_wasm_hash);
+    assert_eq!(result, Err(Ok(FactoryError::PoolUpgradeFailed)));
 }
 
 // ── create_pool auth gate ─────────────────────────────────────────────────────
@@ -694,6 +858,126 @@ fn test_get_pools_by_asset_paginates_large_matching_registry() {
 }
 
 #[test]
+fn test_get_pools_by_asset_bounds_scan_for_sparse_matches() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let wasm_hash = upload_farming_pool_wasm(&env);
+    let factory_addr = env.register(Factory, ());
+    let client = FactoryClient::new(&env, &factory_addr);
+    client.initialize(&admin, &wasm_hash);
+
+    let sparse_asset = Address::generate(&env);
+    let other_asset = Address::generate(&env);
+    for i in 0..500 {
+        let asset = if i == 499 {
+            sparse_asset.clone()
+        } else {
+            other_asset.clone()
+        };
+        client.create_pool(
+            &asset,
+            &(1_728_000 + i as u128 * 17_280),
+            &2u32,
+            &(10 + i as u64),
+            &0i128,
+        );
+    }
+
+    let page = client.get_pools_by_asset(&sparse_asset, &0u32, &20u32);
+
+    assert_eq!(page.records.len(), 0);
+    assert_eq!(page.next_start_id, 50);
+    assert_eq!(page.total, 500);
+}
+
+#[test]
+fn test_get_pools_by_asset_can_page_sparse_matches_to_completion() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let wasm_hash = upload_farming_pool_wasm(&env);
+    let factory_addr = env.register(Factory, ());
+    let client = FactoryClient::new(&env, &factory_addr);
+    client.initialize(&admin, &wasm_hash);
+
+    let sparse_asset = Address::generate(&env);
+    let other_asset = Address::generate(&env);
+    for i in 0..500 {
+        let asset = if i == 250 || i == 499 {
+            sparse_asset.clone()
+        } else {
+            other_asset.clone()
+        };
+        client.create_pool(
+            &asset,
+            &(1_728_000 + i as u128 * 17_280),
+            &2u32,
+            &(10 + i as u64),
+            &0i128,
+        );
+    }
+
+    let mut start_id = 0u32;
+    let mut found_ids: Vec<u32> = vec![&env];
+
+    loop {
+        let page = client.get_pools_by_asset(&sparse_asset, &start_id, &20u32);
+        for idx in 0..page.records.len() {
+            found_ids.push_back(page.records.get(idx).unwrap().0);
+        }
+        if page.next_start_id == page.total {
+            break;
+        }
+        start_id = page.next_start_id;
+    }
+
+    assert_eq!(found_ids.len(), 2);
+    assert_eq!(found_ids.get(0), Some(250));
+    assert_eq!(found_ids.get(1), Some(499));
+}
+
+#[test]
+fn test_get_pools_by_asset_range_custom_scan_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let wasm_hash = upload_farming_pool_wasm(&env);
+    let factory_addr = env.register(Factory, ());
+    let client = FactoryClient::new(&env, &factory_addr);
+    client.initialize(&admin, &wasm_hash);
+
+    let sparse_asset = Address::generate(&env);
+    let other_asset = Address::generate(&env);
+    for i in 0..100 {
+        let asset = if i == 90 {
+            sparse_asset.clone()
+        } else {
+            other_asset.clone()
+        };
+        client.create_pool(
+            &asset,
+            &(1_728_000 + i as u128 * 17_280),
+            &2u32,
+            &(10 + i as u64),
+            &0i128,
+        );
+    }
+
+    // With a scan_limit of 50, first call should only scan 0..50
+    let page1 = client.get_pools_by_asset_range(&sparse_asset, &0u32, &50u32, &20u32);
+    assert_eq!(page1.records.len(), 0);
+    assert_eq!(page1.next_start_id, 50);
+
+    // Second call scanning 50..100 should find the match at 90
+    let page2 =
+        client.get_pools_by_asset_range(&sparse_asset, &page1.next_start_id, &50u32, &20u32);
+    assert_eq!(page2.records.len(), 1);
+    assert_eq!(page2.records.get(0).unwrap().0, 90);
+    assert_eq!(page2.next_start_id, 100);
+}
+
+#[test]
 fn test_create_pool_emits_pool_crtd_event() {
     let env = Env::default();
     env.mock_all_auths();
@@ -849,14 +1133,35 @@ fn test_create_pool_rejects_zero_daily_rate() {
 }
 
 #[test]
-fn test_create_pool_rejects_daily_rate_below_ledgers_per_day() {
+fn test_create_pool_rejects_dust_minimum_stake() {
     let t = setup();
     let asset = Address::generate(&t.env);
 
     let result = t
         .client
-        .try_create_pool(&asset, &17_279u128, &2u32, &25u64, &0i128);
-    assert_eq!(result, Err(Ok(FactoryError::InvalidCreditRate)));
+        .try_create_pool(&asset, &1_728_000u128, &2u32, &25u64, &1i128);
+
+    assert_eq!(result, Err(Ok(FactoryError::InvalidMinStakeAmount)));
+    assert_eq!(t.client.pool_count(), 0);
+}
+
+#[test]
+fn test_create_pool_accepts_daily_rate_below_ledgers_per_day_with_ceiling_rounding() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+
+    // Before #148 the daily_rate -> credit_rate conversion truncated, so a
+    // sub-LEDGERS_PER_DAY daily_rate (17_279) became 0 and was rejected. Now it
+    // uses ceiling division, so it rounds up to credit_rate = 1 and the pool is
+    // created successfully.
+    let pool_id = t
+        .client
+        .create_pool(&asset, &17_279u128, &2u32, &25u64, &0i128);
+    assert_eq!(pool_id, 0);
+
+    let pool_addr = t.client.get_pool(&pool_id).address;
+    let pool = FarmingPoolClient::new(&t.env, &pool_addr);
+    assert_eq!(pool.credit_rate(), 1);
 }
 
 #[test]
@@ -903,6 +1208,26 @@ fn test_get_pool_bumps_pool_record_ttl() {
 }
 
 #[test]
+fn test_list_pools_bumps_pool_record_ttl() {
+    let t = setup();
+    let id = t.client.create_pool(
+        &Address::generate(&t.env),
+        &4_320_000u128,
+        &2u32,
+        &50u64,
+        &0i128,
+    );
+
+    assert_eq!(pool_record_ttl(&t.env, &t.factory_addr, id), TTL_EXTEND_TO);
+
+    advance_ledgers(&t.env, TTL_EXTEND_TO - TTL_THRESHOLD + 1);
+    assert!(pool_record_ttl(&t.env, &t.factory_addr, id) < TTL_THRESHOLD);
+
+    assert!(t.client.try_list_pools(&id, &1u32).is_ok());
+    assert_eq!(pool_record_ttl(&t.env, &t.factory_addr, id), TTL_EXTEND_TO);
+}
+
+#[test]
 fn test_refresh_pool_ttls_restores_ttl_for_unqueried_pool() {
     let t = setup();
     let id = t.client.create_pool(
@@ -928,6 +1253,34 @@ fn test_refresh_pool_ttls_restores_ttl_for_unqueried_pool() {
 }
 
 #[test]
+fn test_refresh_pool_ttls_stays_permissionless_for_any_caller() {
+    // #168: refresh_pool_ttls remains callable by anyone — the keep-alive
+    // mechanism must not be gated behind the admin, otherwise a factory whose
+    // only lifeline relies on a single admin becomes a single point of failure.
+    let t = setup_with_pool_records(3);
+    let stranger = Address::generate(&t.env);
+    // No admin auth provided at all: assert the refresh still succeeds.
+    assert_eq!(t.client.try_refresh_pool_ttls(&0u32, &3u32), Ok(Ok(())));
+    assert_eq!(
+        pool_record_ttl(&t.env, &t.factory_addr, 1),
+        TTL_EXTEND_TO,
+        "stranger-triggered keep-alive must still extend TTLs"
+    );
+    // Sanity: the stranger address is not the admin.
+    assert_ne!(t.client.admin(), stranger);
+}
+
+#[test]
+fn test_refresh_pool_ttls_requires_initialized_factory() {
+    // #168: an uninitialized factory has no registry to keep alive, so the
+    // permissionless refresh entry point must reject the call with a typed
+    // error rather than silently bumping instance state.
+    let (_env, client) = setup_uninitialized();
+    let result = client.try_refresh_pool_ttls(&0u32, &20u32);
+    assert!(matches!(result, Err(Ok(FactoryError::NotInitialized))));
+}
+
+#[test]
 fn test_create_pool_emits_pool_crtd_event_with_payload() {
     let t = setup();
     let asset = Address::generate(&t.env);
@@ -947,7 +1300,18 @@ fn test_create_pool_emits_pool_crtd_event_with_payload() {
                     symbol_short!("factory").into_val(&t.env),
                     symbol_short!("pool_crtd").into_val(&t.env),
                 ],
-                (id, expected_address, asset, 300i128, 2u32, 30u32).into_val(&t.env),
+                (
+                    id,
+                    expected_address,
+                    t.admin.clone(),
+                    asset,
+                    300i128,
+                    2u32,
+                    30u32,
+                    5_184_000u128,
+                    t.wasm_hash.clone()
+                )
+                    .into_val(&t.env),
             )
         ]
     );
@@ -1028,4 +1392,145 @@ fn test_create_pool_initializes_real_farming_pool_atomically() {
     // The pool must already be initialized: an initialized-only getter must
     // succeed and return the factory's admin, not panic with NotInitialized.
     assert_eq!(pool_client.admin(), admin);
+}
+
+// ── pause_pool_creation tests ──────────────────────────────────────────────────
+
+#[test]
+fn test_pause_pool_creation_prevents_create_pool() {
+    let t = setup();
+    assert!(!t.client.is_pool_creation_paused());
+
+    t.client.pause_pool_creation();
+    assert!(t.client.is_pool_creation_paused());
+
+    let asset = Address::generate(&t.env);
+    let result = t
+        .client
+        .try_create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+
+    assert!(matches!(result, Err(Ok(FactoryError::PoolCreationPaused))));
+}
+
+#[test]
+fn test_unpause_pool_creation_allows_create_pool() {
+    let t = setup();
+    t.client.pause_pool_creation();
+    assert!(t.client.is_pool_creation_paused());
+
+    t.client.unpause_pool_creation();
+    assert!(!t.client.is_pool_creation_paused());
+
+    let asset = Address::generate(&t.env);
+    let pool_id = t
+        .client
+        .create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+    assert_eq!(pool_id, 0);
+}
+
+#[test]
+fn test_pause_pool_creation_requires_admin_auth() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+
+    let result = t
+        .client
+        .mock_auths(&[MockAuth {
+            address: &user,
+            invoke: &MockAuthInvoke {
+                contract: &t.factory_addr,
+                fn_name: "pause_pool_creation",
+                args: ().into_val(&t.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_pause_pool_creation();
+
+    assert!(
+        result.is_err(),
+        "non-admin pause_pool_creation must be rejected"
+    );
+}
+
+#[test]
+fn test_admin_transfer_count_increments_on_transfer() {
+    let t = setup();
+    assert_eq!(t.client.admin_transfer_count(), 0);
+    assert_eq!(t.client.get_admin_transfer_count(), 0);
+
+    let new_admin = Address::generate(&t.env);
+    t.client.transfer_admin(&new_admin);
+    assert_eq!(t.client.admin_transfer_count(), 1);
+    assert_eq!(t.client.get_admin_transfer_count(), 1);
+
+    let next_admin = Address::generate(&t.env);
+    t.client.transfer_admin(&next_admin);
+    assert_eq!(t.client.admin_transfer_count(), 2);
+    assert_eq!(t.client.get_admin_transfer_count(), 2);
+
+    // Rejected non-admin attempt does not increment
+    let unauthorized = Address::generate(&t.env);
+    let candidate = Address::generate(&t.env);
+    let args = (&candidate,).into_val(&t.env);
+    let invoke = MockAuthInvoke {
+        contract: &t.factory_addr,
+        fn_name: "transfer_admin",
+        args,
+        sub_invokes: &[],
+    };
+    let result = t
+        .client
+        .mock_auths(&[MockAuth {
+            address: &unauthorized,
+            invoke: &invoke,
+        }])
+        .try_transfer_admin(&candidate);
+    assert!(result.is_err());
+    assert_eq!(t.client.admin_transfer_count(), 2);
+}
+
+#[test]
+fn test_get_pools_by_admin_returns_created_pools() {
+    let t = setup();
+    assert_eq!(t.client.get_pools_by_admin(&t.admin), vec![&t.env]);
+
+    let asset1 = Address::generate(&t.env);
+    let id1 = t
+        .client
+        .create_pool(&asset1, &1_728_000u128, &2u32, &10u64, &0i128);
+
+    let asset2 = Address::generate(&t.env);
+    let id2 = t
+        .client
+        .create_pool(&asset2, &3_456_000u128, &2u32, &20u64, &0i128);
+
+    let pools = t.client.get_pools_by_admin(&t.admin);
+    assert_eq!(pools, vec![&t.env, id1, id2]);
+}
+
+#[test]
+fn test_get_admin_pool_count_tracks_pools_created_by_admin() {
+    let t = setup();
+    assert_eq!(t.client.get_admin_pool_count(&t.admin), 0);
+
+    let asset1 = Address::generate(&t.env);
+    t.client
+        .create_pool(&asset1, &1_728_000u128, &2u32, &10u64, &0i128);
+    assert_eq!(t.client.get_admin_pool_count(&t.admin), 1);
+
+    let asset2 = Address::generate(&t.env);
+    t.client
+        .create_pool(&asset2, &3_456_000u128, &2u32, &20u64, &0i128);
+    assert_eq!(t.client.get_admin_pool_count(&t.admin), 2);
+
+    let other_admin = Address::generate(&t.env);
+    assert_eq!(t.client.get_admin_pool_count(&other_admin), 0);
+}
+
+#[test]
+fn test_get_admin_pool_count_uninitialized_returns_not_initialized() {
+    let (_env, client) = setup_uninitialized();
+    let admin = Address::generate(&_env);
+    let result = client.try_get_admin_pool_count(&admin);
+    assert!(matches!(result, Err(Ok(FactoryError::NotInitialized))));
 }

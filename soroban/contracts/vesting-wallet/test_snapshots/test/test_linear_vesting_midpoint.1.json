@@ -269,6 +269,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "Funder"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "ReleasedAmount"
                           }
                         ]
