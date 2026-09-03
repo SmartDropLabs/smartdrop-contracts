@@ -550,6 +550,13 @@ fn test_boost_can_be_updated_repeatedly_without_losing_credits() {
 }
 
 #[test]
+fn test_set_boost_rejects_without_active_stake() {
+    let t = setup(2, 1);
+    let res = t.client.try_set_boost(&t.user, &50u32);
+    assert_eq!(res, Err(Ok(PoolError::NoActiveStake)));
+}
+
+#[test]
 fn test_set_boost_rejects_zero_allocation() {
     // Soroban host wraps contract panics in HostError; use try_ client variants to inspect them.
     let t = setup(2, 1);
@@ -933,9 +940,9 @@ fn test_flash_stake_unstake_in_same_ledger_yields_no_credits() {
     // credits, i.e. flash-staking provides no reward and no leverage.
     let t = setup(2, 1);
     let initial_balance = t.token.balance(&t.user);
-    t.client.set_boost(&t.user, &100u32);
 
     t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &100u32);
     let credits = t.client.unstake(&t.user);
 
     assert_eq!(credits, 0, "flash staking must not mint credits");
@@ -1376,7 +1383,26 @@ fn test_lock_assets_emits_event() {
                     soroban_sdk::symbol_short!("pool").into_val(&t.env),
                     soroban_sdk::symbol_short!("locked").into_val(&t.env)
                 ],
-                (t.user.clone(), 1_000i128, 0u32).into_val(&t.env),
+                (t.user.clone(), 1_000i128, 1_000i128).into_val(&t.env),
+            )
+        ]
+    );
+
+    // Top up with another 500 tokens; event should include 500 as lock amount and 1500 as total position.
+    // Soroban test env only retains the most recent invocation's events.
+    t.client.lock_assets(&t.user, &500);
+    assert_eq!(
+        t.env.events().all().filter_by_contract(&t.contract_id),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("locked").into_val(&t.env)
+                ],
+                (t.user.clone(), 500i128, 1_500i128).into_val(&t.env),
             )
         ]
     );
@@ -3139,6 +3165,67 @@ fn test_checkpoint_emits_chkpt_event() {
 
     let events = t.env.events().all().filter_by_contract(&t.contract_id);
     assert_ne!(events, soroban_sdk::vec![&t.env]);
+}
+
+#[test]
+fn test_active_stake_count_lifecycle() {
+    let t = setup(1, 10);
+    assert_eq!(t.client.active_stake_count(), 0);
+    assert_eq!(t.client.get_active_stake_count(), 0);
+
+    let user2 = Address::generate(&t.env);
+    t.token_sac.mint(&user2, &10_000);
+
+    // User 1 stakes: active_stake_count becomes 1
+    t.client.stake(&t.user, &1_000);
+    assert_eq!(t.client.active_stake_count(), 1);
+    assert_eq!(t.client.get_active_stake_count(), 1);
+
+    // User 1 stakes more (top up): active_stake_count remains 1
+    t.client.stake(&t.user, &500);
+    assert_eq!(t.client.active_stake_count(), 1);
+
+    // User 2 stakes: active_stake_count becomes 2
+    t.client.stake(&user2, &2_000);
+    assert_eq!(t.client.active_stake_count(), 2);
+
+    // User 3 locks position: locked position does not increment active_stake_count
+    let user3 = Address::generate(&t.env);
+    t.token_sac.mint(&user3, &10_000);
+    t.client.lock_assets(&user3, &1_000);
+    assert_eq!(t.client.active_stake_count(), 2);
+
+    // User 1 unstakes: active_stake_count becomes 1
+    t.client.unstake(&t.user);
+    assert_eq!(t.client.active_stake_count(), 1);
+
+    // Pool pauses, User 2 emergency withdraws: active_stake_count becomes 0
+    t.client.pause();
+    t.client.emergency_withdraw(&user2);
+    assert_eq!(t.client.active_stake_count(), 0);
+    assert_eq!(t.client.get_active_stake_count(), 0);
+}
+
+#[test]
+fn test_credit_rate_change_count_tracking() {
+    let t = setup(1, 10);
+    assert_eq!(t.client.credit_rate_change_count(), 0);
+    assert_eq!(t.client.get_credit_rate_change_count(), 0);
+
+    // First rate change
+    t.client.set_credit_rate(&5i128);
+    assert_eq!(t.client.credit_rate_change_count(), 1);
+    assert_eq!(t.client.get_credit_rate_change_count(), 1);
+
+    // Second rate change
+    t.client.set_credit_rate(&10i128);
+    assert_eq!(t.client.credit_rate_change_count(), 2);
+    assert_eq!(t.client.get_credit_rate_change_count(), 2);
+
+    // Invalid rate change does not increment count
+    assert!(t.client.try_set_credit_rate(&0i128).is_err());
+    assert_eq!(t.client.credit_rate_change_count(), 2);
+    assert_eq!(t.client.get_credit_rate_change_count(), 2);
 }
 
 #[test]

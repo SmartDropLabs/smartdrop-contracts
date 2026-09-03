@@ -73,6 +73,7 @@ Emitted by `lock_assets` when a user deposits assets into the pool.
 | :--- | :--- | :--- |
 | `user` | `Address` | The wallet address that locked assets. |
 | `amount` | `i128` | The quantity of assets deposited in this call. |
+| `total_position` | `i128` | The total quantity of assets locked in the user's position after this call. |
 
 ### `unlocked`
 Emitted by `unlock_assets` when a user withdraws assets from the pool.
@@ -137,6 +138,7 @@ Emitted by `set_credit_rate`.
 | :--- | :--- | :--- |
 | `old_rate` | `i128` | Credit rate before the update. |
 | `new_rate` | `i128` | Credit rate after the update. |
+| `ledger_sequence` | `u32` | The ledger sequence at the time of the update. |
 
 ### `lock_set`
 Emitted by `set_min_lock_period`.

@@ -536,11 +536,12 @@ impl Factory {
                     records.push_back((pool_id, record));
                 }
             }
+            let has_more = next_start_id < count;
             return Ok(ListPoolsResponse {
                 records,
                 next_start_id,
                 total: count,
-                has_more: next_start_id < count,
+                has_more,
             });
         }
 
@@ -1062,6 +1063,11 @@ impl Factory {
     ) -> Result<u32, FactoryError> {
         require_initialized(&env)?;
         let admin = load_admin(&env)?;
+        // Reject a zero-address admin before any auth checks to avoid misleading Unauthorized errors.
+        let zero_admin = Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"));
+        if admin == zero_admin {
+            return Err(FactoryError::InvalidAdmin);
+        }
         admin.require_auth();
         bump_instance(&env);
 
