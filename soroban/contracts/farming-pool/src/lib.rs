@@ -570,10 +570,6 @@ fn increment_boost_user_count(env: &Env) {
         .set(&DataKey::BoostUserCount, &(count + 1));
 }
 
-// `set_boost` rejects a zero `allocation_pct` (see `test_set_boost_rejects_zero_allocation`),
-// so there is currently no path that clears a user's boost back to zero. Kept as the
-// symmetric counterpart to `increment_boost_user_count` for when such a path is added.
-#[allow(dead_code)]
 fn decrement_boost_user_count(env: &Env) {
     let count = read_boost_user_count(env);
     if count > 0 {
@@ -1325,7 +1321,13 @@ impl FarmingPool {
             .ledger()
             .sequence()
             .saturating_sub(position.checkpoint_ledger);
-        Ok(position.total_credits + position.amount * position.credit_rate * elapsed as i128)
+        let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
+        let multiplier = read_global_multiplier(&env);
+        let accrued = compute_total_stake(position.amount, allocation_pct, multiplier)
+            .checked_mul(position.credit_rate)
+            .and_then(|t| t.checked_mul(elapsed as i128))
+            .expect("credits arithmetic overflow");
+        Ok(position.total_credits + accrued)
     }
 
     /// Return current accrued credits for a user's time-locked `Position`.
@@ -1343,7 +1345,13 @@ impl FarmingPool {
         };
         let current = env.ledger().sequence();
         let elapsed = current.saturating_sub(position.checkpoint_ledger);
-        position.total_credits += position.amount * position.credit_rate * elapsed as i128;
+        let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
+        let multiplier = read_global_multiplier(&env);
+        let accrued = compute_total_stake(position.amount, allocation_pct, multiplier)
+            .checked_mul(position.credit_rate)
+            .and_then(|t| t.checked_mul(elapsed as i128))
+            .expect("credits arithmetic overflow");
+        position.total_credits += accrued;
         position.checkpoint_ledger = current;
         position.credit_rate = read_credit_rate(&env);
         Ok(Some(position))
@@ -1538,10 +1546,10 @@ impl FarmingPool {
 
         let stake_token = get_stake_token(&env)?;
         let token = token::TokenClient::new(&env, &stake_token);
-        if position_opt.is_some() {
+        if position_amount > 0 {
             token.transfer(&env.current_contract_address(), &user, &position_amount);
         }
-        if stake_opt.is_some() {
+        if stake_amount > 0 {
             token.transfer(&env.current_contract_address(), &user, &stake_amount);
         }
 
@@ -1805,7 +1813,10 @@ impl FarmingPool {
         let current = env.ledger().sequence();
         let mut new_stake = if let Some(mut existing) = get_user_stake(&env, &from) {
             checkpoint(&env, &from, &mut existing);
-            existing.amount += amount;
+            existing.amount = existing.amount.checked_add(amount).expect("stake amount overflow");
+            if existing.amount > MAX_STAKE_AMOUNT {
+                return Err(PoolError::ExceedsMaxStake);
+            }
             existing
         } else {
             UserStake {
@@ -1909,21 +1920,21 @@ impl FarmingPool {
             (from.clone(), amount, total_credits),
         );
 
-        record_stake_event(&env, &from, symbol_short!("unstake"), stake_amount);
+        record_stake_event(&env, &from, symbol_short!("unstake"), amount);
 
         Ok(total_credits)
     }
 
-    /// Admin sets a user's boost allocation (1-100%). Requires an active
+    /// Admin sets a user's boost allocation (0-100%). Requires an active
     /// flexible `UserStake` for `user` (#285): boosting an address with no
     /// stake is rejected with `NoActiveStake` instead of storing an inert
     /// allocation. A time-locked `Position` alone does not satisfy this —
-    /// boost only accrues via the `UserStake` path.
+    /// boost only accrues via the `UserStake` path. Set to 0 to clear boost.
     pub fn set_boost(env: Env, user: Address, allocation_pct: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
         require_staking_not_paused(&env)?;
         get_admin(&env)?.require_auth();
-        if !(1..=100).contains(&allocation_pct) {
+        if allocation_pct > 100 {
             return Err(PoolError::InvalidAllocation);
         }
         bump_instance(&env);
@@ -1933,22 +1944,31 @@ impl FarmingPool {
         set_user_stake(&env, &user, &stake);
 
         let old_alloc: u32 = get_user_boost(&env, &user).unwrap_or(0);
-        if old_alloc == 0 {
+        if allocation_pct == 0 {
+            if old_alloc > 0 {
+                decrement_boost_user_count(&env);
+                add_total_boost_allocation(&env, -(old_alloc as i64));
+                let key = DataKey::UserBoost(user.clone());
+                env.storage().persistent().remove(&key);
+            }
+        } else if old_alloc == 0 {
             increment_boost_user_count(&env);
             add_total_boost_allocation(&env, allocation_pct as i64);
+            let key = DataKey::UserBoost(user.clone());
+            if !env.storage().persistent().has(&key) {
+                increment_boost_count(&env);
+            }
+            env.storage().persistent().set(&key, &allocation_pct);
+            bump_user(&env, &key);
         } else {
             let delta = allocation_pct as i64 - old_alloc as i64;
             if delta != 0 {
                 add_total_boost_allocation(&env, delta);
             }
+            let key = DataKey::UserBoost(user.clone());
+            env.storage().persistent().set(&key, &allocation_pct);
+            bump_user(&env, &key);
         }
-
-        let key = DataKey::UserBoost(user.clone());
-        if !env.storage().persistent().has(&key) {
-            increment_boost_count(&env);
-        }
-        env.storage().persistent().set(&key, &allocation_pct);
-        bump_user(&env, &key);
 
         let multiplier = read_global_multiplier(&env);
         env.events().publish(
@@ -2146,7 +2166,13 @@ impl FarmingPool {
                     .ledger()
                     .sequence()
                     .saturating_sub(position.checkpoint_ledger);
-                position.total_credits + position.amount * position.credit_rate * elapsed as i128
+                let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
+                let multiplier = read_global_multiplier(&env);
+                let accrued = compute_total_stake(position.amount, allocation_pct, multiplier)
+                    .checked_mul(position.credit_rate)
+                    .and_then(|t| t.checked_mul(elapsed as i128))
+                    .expect("credits arithmetic overflow");
+                position.total_credits + accrued
             })
             .unwrap_or(0);
 
