@@ -2067,6 +2067,9 @@ impl FarmingPool {
         require_initialized(&env)?;
         let admin = get_admin(&env)?;
         admin.require_auth();
+        if new_period > MAX_LOCK_PERIOD {
+            return Err(PoolError::InvalidMinStakeAmount);
+        }
         bump_instance(&env);
 
         let old_period = read_min_lock_period(&env);
