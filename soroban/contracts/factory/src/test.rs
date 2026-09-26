@@ -558,7 +558,7 @@ fn test_upgrade_pool_hot_swaps_registered_pool_without_changing_factory_hash() {
                     symbol_short!("pool").into_val(&t.env),
                     symbol_short!("upgraded").into_val(&t.env),
                 ],
-                new_wasm_hash.clone().into_val(&t.env),
+                (original_factory_hash.clone(), new_wasm_hash.clone()).into_val(&t.env),
             ),
             (
                 t.factory_addr.clone(),

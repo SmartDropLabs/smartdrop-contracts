@@ -5,7 +5,9 @@
 mod mock_reentrant_token;
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, BytesN, Env, Vec};
+use soroban_sdk::{
+    contract, contractimpl, symbol_short, token, Address, BytesN, Env, Executable, Vec,
+};
 pub use types::PoolError;
 use types::{
     BankedCreditTotals, BoostConfig, DataKey, ListWhitelistedResponse, Position, UserStake,
@@ -960,7 +962,10 @@ impl FarmingPool {
 
         // Capture the old WASM hash before replacing it so the upgrade event
         // provides a complete audit trail of which version was replaced (#291).
-        let old_wasm_hash = env.deployer().get_current_contract_wasm_hash();
+        let old_wasm_hash = match env.current_contract_address().executable() {
+            Some(Executable::Wasm(hash)) => Some(hash),
+            _ => None,
+        };
 
         #[allow(deprecated)]
         env.events().publish(
@@ -1361,11 +1366,7 @@ impl FarmingPool {
         let stake_token = get_stake_token(&env)?;
         let token = token::TokenClient::new(&env, &stake_token);
         if position_opt.is_some() {
-            token.transfer(
-                &env.current_contract_address(),
-                &user,
-                &position_amount,
-            );
+            token.transfer(&env.current_contract_address(), &user, &position_amount);
         }
         if stake_opt.is_some() {
             token.transfer(&env.current_contract_address(), &user, &stake_amount);
