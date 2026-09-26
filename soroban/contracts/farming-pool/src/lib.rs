@@ -221,12 +221,25 @@ fn set_user_stake(env: &Env, user: &Address, stake: &UserStake) {
     let key = DataKey::UserStake(user.clone());
     env.storage().persistent().set(&key, stake);
     bump_user(env, &key);
+    let mut users = get_staked_users_list(env);
+    if !users.contains(user) {
+        users.push_back(user.clone());
+        set_staked_users_list(env, &users);
+    }
 }
 
 fn remove_user_stake(env: &Env, user: &Address) {
     env.storage()
         .persistent()
         .remove(&DataKey::UserStake(user.clone()));
+    let users = get_staked_users_list(env);
+    let mut new_users: Vec<Address> = Vec::new(env);
+    for u in users.iter() {
+        if u != *user {
+            new_users.push_back(u);
+        }
+    }
+    set_staked_users_list(env, &new_users);
 }
 
 fn add_total_staked(env: &Env, amount: i128) {
@@ -578,12 +591,25 @@ fn set_position(env: &Env, user: &Address, position: &Position) {
     let key = DataKey::UserPosition(user.clone());
     env.storage().persistent().set(&key, position);
     bump_user(env, &key);
+    let mut users = get_locked_users_list(env);
+    if !users.contains(user) {
+        users.push_back(user.clone());
+        set_locked_users_list(env, &users);
+    }
 }
 
 fn remove_position(env: &Env, user: &Address) {
     env.storage()
         .persistent()
         .remove(&DataKey::UserPosition(user.clone()));
+    let users = get_locked_users_list(env);
+    let mut new_users: Vec<Address> = Vec::new(env);
+    for u in users.iter() {
+        if u != *user {
+            new_users.push_back(u);
+        }
+    }
+    set_locked_users_list(env, &new_users);
 }
 
 fn whitelist_enabled(env: &Env) -> bool {
@@ -613,6 +639,32 @@ fn set_whitelisted_users_list(env: &Env, users: &Vec<Address>) {
     env.storage()
         .instance()
         .set(&DataKey::WhitelistedUsers, users);
+}
+
+fn get_staked_users_list(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::StakedUsers)
+        .unwrap_or(Vec::new(env))
+}
+
+fn set_staked_users_list(env: &Env, users: &Vec<Address>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::StakedUsers, users);
+}
+
+fn get_locked_users_list(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::LockedUsers)
+        .unwrap_or(Vec::new(env))
+}
+
+fn set_locked_users_list(env: &Env, users: &Vec<Address>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::LockedUsers, users);
 }
 
 // ── Boost calculation ─────────────────────────────────────────────────────────
@@ -886,7 +938,7 @@ impl FarmingPool {
     ///
     /// Deprecated: use `propose_admin` followed by `accept_admin` so the new
     /// admin must prove control of its address before the handoff completes.
-    /// Emits a `("pool", "adm_xfr")` event with `(old_admin, new_admin)`.
+    /// Emits a `("pool", "adm_xfr")` event with `(old_admin, new_admin)` tuple.
     #[deprecated(note = "use propose_admin followed by accept_admin")]
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), PoolError> {
         let current = get_admin(&env)?;
@@ -895,6 +947,7 @@ impl FarmingPool {
 
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("adm_xfr")),
             (current, new_admin),
@@ -1829,6 +1882,20 @@ impl FarmingPool {
         bump_instance(&env);
 
         let old_period = read_min_lock_period(&env);
+        let current_ledger = env.ledger().sequence();
+
+        if new_period > old_period {
+            let locked_users = get_locked_users_list(&env);
+            for user in locked_users.iter() {
+                if let Some(position) = get_position(&env, &user) {
+                    let required_unlock = position.lock_ledger.saturating_add(new_period);
+                    if position.unlock_ledger < required_unlock && current_ledger < required_unlock {
+                        return Err(PoolError::NoActivePosition);
+                    }
+                }
+            }
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::MinLockPeriod, &new_period);
@@ -2163,6 +2230,65 @@ impl FarmingPool {
     pub fn get_whitelist_count(env: Env) -> Result<u32, PoolError> {
         Self::whitelist_count(env)
     }
+
+    /// Return a paginated list of all users with active stakes.
+    ///
+    /// `offset`: zero-based index of the first user to return.
+    /// `limit`: maximum number of users to return per call.
+    ///
+    /// Returns addresses and total count. Call repeatedly with increasing `offset`
+    /// until `offset >= total` to retrieve the full list.
+    pub fn get_staked_users(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<ListWhitelistedResponse, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let all = get_staked_users_list(&env);
+        let total = all.len();
+        let mut page: Vec<Address> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            page.push_back(all.get(i).unwrap());
+            i += 1;
+            count += 1;
+        }
+
+        Ok(ListWhitelistedResponse { users: page, total })
+    }
+
+    /// Return a paginated list of all users with active locked positions.
+    ///
+    /// `offset`: zero-based index of the first user to return.
+    /// `limit`: maximum number of users to return per call.
+    ///
+    /// Returns addresses and total count. Call repeatedly with increasing `offset`
+    /// until `offset >= total` to retrieve the full list.
+    pub fn get_locked_users(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<ListWhitelistedResponse, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let all = get_locked_users_list(&env);
+        let total = all.len();
+        let mut page: Vec<Address> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            page.push_back(all.get(i).unwrap());
+            i += 1;
+            count += 1;
+        }
+
+        Ok(ListWhitelistedResponse { users: page, total })
+    }
+
 }
 
 mod test;
