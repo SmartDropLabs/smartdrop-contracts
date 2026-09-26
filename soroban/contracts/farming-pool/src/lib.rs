@@ -1478,6 +1478,7 @@ impl FarmingPool {
     // ── Whitelist system ──────────────────────────────────────────────────────
 
     /// Admin: enable whitelist mode. Admin must authorise.
+    /// Emits `("pool", "wl_en")` event.
     pub fn enable_whitelist(env: Env) -> Result<(), PoolError> {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
@@ -1485,10 +1486,15 @@ impl FarmingPool {
         env.storage()
             .instance()
             .set(&DataKey::WhitelistEnabled, &true);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("wl_en")),
+            (),
+        );
         Ok(())
     }
 
     /// Admin: disable whitelist mode. Admin must authorise.
+    /// Emits `("pool", "wl_dis")` event.
     pub fn disable_whitelist(env: Env) -> Result<(), PoolError> {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
@@ -1496,6 +1502,10 @@ impl FarmingPool {
         env.storage()
             .instance()
             .set(&DataKey::WhitelistEnabled, &false);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("wl_dis")),
+            (),
+        );
         Ok(())
     }
 
@@ -1907,7 +1917,7 @@ impl FarmingPool {
             .instance()
             .set(&DataKey::MinLockPeriod, &new_period);
         env.events().publish(
-            (symbol_short!("pool"), symbol_short!("lock_set")),
+            (symbol_short!("pool"), symbol_short!("min_lock_set")),
             (old_period, new_period),
         );
         Ok(())
@@ -2095,6 +2105,11 @@ impl FarmingPool {
             .instance()
             .get(&DataKey::TotalDistributedCredits)
             .unwrap_or(0))
+    }
+
+    /// Alias for `total_distributed_credits` for consistency with other getter functions.
+    pub fn get_total_distributed_credits(env: Env) -> Result<i128, PoolError> {
+        Self::total_distributed_credits(env)
     }
 
     /// Return the total credits currently banked across all users.
