@@ -5,7 +5,9 @@
 mod mock_reentrant_token;
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, BytesN, Env, Vec};
+use soroban_sdk::{
+    contract, contractimpl, symbol_short, token, Address, BytesN, Env, Executable, Vec,
+};
 pub use types::PoolError;
 use types::{
     BankedCreditTotals, BoostConfig, DataKey, ListWhitelistedResponse, Position, UserStake,
@@ -1013,7 +1015,10 @@ impl FarmingPool {
 
         // Capture the old WASM hash before replacing it so the upgrade event
         // provides a complete audit trail of which version was replaced (#291).
-        let old_wasm_hash = env.deployer().get_current_contract_wasm_hash();
+        let old_wasm_hash = match env.current_contract_address().executable() {
+            Some(Executable::Wasm(hash)) => Some(hash),
+            _ => None,
+        };
 
         #[allow(deprecated)]
         env.events().publish(
@@ -1360,10 +1365,17 @@ impl FarmingPool {
         bump_instance(&env);
 
         let was_staked = is_user_staked(&env, &user);
-        let position_opt = get_position(&env, &user);
-        let stake_opt = get_user_stake(&env, &user);
+        let mut position_opt = get_position(&env, &user);
+        let mut stake_opt = get_user_stake(&env, &user);
         if position_opt.is_none() && stake_opt.is_none() {
             return Err(PoolError::NoActiveStake);
+        }
+        // Bank credits accrued since the last checkpoint so they survive the exit (#295).
+        if let Some(p) = position_opt.as_mut() {
+            checkpoint_position(&env, &user, p);
+        }
+        if let Some(s) = stake_opt.as_mut() {
+            checkpoint(&env, &user, s);
         }
         let position_amount = position_opt.as_ref().map_or(0i128, |p| p.amount);
         let stake_amount = stake_opt.as_ref().map_or(0i128, |s| s.amount);
@@ -1414,11 +1426,7 @@ impl FarmingPool {
         let stake_token = get_stake_token(&env)?;
         let token = token::TokenClient::new(&env, &stake_token);
         if position_opt.is_some() {
-            token.transfer(
-                &env.current_contract_address(),
-                &user,
-                &position_amount,
-            );
+            token.transfer(&env.current_contract_address(), &user, &position_amount);
         }
         if stake_opt.is_some() {
             token.transfer(&env.current_contract_address(), &user, &stake_amount);
@@ -1570,7 +1578,7 @@ impl FarmingPool {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
         if users.len() > 50 {
-            panic!("max 50 addresses per call");
+            return Err(PoolError::BatchTooLarge);
         }
         bump_instance(&env);
 
@@ -1597,7 +1605,7 @@ impl FarmingPool {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
         if users.len() > 50 {
-            panic!("max 50 addresses per call");
+            return Err(PoolError::BatchTooLarge);
         }
         bump_instance(&env);
 
@@ -1766,10 +1774,9 @@ impl FarmingPool {
         require_initialized(&env)?;
         require_staking_not_paused(&env)?;
         get_admin(&env)?.require_auth();
-        assert!(
-            (1..=100).contains(&allocation_pct),
-            "allocation_pct must be 1-100"
-        );
+        if !(1..=100).contains(&allocation_pct) {
+            return Err(PoolError::InvalidAllocation);
+        }
         bump_instance(&env);
 
         let mut stake = get_user_stake(&env, &user).ok_or(PoolError::NoActiveStake)?;
