@@ -3356,3 +3356,21 @@ fn test_compute_credits_overflow_panics() {
         let _ = crate::compute_credits(10i128.pow(18), 100, 1_000, 100_000_000, u32::MAX);
     });
 }
+
+#[test]
+fn test_checkpoint_formulas_produce_identical_results() {
+    let t = setup(2, 1);
+    let user_b = Address::generate(&t.env);
+    t.token_sac.mint(&user_b, &1_000);
+
+    t.client.stake(&t.user, &1000);
+    t.client.lock_assets(&user_b, &1000);
+
+    advance_ledgers(&t.env, 10);
+
+    let credits_a = t.client.get_stake_credits(&t.user);
+    let credits_b = t.client.get_position_credits(&user_b);
+
+    assert_eq!(credits_a, credits_b);
+    assert!(credits_a > 0);
+}

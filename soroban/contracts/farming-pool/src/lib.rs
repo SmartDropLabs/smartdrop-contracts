@@ -796,7 +796,7 @@ fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) {
 fn checkpoint_position(env: &Env, user: &Address, position: &mut Position) {
     let current = env.ledger().sequence();
     let elapsed = current.saturating_sub(position.checkpoint_ledger);
-    let delta = position.amount * position.credit_rate * elapsed as i128;
+    let delta = compute_credits(position.amount, 0, 1, position.credit_rate, elapsed);
     position.total_credits += delta;
     add_total_credits(env, delta);
     add_total_distributed_credits(env, delta);
