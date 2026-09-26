@@ -147,6 +147,10 @@ pub enum DataKey {
     TotalBankedCredits,
     /// Cumulative credits earned by a user across their entire lifetime.
     TotalCreditsEarned(Address),
+    /// Ordered list of all users with active stakes (persistent storage).
+    StakedUsers,
+    /// Ordered list of all users with active locked positions (persistent storage).
+    LockedUsers,
 }
 
 /// Paginated response for `get_whitelisted_users`.
