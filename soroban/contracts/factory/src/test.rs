@@ -1554,3 +1554,68 @@ fn test_get_admin_pool_count_uninitialized_returns_not_initialized() {
     let result = client.try_get_admin_pool_count(&admin);
     assert!(matches!(result, Err(Ok(FactoryError::NotInitialized))));
 }
+
+// ── #323: min_stake_amount range ─────────────────────────────────────────────
+
+#[test]
+fn test_create_pool_rejects_minimum_stake_above_the_maximum() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+
+    let result = t.client.try_create_pool(
+        &asset,
+        &1_728_000u128,
+        &2u32,
+        &25u64,
+        &(10i128.pow(18) + 1),
+    );
+
+    assert_eq!(result, Err(Ok(FactoryError::InvalidMinStakeAmount)));
+    assert_eq!(t.client.pool_count(), 0);
+}
+
+#[test]
+fn test_create_pool_treats_a_non_positive_minimum_stake_as_the_default() {
+    let t = setup();
+
+    let negative = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &25u64,
+        &-5i128,
+    );
+
+    assert_eq!(negative, 0);
+}
+
+// ── #325: gaps in the registry are reported ─────────────────────────────────
+
+#[test]
+fn test_list_pools_reports_missing_records_with_a_pool_gap_event() {
+    let t = setup_with_pool_records(3);
+    t.env.as_contract(&t.factory_addr, || {
+        t.env.storage().persistent().remove(&DataKey::Pool(1));
+    });
+
+    let page = t.client.list_pools(&0u32, &10u32);
+
+    // The missing record is skipped in the page but not silently.
+    assert_eq!(page.records.len(), 2);
+    assert_eq!(page.total, 3);
+    assert_eq!(
+        t.env.events().all(),
+        vec![
+            &t.env,
+            (
+                t.factory_addr.clone(),
+                vec![
+                    &t.env,
+                    symbol_short!("factory").into_val(&t.env),
+                    symbol_short!("pool_gap").into_val(&t.env),
+                ],
+                1u32.into_val(&t.env),
+            )
+        ]
+    );
+}
