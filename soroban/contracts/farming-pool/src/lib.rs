@@ -11,7 +11,8 @@ use soroban_sdk::{
 pub use types::PoolError;
 use types::{
     AdminActionEvent, AdminActionHistoryPage, BankedCreditTotals, BoostConfig, BoostEvent,
-    BoostHistoryPage, DataKey, ListWhitelistedResponse, Position, StakeEvent, StakeHistoryPage,
+    BoostHistoryPage, CreditRateEvent, CreditRateHistoryPage, DataKey, GlobalMultiplierEvent,
+    GlobalMultiplierHistoryPage, ListWhitelistedResponse, Position, StakeEvent, StakeHistoryPage,
     UserStake, WhitelistEvent, WhitelistHistoryPage,
 };
 
@@ -746,6 +747,48 @@ fn record_admin_action(env: &Env, action: soroban_sdk::Symbol, admin: &Address) 
     env.storage()
         .instance()
         .set(&DataKey::AdminActionCount, &(count + 1));
+}
+
+// ── #310 — Credit rate history ────────────────────────────────────────────────
+
+fn record_credit_rate_change(env: &Env, old_rate: i128, new_rate: i128) {
+    let count: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::CreditRateEventCount)
+        .unwrap_or(0);
+    let event = CreditRateEvent {
+        old_rate,
+        new_rate,
+        ledger: env.ledger().sequence(),
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::CreditRateHistory(count), &event);
+    env.storage()
+        .instance()
+        .set(&DataKey::CreditRateEventCount, &(count + 1));
+}
+
+// ── #311 — Global multiplier history ─────────────────────────────────────────
+
+fn record_global_multiplier_change(env: &Env, old_multiplier: u32, new_multiplier: u32) {
+    let count: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::GlobalMultiplierEventCount)
+        .unwrap_or(0);
+    let event = GlobalMultiplierEvent {
+        old_multiplier,
+        new_multiplier,
+        ledger: env.ledger().sequence(),
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::GlobalMultiplierHistory(count), &event);
+    env.storage()
+        .instance()
+        .set(&DataKey::GlobalMultiplierEventCount, &(count + 1));
 }
 
 // ── Boost calculation ─────────────────────────────────────────────────────────
@@ -2019,6 +2062,7 @@ impl FarmingPool {
             &DataKey::GlobalMultiplierChangeLedger,
             &env.ledger().sequence(),
         );
+        record_global_multiplier_change(&env, old_multiplier, multiplier);
         env.events().publish(
             (symbol_short!("boost"), symbol_short!("mult_set")),
             (old_multiplier, multiplier),
@@ -2053,6 +2097,7 @@ impl FarmingPool {
             .instance()
             .set(&DataKey::CreditRate, &new_rate);
         increment_credit_rate_change_count(&env);
+        record_credit_rate_change(&env, old_rate, new_rate);
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("rate_set")),
             (old_rate, new_rate, env.ledger().sequence()),
@@ -2637,6 +2682,85 @@ impl FarmingPool {
         }
 
         Ok(AdminActionHistoryPage { events, total })
+    }
+
+    /// #310 — Return a paginated audit trail of credit rate changes.
+    ///
+    /// Each entry records the previous rate, the new rate, and the ledger at
+    /// which the change was applied. Events are stored in chronological order;
+    /// pass `offset = 0` and advance by `limit` to walk the full history.
+    ///
+    /// `offset`: zero-based index of the first event to return.
+    /// `limit`: maximum number of events to return per call.
+    pub fn get_credit_rate_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<CreditRateHistoryPage, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CreditRateEventCount)
+            .unwrap_or(0);
+        let mut events: Vec<CreditRateEvent> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, CreditRateEvent>(&DataKey::CreditRateHistory(i))
+            {
+                events.push_back(event);
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(CreditRateHistoryPage { events, total })
+    }
+
+    /// #311 — Return a paginated audit trail of global multiplier changes.
+    ///
+    /// Each entry records the previous multiplier, the new multiplier, and the
+    /// ledger at which the change was applied. Events are stored in
+    /// chronological order; pass `offset = 0` and advance by `limit` to walk
+    /// the full history.
+    ///
+    /// `offset`: zero-based index of the first event to return.
+    /// `limit`: maximum number of events to return per call.
+    pub fn get_global_multiplier_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<GlobalMultiplierHistoryPage, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GlobalMultiplierEventCount)
+            .unwrap_or(0);
+        let mut events: Vec<GlobalMultiplierEvent> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, GlobalMultiplierEvent>(&DataKey::GlobalMultiplierHistory(i))
+            {
+                events.push_back(event);
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(GlobalMultiplierHistoryPage { events, total })
     }
 
 }

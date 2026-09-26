@@ -3422,3 +3422,158 @@ fn test_unstake_more_than_balance_fails() {
         Err(Ok(PoolError::InsufficientBalance))
     );
 }
+
+// ── #310 — get_credit_rate_history ────────────────────────────────────────────
+
+#[test]
+fn test_credit_rate_history_empty_before_any_change() {
+    let t = setup(2, 1);
+    let page = t.client.get_credit_rate_history(&0, &10);
+    assert_eq!(page.total, 0);
+    assert_eq!(page.events.len(), 0);
+}
+
+#[test]
+fn test_credit_rate_history_records_single_change() {
+    let t = setup(2, 1);
+    let initial_rate: i128 = 1;
+    let new_rate: i128 = 5;
+
+    t.client.set_credit_rate(&new_rate);
+
+    let page = t.client.get_credit_rate_history(&0, &10);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.events.len(), 1);
+
+    let event = page.events.get(0).unwrap();
+    assert_eq!(event.old_rate, initial_rate);
+    assert_eq!(event.new_rate, new_rate);
+}
+
+#[test]
+fn test_credit_rate_history_records_multiple_changes_in_order() {
+    let t = setup(2, 1);
+
+    t.client.set_credit_rate(&2);
+    t.client.set_credit_rate(&3);
+    t.client.set_credit_rate(&4);
+
+    let page = t.client.get_credit_rate_history(&0, &10);
+    assert_eq!(page.total, 3);
+
+    assert_eq!(page.events.get(0).unwrap().old_rate, 1);
+    assert_eq!(page.events.get(0).unwrap().new_rate, 2);
+    assert_eq!(page.events.get(1).unwrap().old_rate, 2);
+    assert_eq!(page.events.get(1).unwrap().new_rate, 3);
+    assert_eq!(page.events.get(2).unwrap().old_rate, 3);
+    assert_eq!(page.events.get(2).unwrap().new_rate, 4);
+}
+
+#[test]
+fn test_credit_rate_history_pagination() {
+    let t = setup(2, 1);
+
+    for rate in [2i128, 3, 4, 5, 6] {
+        t.client.set_credit_rate(&rate);
+    }
+
+    let page1 = t.client.get_credit_rate_history(&0, &3);
+    assert_eq!(page1.total, 5);
+    assert_eq!(page1.events.len(), 3);
+
+    let page2 = t.client.get_credit_rate_history(&3, &10);
+    assert_eq!(page2.total, 5);
+    assert_eq!(page2.events.len(), 2);
+
+    // Contiguous: last event of page1 + first event of page2 must be consecutive.
+    assert_eq!(
+        page1.events.get(2).unwrap().new_rate,
+        page2.events.get(0).unwrap().old_rate
+    );
+}
+
+#[test]
+fn test_credit_rate_history_offset_past_end_returns_empty() {
+    let t = setup(2, 1);
+    t.client.set_credit_rate(&2);
+
+    let page = t.client.get_credit_rate_history(&999, &10);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.events.len(), 0);
+}
+
+// ── #311 — get_global_multiplier_history ─────────────────────────────────────
+
+#[test]
+fn test_global_multiplier_history_empty_before_any_change() {
+    let t = setup(2, 1);
+    let page = t.client.get_global_multiplier_history(&0, &10);
+    assert_eq!(page.total, 0);
+    assert_eq!(page.events.len(), 0);
+}
+
+#[test]
+fn test_global_multiplier_history_records_single_change() {
+    let t = setup(2, 1);
+
+    t.client.set_global_multiplier(&3);
+
+    let page = t.client.get_global_multiplier_history(&0, &10);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.events.len(), 1);
+
+    let event = page.events.get(0).unwrap();
+    assert_eq!(event.old_multiplier, 2); // setup initialises with multiplier=2
+    assert_eq!(event.new_multiplier, 3);
+}
+
+#[test]
+fn test_global_multiplier_history_records_multiple_changes_in_order() {
+    let t = setup(2, 1);
+
+    t.client.set_global_multiplier(&3);
+    t.client.set_global_multiplier(&5);
+    t.client.set_global_multiplier(&1);
+
+    let page = t.client.get_global_multiplier_history(&0, &10);
+    assert_eq!(page.total, 3);
+
+    assert_eq!(page.events.get(0).unwrap().old_multiplier, 2);
+    assert_eq!(page.events.get(0).unwrap().new_multiplier, 3);
+    assert_eq!(page.events.get(1).unwrap().old_multiplier, 3);
+    assert_eq!(page.events.get(1).unwrap().new_multiplier, 5);
+    assert_eq!(page.events.get(2).unwrap().old_multiplier, 5);
+    assert_eq!(page.events.get(2).unwrap().new_multiplier, 1);
+}
+
+#[test]
+fn test_global_multiplier_history_pagination() {
+    let t = setup(2, 1);
+
+    for m in [3u32, 4, 5, 1, 2] {
+        t.client.set_global_multiplier(&m);
+    }
+
+    let page1 = t.client.get_global_multiplier_history(&0, &3);
+    assert_eq!(page1.total, 5);
+    assert_eq!(page1.events.len(), 3);
+
+    let page2 = t.client.get_global_multiplier_history(&3, &10);
+    assert_eq!(page2.total, 5);
+    assert_eq!(page2.events.len(), 2);
+
+    assert_eq!(
+        page1.events.get(2).unwrap().new_multiplier,
+        page2.events.get(0).unwrap().old_multiplier
+    );
+}
+
+#[test]
+fn test_global_multiplier_history_offset_past_end_returns_empty() {
+    let t = setup(2, 1);
+    t.client.set_global_multiplier(&3);
+
+    let page = t.client.get_global_multiplier_history(&999, &10);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.events.len(), 0);
+}
