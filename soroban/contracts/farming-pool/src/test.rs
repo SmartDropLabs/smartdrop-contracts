@@ -3207,3 +3207,155 @@ fn test_compute_credits_i128_overflow_boundaries() {
         assert_eq!(credits, total * 7 * 13);
     }
 }
+
+// ── #289: persistent-storage TTL extension ────────────────────────────────────
+
+#[test]
+fn test_user_stake_ttl_extended_after_stake() {
+    let test = setup(1, 1);
+    let env = &test.env;
+    let client = &test.client;
+    let user = &test.user;
+
+    // Stake to create a persistent entry.
+    client.stake(user, 1_000);
+
+    // The entry should have been bumped — advance past the threshold and verify
+    // the entry still exists (it would have expired without the bump).
+    env.ledger().set_sequence(USER_TTL_THRESHOLD + 100);
+    assert!(client.try_get_user_stake(user).unwrap().is_some());
+}
+
+#[test]
+fn test_user_position_ttl_extended_after_lock() {
+    let test = setup(1, 1);
+    let env = &test.env;
+    let client = &test.client;
+    let user = &test.user;
+
+    client.lock_assets(user, 1_000);
+
+    // Advance past TTL threshold — entry should survive due to bump.
+    env.ledger().set_sequence(USER_TTL_THRESHOLD + 100);
+    let pos = client.get_user_position(user).unwrap();
+    assert!(pos.is_some());
+    assert_eq!(pos.unwrap().amount, 1_000);
+}
+
+#[test]
+fn test_banked_credits_ttl_extended() {
+    let test = setup(1, 1);
+    let env = &test.env;
+    let client = &test.client;
+    let user = &test.user;
+
+    // Stake, advance, unstake to bank credits.
+    client.stake(user, 1_000);
+    env.ledger().set_sequence(50);
+    client.unstake(user, 1_000);
+    let banked = client.get_banked_credits(user);
+    assert!(banked > 0);
+
+    // Advance well past TTL threshold — banked credits should survive.
+    env.ledger().set_sequence(USER_TTL_THRESHOLD + 200);
+    let still_banked = client.get_banked_credits(user);
+    assert_eq!(still_banked, banked);
+}
+
+#[test]
+fn test_user_boost_ttl_extended() {
+    let test = setup(1, 1);
+    let env = &test.env;
+    let client = &test.client;
+    let user = &test.user;
+
+    client.stake(user, 1_000);
+    client.set_boost(user, 50, 10);
+
+    // Advance past TTL threshold — boost should survive.
+    env.ledger().set_sequence(USER_TTL_THRESHOLD + 100);
+    let config = client.get_boost_config(user);
+    assert_eq!(config.allocation_pct, 50);
+    assert_eq!(config.multiplier, 10);
+}
+
+// ── #288: credit independence from checkpoint frequency ───────────────────────
+
+#[test]
+fn test_total_credits_independent_of_checkpoint_frequency() {
+    let test = setup(1, 10);
+    let env = &test.env;
+    let client = &test.client;
+    let user_a = test.user.clone();
+    let user_b = Address::generate(env);
+
+    // Both users stake the same amount at the same ledger.
+    let stake_amount = 10_000i128;
+    client.stake(&user_a, stake_amount);
+    client.stake(&user_b, stake_amount);
+
+    // User A checkpoints once at the end (ledger 100).
+    env.ledger().set_sequence(100);
+    let credits_a = client.get_credits(&user_a);
+    let credits_b = client.get_credits(&user_b);
+
+    // At this point, A has not been checkpointed yet (no unstake/stake),
+    // but get_credits computes live accrual, so both should be equal.
+    assert_eq!(credits_a, credits_b);
+}
+
+#[test]
+fn test_credits_same_regardless_of_intermediate_checkpoints() {
+    let test = setup(1, 10);
+    let env = &test.env;
+    let client = &test.client;
+    let user_a = test.user.clone();
+    let user_b = Address::generate(env);
+
+    let stake_amount = 10_000i128;
+    client.stake(&user_a, stake_amount);
+    client.stake(&user_b, stake_amount);
+
+    // User A checkpoints at ledger 30 and 60 (two intermediate checkpoints).
+    env.ledger().set_sequence(30);
+    client.unstake(&user_a, 1); // triggers checkpoint
+    client.stake(&user_a, 1);   // re-stake same amount
+
+    env.ledger().set_sequence(60);
+    client.unstake(&user_a, 1);
+    client.stake(&user_a, 1);
+
+    // User B never checkpoints — just reads at ledger 100.
+    env.ledger().set_sequence(100);
+    let credits_a = client.get_credits(&user_a);
+    let credits_b = client.get_credits(&user_b);
+
+    // Total credits should be identical regardless of checkpoint frequency.
+    // A's intermediate checkpoints bank credits at the same rate, and
+    // get_credits adds live accrual from the last checkpoint.
+    assert_eq!(credits_a, credits_b);
+}
+
+#[test]
+fn test_position_credits_independent_of_checkpoint_frequency() {
+    let test = setup(1, 10);
+    let env = &test.env;
+    let client = &test.client;
+    let user_a = test.user.clone();
+    let user_b = Address::generate(env);
+
+    let stake_amount = 5_000i128;
+    client.lock_assets(&user_a, stake_amount);
+    client.lock_assets(&user_b, stake_amount);
+
+    // Advance 50 ledgers, checkpoint A, advance 50 more.
+    env.ledger().set_sequence(50);
+    // Force a checkpoint by reading position (get_user_position checkpoints)
+    let _ = client.get_user_position(&user_a);
+
+    env.ledger().set_sequence(100);
+    let credits_a = client.get_position_credits(&user_a);
+    let credits_b = client.get_position_credits(&user_b);
+
+    assert_eq!(credits_a, credits_b);
+}
