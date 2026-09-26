@@ -1735,45 +1735,58 @@ impl FarmingPool {
     /// any time. Because credits accrue only over elapsed ledgers (#169), an
     /// immediate stake→unstake round-trip earns no credits, so the lack of a
     /// lock does not create a flash-staking reward.
-    pub fn unstake(env: Env, from: Address) -> Result<i128, PoolError> {
+    pub fn unstake(env: Env, from: Address, amount: i128) -> Result<i128, PoolError> {
         from.require_auth();
         require_initialized(&env)?;
         require_withdrawals_not_paused(&env)?;
         bump_instance(&env);
 
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+
         let was_staked = is_user_staked(&env, &from);
         let mut stake = get_user_stake(&env, &from).ok_or(PoolError::NoActiveStake)?;
+        if amount > stake.amount {
+            return Err(PoolError::InsufficientBalance);
+        }
+
         checkpoint(&env, &from, &mut stake);
         let total_credits = stake.credits_banked;
-        let stake_amount = stake.amount;
-        if total_credits > 0 {
-            subtract_total_banked_credits(&env, total_credits);
-        }
+        stake.amount -= amount;
 
         // Checks-effects-interactions: clear state *before* the external
         // token transfer below so a reentrant token cannot re-enter and
         // double-withdraw. On transfer failure the whole invocation
         // reverts, rolling these writes back. See #279.
-        remove_user_stake(&env, &from);
-        decrement_active_stake_count(&env);
-        if was_staked && !is_user_staked(&env, &from) {
-            decrement_staked_user_count(&env);
+        if stake.amount == 0 {
+            if total_credits > 0 {
+                subtract_total_banked_credits(&env, total_credits);
+            }
+            remove_user_stake(&env, &from);
+            decrement_active_stake_count(&env);
+            if was_staked && !is_user_staked(&env, &from) {
+                decrement_staked_user_count(&env);
+            }
+        } else {
+            set_user_stake(&env, &from, &stake);
         }
+
         increment_unstake_count(&env);
-        subtract_total_staked(&env, stake_amount);
-        add_total_withdrawals(&env, stake_amount);
+        subtract_total_staked(&env, amount);
+        add_total_withdrawals(&env, amount);
 
         // Return staked tokens to caller.
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &env.current_contract_address(),
             &from,
-            &stake_amount,
+            &amount,
         );
 
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("unstaked")),
-            (from.clone(), stake_amount, total_credits),
+            (from.clone(), amount, total_credits),
         );
 
         Ok(total_credits)
