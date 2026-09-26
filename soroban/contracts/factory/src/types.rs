@@ -142,4 +142,5 @@ pub enum FactoryError {
     /// deployed pool did not answer the `total_staked` getter (e.g. a pool
     /// deployed from an older WASM that predates it).
     PoolQueryFailed = 17,
+    SameWasmHash = 18,
 }
