@@ -3374,3 +3374,16 @@ fn test_checkpoint_formulas_produce_identical_results() {
     assert_eq!(credits_a, credits_b);
     assert!(credits_a > 0);
 }
+
+#[test]
+fn test_set_min_lock_period_bounds() {
+    let t = setup(2, 1);
+    
+    assert!(t.client.try_set_min_lock_period(&63_072_000).is_ok());
+    assert_eq!(t.client.min_lock_period(), 63_072_000);
+    
+    assert_eq!(
+        t.client.try_set_min_lock_period(&63_072_001),
+        Err(Ok(PoolError::InvalidLockPeriod))
+    );
+}

@@ -32,6 +32,8 @@ pub enum PoolError {
     LockPeriodNotElapsed = 16,
     /// Returned when `set_boost` receives an `allocation_pct` outside 1-100.
     InvalidAllocation = 17,
+    /// Returned when the minimum lock period exceeds the allowed maximum.
+    InvalidLockPeriod = 18,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.

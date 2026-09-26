@@ -90,6 +90,7 @@ const SCHEMA_VERSION: u32 = 1;
 const MAX_GLOBAL_MULTIPLIER: u32 = 1_000;
 const MAX_CREDIT_RATE: i128 = 100_000_000;
 const MAX_STAKE_AMOUNT: i128 = 10i128.pow(18);
+const MAX_LOCK_PERIOD: u32 = 63_072_000; // 10 years at 5s/ledger
 
 fn bump_instance(env: &Env) {
     env.storage()
@@ -1899,6 +1900,9 @@ impl FarmingPool {
     pub fn set_min_lock_period(env: Env, new_period: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
+        if new_period > MAX_LOCK_PERIOD {
+            return Err(PoolError::InvalidLockPeriod);
+        }
         bump_instance(&env);
 
         let old_period = read_min_lock_period(&env);
@@ -1920,7 +1924,7 @@ impl FarmingPool {
             .instance()
             .set(&DataKey::MinLockPeriod, &new_period);
         env.events().publish(
-            (symbol_short!("pool"), symbol_short!("min_lock_set")),
+            (symbol_short!("pool"), soroban_sdk::Symbol::new(&env, "min_lock_set")),
             (old_period, new_period),
         );
         Ok(())
