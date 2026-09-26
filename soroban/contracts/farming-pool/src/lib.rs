@@ -698,7 +698,10 @@ fn compute_credits(
     credit_rate: i128,
     ledgers_elapsed: u32,
 ) -> i128 {
-    compute_total_stake(amount, allocation_pct, multiplier) * credit_rate * ledgers_elapsed as i128
+    compute_total_stake(amount, allocation_pct, multiplier)
+        .checked_mul(credit_rate)
+        .and_then(|t| t.checked_mul(ledgers_elapsed as i128))
+        .expect("credits arithmetic overflow")
 }
 
 fn compute_stake_accrual(env: &Env, user: &Address, stake: &UserStake, current: u32) -> i128 {

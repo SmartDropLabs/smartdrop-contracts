@@ -3336,3 +3336,23 @@ fn test_position_credits_independent_of_checkpoint_frequency() {
         t.client.get_position_credits(&user_b)
     );
 }
+
+#[test]
+fn test_compute_credits_overflow_prevention() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1000);
+    t.client.set_boost(&t.user, &100);
+    t.env.as_contract(&t.contract_id, || {
+        let amt = crate::compute_credits(1000, 0, 1, 100, 10);
+        assert_eq!(amt, 1_000_000);
+    });
+}
+
+#[test]
+#[should_panic(expected = "credits arithmetic overflow")]
+fn test_compute_credits_overflow_panics() {
+    let t = setup(2, 1);
+    t.env.as_contract(&t.contract_id, || {
+        let _ = crate::compute_credits(10i128.pow(18), 100, 1_000, 100_000_000, u32::MAX);
+    });
+}
