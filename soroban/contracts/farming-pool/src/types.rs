@@ -171,6 +171,14 @@ pub enum DataKey {
     AdminActionCount,
     /// Admin action event by index (u32 -> AdminActionEvent).
     AdminActionHistory(u32),
+    /// Global counter for credit rate change events (#310).
+    CreditRateEventCount,
+    /// Credit rate change event by index (#310).
+    CreditRateHistory(u32),
+    /// Global counter for global multiplier change events (#311).
+    GlobalMultiplierEventCount,
+    /// Global multiplier change event by index (#311).
+    GlobalMultiplierHistory(u32),
 }
 
 /// Paginated response for `get_whitelisted_users`.
@@ -256,5 +264,39 @@ pub struct StakeHistoryPage {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AdminActionHistoryPage {
     pub events: Vec<AdminActionEvent>,
+    pub total: u32,
+}
+
+/// A single credit rate change event (#310).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreditRateEvent {
+    pub old_rate: i128,
+    pub new_rate: i128,
+    pub ledger: u32,
+}
+
+/// Paginated response for credit rate history queries (#310).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreditRateHistoryPage {
+    pub events: Vec<CreditRateEvent>,
+    pub total: u32,
+}
+
+/// A single global multiplier change event (#311).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalMultiplierEvent {
+    pub old_multiplier: u32,
+    pub new_multiplier: u32,
+    pub ledger: u32,
+}
+
+/// Paginated response for global multiplier history queries (#311).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalMultiplierHistoryPage {
+    pub events: Vec<GlobalMultiplierEvent>,
     pub total: u32,
 }
