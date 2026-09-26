@@ -18,10 +18,14 @@ Emitted by `create_pool` immediately after the new pool is deployed and initiali
 | :--- | :--- | :--- |
 | `pool_id` | `u32` | Monotonically assigned ID of the new pool. |
 | `pool_address` | `Address` | The deployed contract address of the new pool. |
+| `admin` | `Address` | The factory admin at creation time (fixed as the pool's admin). |
 | `asset` | `Address` | The token asset address being staked in the pool. |
 | `credit_rate` | `i128` | Per-ledger credit accrual rate, as passed to the pool's `initialize` (converted from `create_pool`'s caller-facing `daily_rate`). |
 | `global_multiplier` | `u32` | Boost multiplier applied to allocated stake, as passed to `initialize`. |
 | `min_lock_period` | `u32` | The minimum number of ledgers tokens must remain locked. |
+| `daily_rate` | `u128` | The originally requested daily rate, preserved before ledger conversion. |
+| `wasm_hash` | `BytesN<32>` | The WASM hash the pool was deployed from. |
+| `min_stake_amount` | `i128` | Resolved minimum stake actually passed to the pool's `initialize` (caller input after the dust-threshold default is applied). |
 
 ### `adm_xfr`
 Emitted by `transfer_admin` when the factory admin is rotated.
@@ -56,6 +60,17 @@ Emitted by `set_pool_wasm_hash` when the WASM hash used for *future* `create_poo
 | :--- | :--- | :--- |
 | `old_hash` | `BytesN<32>` | The previous pool WASM hash. |
 | `new_hash` | `BytesN<32>` | The newly configured pool WASM hash. |
+
+### `ttl_ref`
+Emitted by `refresh_pool_ttls` after extending pool-record TTLs, so off-chain monitoring can track when each pool range was last refreshed.
+
+* **Topics:** `(Symbol, Symbol)` -> `(symbol_short!("factory"), symbol_short!("ttl_ref"))`
+* **Payload Structure (tuple order):**
+
+| Field | Rust Type | Description |
+| :--- | :--- | :--- |
+| `start_id` | `u32` | First pool ID in the refreshed range (inclusive). |
+| `end` | `u32` | One past the last pool ID in the refreshed range (exclusive). |
 
 ---
 
