@@ -1166,6 +1166,9 @@ impl FarmingPool {
         if amount <= 0 {
             return Err(PoolError::InvalidAmount);
         }
+        if amount > MAX_STAKE_AMOUNT {
+            return Err(PoolError::ExceedsMaxStake);
+        }
 
         if whitelist_enabled(&env) && !is_user_whitelisted(&env, &user) {
             return Err(PoolError::NotWhitelisted);
@@ -1175,6 +1178,9 @@ impl FarmingPool {
         let min_stake = Self::get_min_stake_amount(env.clone())?;
         if total_amount < min_stake {
             return Err(PoolError::BelowMinimumStake);
+        }
+        if total_amount > MAX_STAKE_AMOUNT {
+            return Err(PoolError::ExceedsMaxStake);
         }
 
         bump_instance(&env);
@@ -1241,6 +1247,9 @@ impl FarmingPool {
 
         if amount <= 0 {
             return Err(PoolError::InvalidAmount);
+        }
+        if amount > MAX_STAKE_AMOUNT {
+            return Err(PoolError::ExceedsMaxStake);
         }
         bump_instance(&env);
 
@@ -1772,6 +1781,9 @@ impl FarmingPool {
         require_staking_not_paused(&env)?;
         if amount <= 0 {
             return Err(PoolError::InvalidAmount);
+        }
+        if amount > MAX_STAKE_AMOUNT {
+            return Err(PoolError::ExceedsMaxStake);
         }
 
         if whitelist_enabled(&env) && !is_user_whitelisted(&env, &from) {
