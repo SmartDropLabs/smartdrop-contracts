@@ -22,6 +22,14 @@ pub enum PoolError {
     NoPendingAdmin = 11,
     /// Returned by `batch_add_to_whitelist` or `batch_remove_from_whitelist` when batch exceeds 50 users.
     BatchTooLarge = 12,
+    /// Returned when a supplied amount is zero or negative.
+    InvalidAmount = 13,
+    /// Returned when the user has no active locked position.
+    NoActivePosition = 14,
+    /// Returned when withdrawing more than the locked/staked balance.
+    InsufficientBalance = 15,
+    /// Returned when the minimum lock period has not elapsed yet.
+    LockPeriodNotElapsed = 16,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.
