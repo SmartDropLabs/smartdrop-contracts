@@ -139,6 +139,22 @@ fn load_wasm_hash(env: &Env) -> Result<BytesN<32>, FactoryError> {
         .ok_or(FactoryError::NotInitialized)
 }
 
+fn is_approved_wasm_hash(env: &Env, wasm_hash: &BytesN<32>) -> bool {
+    let approved = env
+        .storage()
+        .persistent()
+        .get(&DataKey::ApprovedWasmHash(wasm_hash.clone()))
+        .unwrap_or(false);
+    if approved {
+        env.storage().persistent().extend_ttl(
+            &DataKey::ApprovedWasmHash(wasm_hash.clone()),
+            TTL_THRESHOLD,
+            TTL_EXTEND_TO,
+        );
+    }
+    approved
+}
+
 /// Read the running count of successful `upgrade_pool` calls (#258).
 fn read_upgrade_count(env: &Env) -> u32 {
     env.storage()
@@ -295,6 +311,17 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::WasmHash, &pool_wasm_hash);
+        env.storage().persistent().set(
+            &DataKey::ApprovedWasmHash(pool_wasm_hash),
+            &true,
+        );
+        // Keep the initial approval alive for as long as the factory is used.
+        let approved_hash = load_wasm_hash(&env)?;
+        env.storage().persistent().extend_ttl(
+            &DataKey::ApprovedWasmHash(approved_hash),
+            TTL_THRESHOLD,
+            TTL_EXTEND_TO,
+        );
         env.storage().instance().set(&DataKey::PoolCount, &0u32);
         bump_instance(&env);
         Ok(())
@@ -738,13 +765,13 @@ impl Factory {
         {
             return Err(FactoryError::InvalidAdmin);
         }
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        increment_admin_transfer_count(&env);
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("factory"), symbol_short!("adm_xfr")),
-            (current, new_admin),
+            (current, new_admin.clone()),
         );
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        increment_admin_transfer_count(&env);
         Ok(())
     }
 
@@ -812,6 +839,9 @@ impl Factory {
         }
         if new_wasm_hash == record.wasm_hash {
             return Err(FactoryError::PoolUpgradeFailed);
+        }
+        if !is_approved_wasm_hash(&env, &new_wasm_hash) {
+            return Err(FactoryError::InvalidWasmHash);
         }
 
         let upgrade_args: Vec<Val> = vec![&env, new_wasm_hash.clone().into_val(&env)];
@@ -1011,6 +1041,18 @@ impl Factory {
         if new_hash == old_hash {
             return Err(FactoryError::SameWasmHash);
         }
+        // An admin-approved hash may be used for future deployments and
+        // upgrades. The approval is intentionally explicit because a hash
+        // alone cannot prove that its uploaded WASM implements FarmingPool.
+        env.storage().persistent().set(
+            &DataKey::ApprovedWasmHash(new_hash.clone()),
+            &true,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::ApprovedWasmHash(new_hash.clone()),
+            TTL_THRESHOLD,
+            TTL_EXTEND_TO,
+        );
         env.storage().instance().set(&DataKey::WasmHash, &new_hash);
         #[allow(deprecated)]
         env.events().publish(
@@ -1129,6 +1171,10 @@ impl Factory {
             return Err(FactoryError::PoolCreationPaused);
         }
 
+        if min_stake_amount <= 0 {
+            return Err(FactoryError::InvalidMinStakeAmount);
+        }
+
         validate_asset(&env, &asset)?;
 
         if global_multiplier < 1 {
@@ -1141,13 +1187,9 @@ impl Factory {
         if min_lock_period < MIN_LOCK_PERIOD {
             return Err(FactoryError::MinLockPeriodTooShort);
         }
-        let effective_min_stake = if min_stake_amount <= 0 {
-            MIN_STAKE_AMOUNT
-        } else {
-            min_stake_amount
-        };
-        // A non-positive request means "use the default"; anything else must lie
-        // within [MIN_STAKE_AMOUNT, MAX_STAKE_AMOUNT] so the pool is usable.
+        let effective_min_stake = min_stake_amount;
+        // The requested amount must lie within [MIN_STAKE_AMOUNT,
+        // MAX_STAKE_AMOUNT] so the pool is usable.
         if effective_min_stake < MIN_STAKE_AMOUNT || effective_min_stake > MAX_STAKE_AMOUNT {
             return Err(FactoryError::InvalidMinStakeAmount);
         }
