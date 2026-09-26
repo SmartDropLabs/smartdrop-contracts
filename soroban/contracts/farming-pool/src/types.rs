@@ -30,6 +30,8 @@ pub enum PoolError {
     InsufficientBalance = 15,
     /// Returned when the minimum lock period has not elapsed yet.
     LockPeriodNotElapsed = 16,
+    /// Returned when `set_boost` receives an `allocation_pct` outside 1-100.
+    InvalidAllocation = 17,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.

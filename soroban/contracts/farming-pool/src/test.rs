@@ -565,14 +565,20 @@ fn test_set_boost_rejects_zero_allocation() {
     // Soroban host wraps contract panics in HostError; use try_ client variants to inspect them.
     let t = setup(2, 1);
     t.client.stake(&t.user, &1_000);
-    assert!(t.client.try_set_boost(&t.user, &0u32).is_err());
+    assert_eq!(
+        t.client.try_set_boost(&t.user, &0u32),
+        Err(Ok(PoolError::InvalidAllocation))
+    );
 }
 
 #[test]
 fn test_set_boost_rejects_over_100_allocation() {
     let t = setup(2, 1);
     t.client.stake(&t.user, &1_000);
-    assert!(t.client.try_set_boost(&t.user, &101u32).is_err());
+    assert_eq!(
+        t.client.try_set_boost(&t.user, &101u32),
+        Err(Ok(PoolError::InvalidAllocation))
+    );
 }
 
 #[test]
@@ -2097,6 +2103,20 @@ fn test_emergency_withdraw_while_paused() {
 }
 
 #[test]
+fn test_emergency_withdraw_banks_unbanked_credits() {
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &500);
+    t.client.stake(&t.user, &300);
+    advance_ledgers(&t.env, 10);
+    t.client.pause();
+    t.client.emergency_withdraw(&t.user);
+    // No manual checkpoint: 500*1*10 and 300*1*10 must still be banked (#295).
+    let split = t.client.get_banked_credits_split(&t.user);
+    assert_eq!(split.position_credits, 5_000);
+    assert_eq!(split.stake_credits, 3_000);
+}
+
+#[test]
 fn test_emergency_withdraw_while_unpaused_returns_not_paused() {
     let t = setup(1, 1);
     t.client.lock_assets(&t.user, &1_000);
@@ -2289,14 +2309,16 @@ fn test_batch_add_to_whitelist() {
 }
 
 #[test]
-#[should_panic(expected = "max 50 addresses per call")]
 fn test_batch_add_to_whitelist_exceeds_limit() {
     let t = setup(2, 1);
     let mut users = soroban_sdk::Vec::new(&t.env);
     for _ in 0..51 {
         users.push_back(Address::generate(&t.env));
     }
-    t.client.batch_add_to_whitelist(&users);
+    assert_eq!(
+        t.client.try_batch_add_to_whitelist(&users),
+        Err(Ok(PoolError::BatchTooLarge))
+    );
 }
 
 #[test]
@@ -2330,14 +2352,16 @@ fn test_batch_remove_from_whitelist() {
 }
 
 #[test]
-#[should_panic(expected = "max 50 addresses per call")]
 fn test_batch_remove_from_whitelist_exceeds_limit() {
     let t = setup(2, 1);
     let mut users = soroban_sdk::Vec::new(&t.env);
     for _ in 0..51 {
         users.push_back(Address::generate(&t.env));
     }
-    t.client.batch_remove_from_whitelist(&users);
+    assert_eq!(
+        t.client.try_batch_remove_from_whitelist(&users),
+        Err(Ok(PoolError::BatchTooLarge))
+    );
 }
 
 #[test]
