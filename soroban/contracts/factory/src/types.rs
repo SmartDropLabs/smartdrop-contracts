@@ -136,7 +136,9 @@ pub enum FactoryError {
     InvalidWasmHash = 14,
     /// `create_pool`'s minimum lock period is below the minimum allowed threshold.
     MinLockPeriodTooShort = 15,
-    /// `initialize` was called with a zero-address admin, which would permanently lock the factory.
+    /// `initialize` was called with a zero-address admin, or `transfer_admin`
+    /// was called with a zero-address `new_admin`, which would permanently
+    /// lock the factory.
     InvalidAdmin = 16,
     /// A pool's TVL could not be read during `total_tvl` maintenance because the
     /// deployed pool did not answer the `total_staked` getter (e.g. a pool
