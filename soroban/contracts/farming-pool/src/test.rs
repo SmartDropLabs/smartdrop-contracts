@@ -197,7 +197,7 @@ fn test_total_staked_tracks_locked_and_flexible_positions() {
     t.client.lock_assets(&t.user, &500);
     assert_eq!(t.client.total_staked(), 1_500);
 
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert_eq!(t.client.total_staked(), 500);
 
     t.client.unlock_assets(&t.user, &500);
@@ -224,7 +224,7 @@ fn test_total_distributed_credits_counts_banked_stake_accrual_on_checkpoint() {
     assert_eq!(t.client.total_distributed_credits(), 0);
 
     // unstake checkpoints and banks 10_000 credits.
-    let banked = t.client.unstake(&t.user);
+    let banked = t.client.unstake(&t.user, &1_000);
     assert_eq!(banked, 10_000);
     assert_eq!(t.client.total_distributed_credits(), 10_000);
 }
@@ -271,13 +271,13 @@ fn test_total_credits_earned_tracks_lifetime_credits_across_withdrawals() {
     assert_eq!(t.client.get_credits(&t.user), 10_000);
     assert_eq!(t.client.total_credits_earned(&t.user), 0);
 
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert_eq!(t.client.total_credits_earned(&t.user), 10_000);
 
     advance_ledgers(&t.env, 5);
     t.client.stake(&t.user, &500);
     advance_ledgers(&t.env, 5);
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert_eq!(t.client.total_credits_earned(&t.user), 12_500);
 }
 
@@ -291,12 +291,12 @@ fn test_total_banked_credits_tracks_current_bank_across_users() {
     advance_ledgers(&t.env, 10);
     assert_eq!(t.client.total_banked_credits(), 0);
 
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert_eq!(t.client.total_banked_credits(), 0);
 
     t.client.stake(&other, &2_000);
     advance_ledgers(&t.env, 5);
-    t.client.unstake(&other);
+    t.client.unstake(&other, &2_000);
     assert_eq!(t.client.total_banked_credits(), 0);
 }
 
@@ -793,7 +793,7 @@ fn test_get_credits_matches_checkpoint_accrual_after_multiplier_change() {
     assert_eq!(viewed, 35_000);
 
     // unstake checkpoints → banked credits must equal the viewed total.
-    let banked = t.client.unstake(&t.user);
+    let banked = t.client.unstake(&t.user, &1_000);
     assert_eq!(banked, viewed);
 
     // The aggregate counter must agree with the banked amount too.
@@ -937,7 +937,7 @@ fn test_unstake_returns_tokens_and_credits() {
     t.client.stake(&t.user, &1_000);
     t.client.set_boost(&t.user, &50u32);
     advance_ledgers(&t.env, 10);
-    let credits = t.client.unstake(&t.user);
+    let credits = t.client.unstake(&t.user, &1_000);
     assert_eq!(credits, 15_000); // 1500 * 10
     assert_eq!(t.token.balance(&t.user), initial_balance);
     assert!(t.client.get_stake(&t.user).is_none());
@@ -953,7 +953,7 @@ fn test_flash_stake_unstake_in_same_ledger_yields_no_credits() {
 
     t.client.stake(&t.user, &1_000);
     t.client.set_boost(&t.user, &100u32);
-    let credits = t.client.unstake(&t.user);
+    let credits = t.client.unstake(&t.user, &1_000);
 
     assert_eq!(credits, 0, "flash staking must not mint credits");
     assert_eq!(
@@ -1952,7 +1952,7 @@ fn test_pause_staking_blocks_new_stakes_but_allows_withdrawals() {
 
     assert!(t.client.try_stake(&t.user, &100i128).is_err());
     assert!(t.client.try_lock_assets(&t.user, &100i128).is_err());
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
 }
 
 #[test]
@@ -1961,7 +1961,7 @@ fn test_pause_withdrawals_blocks_unstake_but_allows_new_stakes() {
     t.client.pause_withdrawals();
     t.client.stake(&t.user, &1_000);
 
-    assert!(t.client.try_unstake(&t.user).is_err());
+    assert!(t.client.try_unstake(&t.user, &1_000).is_err());
     assert!(t.client.try_unlock_assets(&t.user, &100i128).is_err());
 }
 
@@ -1990,7 +1990,7 @@ fn test_pause_blocks_unstake() {
     let t = setup(1, 1);
     t.client.stake(&t.user, &1_000);
     t.client.pause();
-    assert!(t.client.try_unstake(&t.user).is_err());
+    assert!(t.client.try_unstake(&t.user, &1_000).is_err());
 }
 
 #[test]
@@ -1999,7 +1999,7 @@ fn test_unpause_restores_unstake() {
     t.client.stake(&t.user, &1_000);
     t.client.pause();
     t.client.unpause();
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert!(t.client.get_stake(&t.user).is_none());
 }
 
@@ -2659,7 +2659,7 @@ fn test_unstake_reentrant_transfer_is_rejected_and_final_state_is_correct() {
         soroban_sdk::vec![&env, user.clone().into_val(&env)];
     token_client.configure_reentrant_call(&Symbol::new(&env, "unstake"), &reentrant_args);
 
-    client.unstake(&user);
+    client.unstake(&user, &1_000);
 
     assert!(token_client.reentry_was_rejected());
     assert!(client.get_stake(&user).is_none());
@@ -2685,7 +2685,7 @@ fn test_unstake_reverts_entirely_if_stake_token_naively_reenters() {
     seed_user_stake(&env, &farming_pool_id, &user, 500i128);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.unstake(&user);
+        client.unstake(&user, &1_000);
     }));
     assert!(
         result.is_err(),
@@ -2899,7 +2899,7 @@ fn test_staked_user_count_increments_and_decrements_correctly() {
     assert_eq!(t.client.staked_user_count(), 2);
 
     // User 1 unstakes completely: count becomes 1
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert_eq!(t.client.staked_user_count(), 1);
 
     // User 2 unlocks position completely: count becomes 0
@@ -2951,7 +2951,7 @@ fn test_lock_count_increments_on_every_lock_operation() {
     // Flexible staking does not affect lock_count
     t.client.stake(&t.user, &1_000);
     assert_eq!(t.client.lock_count(), 0);
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert_eq!(t.client.lock_count(), 0);
 
     // User 1 locks: lock_count becomes 1
@@ -2994,12 +2994,12 @@ fn test_unstake_count_increments_on_every_unstake_operation() {
     assert_eq!(t.client.unstake_count(), 0);
 
     // User 1 unstakes: unstake_count becomes 1
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert_eq!(t.client.unstake_count(), 1);
     assert_eq!(t.client.get_unstake_count(), 1);
 
     // User 2 unstakes: unstake_count becomes 2
-    t.client.unstake(&user2);
+    t.client.unstake(&user2, &1_000);
     assert_eq!(t.client.unstake_count(), 2);
     assert_eq!(t.client.get_unstake_count(), 2);
 
@@ -3049,7 +3049,7 @@ fn test_active_stake_count_lifecycle() {
     assert_eq!(t.client.active_stake_count(), 2);
 
     // User 1 unstakes: active_stake_count becomes 1
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert_eq!(t.client.active_stake_count(), 1);
 
     // Pool pauses, User 2 emergency withdraws: active_stake_count becomes 0
@@ -3334,5 +3334,91 @@ fn test_position_credits_independent_of_checkpoint_frequency() {
     assert_eq!(
         t.client.get_position_credits(&t.user),
         t.client.get_position_credits(&user_b)
+    );
+}
+
+#[test]
+fn test_compute_credits_overflow_prevention() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1000);
+    t.client.set_boost(&t.user, &100);
+    t.env.as_contract(&t.contract_id, || {
+        let amt = crate::compute_credits(1000, 0, 1, 100, 10);
+        assert_eq!(amt, 1_000_000);
+    });
+}
+
+#[test]
+#[should_panic(expected = "credits arithmetic overflow")]
+fn test_compute_credits_overflow_panics() {
+    let t = setup(2, 1);
+    t.env.as_contract(&t.contract_id, || {
+        let _ = crate::compute_credits(10i128.pow(18), 100, 1_000, 100_000_000, u32::MAX);
+    });
+}
+
+#[test]
+fn test_checkpoint_formulas_produce_identical_results() {
+    let t = setup(2, 1);
+    let user_b = Address::generate(&t.env);
+    t.token_sac.mint(&user_b, &1_000);
+
+    t.client.stake(&t.user, &1000);
+    t.client.lock_assets(&user_b, &1000);
+
+    advance_ledgers(&t.env, 10);
+
+    let credits_a = t.client.get_stake_credits(&t.user);
+    let credits_b = t.client.get_position_credits(&user_b);
+
+    assert_eq!(credits_a, credits_b);
+    assert!(credits_a > 0);
+}
+
+#[test]
+fn test_set_min_lock_period_bounds() {
+    let t = setup(2, 1);
+    
+    assert!(t.client.try_set_min_lock_period(&63_072_000).is_ok());
+    assert_eq!(t.client.min_lock_period(), 63_072_000);
+    
+    assert_eq!(
+        t.client.try_set_min_lock_period(&63_072_001),
+        Err(Ok(PoolError::InvalidLockPeriod))
+    );
+}
+
+#[test]
+fn test_partial_unstake_works_and_leaves_correct_balance() {
+    let t = setup(2, 1);
+    let initial = t.token.balance(&t.user);
+    t.client.stake(&t.user, &1000);
+    t.client.set_boost(&t.user, &50);
+    advance_ledgers(&t.env, 10);
+
+    let credits_claimed = t.client.unstake(&t.user, &400);
+    assert!(credits_claimed > 0);
+    assert_eq!(t.token.balance(&t.user), initial - 600);
+
+    let stake = t.client.get_stake(&t.user).unwrap();
+    assert_eq!(stake.amount, 600);
+    assert_eq!(stake.credits_banked, credits_claimed);
+    assert_eq!(t.client.total_staked(), 600);
+    
+    advance_ledgers(&t.env, 10);
+    let final_credits = t.client.unstake(&t.user, &600);
+    assert!(final_credits > credits_claimed); 
+    
+    assert!(t.client.get_stake(&t.user).is_none());
+    assert_eq!(t.token.balance(&t.user), initial);
+}
+
+#[test]
+fn test_unstake_more_than_balance_fails() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1000);
+    assert_eq!(
+        t.client.try_unstake(&t.user, &1001),
+        Err(Ok(PoolError::InsufficientBalance))
     );
 }
