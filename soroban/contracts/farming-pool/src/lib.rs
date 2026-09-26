@@ -971,7 +971,9 @@ impl FarmingPool {
         require_initialized(&env)?;
         require_staking_not_paused(&env)?;
 
-        assert!(amount > 0, "amount must be positive");
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
 
         if whitelist_enabled(&env) && !is_user_whitelisted(&env, &user) {
             return Err(PoolError::NotWhitelisted);
@@ -1042,18 +1044,21 @@ impl FarmingPool {
         require_initialized(&env)?;
         require_withdrawals_not_paused(&env)?;
 
-        assert!(amount > 0, "amount must be positive");
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
         bump_instance(&env);
 
         let was_staked = is_user_staked(&env, &user);
-        let mut position = get_position(&env, &user).expect("no active position");
-        assert!(amount <= position.amount, "insufficient locked balance");
+        let mut position = get_position(&env, &user).ok_or(PoolError::NoActivePosition)?;
+        if amount > position.amount {
+            return Err(PoolError::InsufficientBalance);
+        }
 
         let current = env.ledger().sequence();
-        assert!(
-            current >= position.unlock_ledger,
-            "minimum lock period not elapsed"
-        );
+        if current < position.unlock_ledger {
+            return Err(PoolError::LockPeriodNotElapsed);
+        }
 
         checkpoint_position(&env, &user, &mut position);
         let total_credits = position.total_credits;
@@ -1254,36 +1259,38 @@ impl FarmingPool {
         bump_instance(&env);
 
         let was_staked = is_user_staked(&env, &user);
-        let mut total_returned = 0i128;
-        let mut position_credits = 0i128;
-        let mut stake_credits = 0i128;
-        let stake_token = get_stake_token(&env)?;
-        let token = token::TokenClient::new(&env, &stake_token);
+        let position_opt = get_position(&env, &user);
+        let stake_opt = get_user_stake(&env, &user);
+        if position_opt.is_none() && stake_opt.is_none() {
+            return Err(PoolError::NoActiveStake);
+        }
+        let position_amount = position_opt.as_ref().map_or(0i128, |p| p.amount);
+        let stake_amount = stake_opt.as_ref().map_or(0i128, |s| s.amount);
+        let total_returned = position_amount + stake_amount;
+        if total_returned == 0 {
+            return Err(PoolError::NoActiveStake);
+        }
+        let position_credits = position_opt.as_ref().map_or(0i128, |p| p.total_credits);
+        let stake_credits = stake_opt.as_ref().map_or(0i128, |s| s.credits_banked);
 
-        if let Some(position) = get_position(&env, &user) {
-            token.transfer(&env.current_contract_address(), &user, &position.amount);
-            total_returned += position.amount;
-            subtract_total_staked(&env, position.amount);
-            subtract_total_locked(&env, position.amount);
-            position_credits = position.total_credits;
+        // Checks-effects-interactions: clear all state *before* the external
+        // token transfers below so a malicious token contract cannot
+        // re-enter and double-withdraw. On transfer failure the whole
+        // invocation reverts, rolling these writes back. See #279.
+        if position_opt.is_some() {
+            subtract_total_staked(&env, position_amount);
+            subtract_total_locked(&env, position_amount);
             remove_position(&env, &user);
         }
 
-        if let Some(stake) = get_user_stake(&env, &user) {
-            token.transfer(&env.current_contract_address(), &user, &stake.amount);
-            total_returned += stake.amount;
-            subtract_total_staked(&env, stake.amount);
-            stake_credits = stake.credits_banked;
+        if stake_opt.is_some() {
+            subtract_total_staked(&env, stake_amount);
             remove_user_stake(&env, &user);
             decrement_active_stake_count(&env);
         }
 
         if was_staked && !is_user_staked(&env, &user) {
             decrement_staked_user_count(&env);
-        }
-
-        if total_returned == 0 {
-            return Err(PoolError::NoActiveStake);
         }
 
         add_total_withdrawals(&env, total_returned);
@@ -1302,6 +1309,19 @@ impl FarmingPool {
         }
 
         increment_emergency_withdrawal_count(&env);
+
+        let stake_token = get_stake_token(&env)?;
+        let token = token::TokenClient::new(&env, &stake_token);
+        if position_opt.is_some() {
+            token.transfer(
+                &env.current_contract_address(),
+                &user,
+                &position_amount,
+            );
+        }
+        if stake_opt.is_some() {
+            token.transfer(&env.current_contract_address(), &user, &stake_amount);
+        }
 
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("emrg_exit")),
@@ -1525,7 +1545,9 @@ impl FarmingPool {
         from.require_auth();
         require_initialized(&env)?;
         require_staking_not_paused(&env)?;
-        assert!(amount > 0, "amount must be positive");
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
 
         if whitelist_enabled(&env) && !is_user_whitelisted(&env, &from) {
             return Err(PoolError::NotWhitelisted);
@@ -1597,34 +1619,40 @@ impl FarmingPool {
         bump_instance(&env);
 
         let was_staked = is_user_staked(&env, &from);
-        let mut stake = get_user_stake(&env, &from).expect("no active stake");
+        let mut stake = get_user_stake(&env, &from).ok_or(PoolError::NoActiveStake)?;
         checkpoint(&env, &from, &mut stake);
         let total_credits = stake.credits_banked;
+        let stake_amount = stake.amount;
         if total_credits > 0 {
             subtract_total_banked_credits(&env, total_credits);
         }
 
-        // Return staked tokens to caller.
-        let stake_token = get_stake_token(&env)?;
-        token::TokenClient::new(&env, &stake_token).transfer(
-            &env.current_contract_address(),
-            &from,
-            &stake.amount,
-        );
-
-        env.events().publish(
-            (symbol_short!("pool"), symbol_short!("unstaked")),
-            (from.clone(), stake.amount, total_credits),
-        );
-
+        // Checks-effects-interactions: clear state *before* the external
+        // token transfer below so a reentrant token cannot re-enter and
+        // double-withdraw. On transfer failure the whole invocation
+        // reverts, rolling these writes back. See #279.
         remove_user_stake(&env, &from);
         decrement_active_stake_count(&env);
         if was_staked && !is_user_staked(&env, &from) {
             decrement_staked_user_count(&env);
         }
         increment_unstake_count(&env);
-        subtract_total_staked(&env, stake.amount);
-        add_total_withdrawals(&env, stake.amount);
+        subtract_total_staked(&env, stake_amount);
+        add_total_withdrawals(&env, stake_amount);
+
+        // Return staked tokens to caller.
+        let stake_token = get_stake_token(&env)?;
+        token::TokenClient::new(&env, &stake_token).transfer(
+            &env.current_contract_address(),
+            &from,
+            &stake_amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("unstaked")),
+            (from.clone(), stake_amount, total_credits),
+        );
+
         Ok(total_credits)
     }
 
