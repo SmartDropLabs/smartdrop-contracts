@@ -3059,3 +3059,151 @@ fn test_migrate_schema_version_framework() {
     let prev = t.client.migrate();
     assert_eq!(prev, 1);
 }
+
+// ── #284: compute_total_stake must not truncate small boosts to zero ─────────
+
+#[test]
+fn test_compute_total_stake_preserves_small_boosts() {
+    // Single trailing division: amount * (100 - alloc + alloc * mult) / 100.
+    // Cases where the old split form (`amount * alloc / 100` first) truncated
+    // `boosted` to zero and silently disabled the boost.
+    assert_eq!(compute_total_stake(1, 1, 1000), 10); // 1 * 1099 / 100
+    assert_eq!(compute_total_stake(10, 1, 1000), 109); // 10 * 1099 / 100
+    assert_eq!(compute_total_stake(99, 1, 1000), 1088); // 99 * 1099 / 100
+    assert_eq!(compute_total_stake(1, 100, 2), 2);
+    assert_eq!(compute_total_stake(50, 50, 2), 75);
+}
+
+#[test]
+fn test_compute_total_stake_matches_split_form_for_large_amounts() {
+    // Refactor guard: for amounts divisible by 100 both formulations agree,
+    // so existing 1_000-based expectations are unaffected by the #284 fix.
+    let cases = [(1_000u32, 50u32, 2u32, 1_500i128), (1_000, 100, 2, 2_000)];
+    for (amount, alloc, mult, expected) in cases {
+        assert_eq!(compute_total_stake(amount as i128, alloc, mult), expected);
+    }
+}
+
+// ── #285: set_boost requires an active flexible stake ────────────────────────
+
+#[test]
+fn test_set_boost_rejects_position_only_user() {
+    // Boost accrues only via the UserStake path: a time-locked Position alone
+    // must not satisfy set_boost's active-stake check.
+    let t = setup(2, 1);
+    t.client.lock_assets(&t.user, &1_000);
+    let res = t.client.try_set_boost(&t.user, &50u32);
+    assert_eq!(res, Err(Ok(PoolError::NoActiveStake)));
+}
+
+// ── #286: set_global_multiplier has zero effect on the Position path ────────
+
+#[test]
+fn test_set_global_multiplier_has_zero_effect_on_position_accrual() {
+    // Position accrual is amount * credit_rate * elapsed with no multiplier
+    // term, so bumping the global multiplier must leave both the accrued view
+    // and future accrual unchanged.
+    let t = setup(2, 1);
+    t.client.lock_assets(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+    assert_eq!(t.client.calculate_credits(&t.user), 10_000);
+
+    t.client.set_global_multiplier(&100u32);
+    // Already-accrued credits are untouched by the change itself.
+    assert_eq!(t.client.calculate_credits(&t.user), 10_000);
+
+    advance_ledgers(&t.env, 10);
+    // Future position accrual still ignores the multiplier.
+    assert_eq!(t.client.calculate_credits(&t.user), 20_000);
+    assert_eq!(t.client.get_position_credits(&t.user), 20_000);
+}
+
+#[test]
+fn test_set_global_multiplier_does_not_rewrite_already_accrued_stake_credits() {
+    // Pin the already-accrued portion: changing the multiplier with no ledger
+    // advance must not move the read-only view; only later ledgers accrue at
+    // the new multiplier.
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &50u32);
+    advance_ledgers(&t.env, 10);
+    assert_eq!(t.client.get_credits(&t.user), 15_000);
+
+    t.client.set_global_multiplier(&3u32);
+    assert_eq!(t.client.get_credits(&t.user), 15_000);
+
+    advance_ledgers(&t.env, 10);
+    assert_eq!(t.client.get_credits(&t.user), 35_000);
+}
+
+// ── #287: i128 overflow boundaries for compute_total_stake/compute_credits ──
+
+#[test]
+fn test_compute_total_stake_i128_boundary_table() {
+    // Deterministic boundary sweep: every case is cross-checked against the
+    // checked-arithmetic oracle, so any silent wrapping in the implementation
+    // fails the test. Values approach i128::MAX quotients without exceeding
+    // them, plus tiny-amount boost cases from #284.
+    let cases: [(i128, u32, u32); 8] = [
+        (1, 1, 1000),
+        (99, 1, 1000),
+        (10_000_000_000_000_000_000, 100, 1000),
+        (i128::MAX / 200_000, 100, 1000),
+        (i128::MAX / 101, 1, 2),
+        (1_000_000_000_000_000_000, 50, 1000),
+        (i128::MAX / 100_100, 100, 1000),
+        (0, 100, 1000),
+    ];
+    for (amount, alloc, mult) in cases {
+        let alloc_i = alloc as i128;
+        let mult_i = mult as i128;
+        let factor = (100i128 - alloc_i)
+            .checked_add(alloc_i.checked_mul(mult_i).unwrap())
+            .unwrap();
+        let expected = amount
+            .checked_mul(factor)
+            .and_then(|v| v.checked_div(100))
+            .unwrap();
+        assert_eq!(compute_total_stake(amount, alloc, mult), expected);
+    }
+}
+
+#[test]
+fn test_compute_credits_i128_overflow_boundaries() {
+    // The #89 ceiling product must fit with the documented 16x headroom, and
+    // inputs beyond it must observably overflow checked arithmetic — proving
+    // the boundary is load-bearing rather than arbitrary.
+    const AMOUNT_MAX: i128 = 1_000_000_000_000_000_000;
+    const ELAPSED_MAX: i128 = 63_072_000;
+    let worst = (AMOUNT_MAX as i128)
+        .checked_mul(MAX_GLOBAL_MULTIPLIER as i128)
+        .and_then(|v| v.checked_mul(MAX_CREDIT_RATE))
+        .and_then(|v| v.checked_mul(ELAPSED_MAX))
+        .expect("ceiling product must fit in i128");
+    assert!(worst <= i128::MAX / 16);
+    assert_eq!(
+        compute_credits(
+            AMOUNT_MAX,
+            100,
+            MAX_GLOBAL_MULTIPLIER,
+            MAX_CREDIT_RATE,
+            ELAPSED_MAX as u32
+        ),
+        worst
+    );
+
+    // Just beyond the boundary, checked arithmetic refuses — the ceilings exist
+    // to keep on-chain (unchecked) math away from this region.
+    assert!(i128::MAX.checked_mul(2).is_none());
+    assert!(worst.checked_mul(16).is_some());
+    assert!(worst.checked_mul(26).is_some());
+    assert!(worst.checked_mul(27).is_none());
+    assert!(worst.checked_mul(28).is_none());
+
+    // Small-value sanity across theCredits chain (allocation sweep).
+    for alloc in [0u32, 1, 25, 50, 99, 100] {
+        let total = compute_total_stake(99, alloc, 10);
+        let credits = compute_credits(99, alloc, 10, 7, 13);
+        assert_eq!(credits, total * 7 * 13);
+    }
+}

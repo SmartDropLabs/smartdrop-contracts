@@ -619,18 +619,22 @@ fn set_whitelisted_users_list(env: &Env, users: &Vec<Address>) {
 
 /// Compute the effective total stake for credit accrual.
 ///
-/// Splits `amount` into a principal portion and a boosted virtual portion:
-///   boosted_amount  = amount * allocation_pct / 100
-///   principal_stake = amount - boosted_amount
-///   virtual_stake   = boosted_amount * multiplier
-///   total_stake     = principal_stake + virtual_stake
+/// Splits `amount` into a principal portion and a boosted virtual portion.
+/// The computation uses a single trailing division so small stakes do not
+/// lose their boost to intermediate truncation (#284):
+///   total_stake = amount * (100 - allocation_pct + allocation_pct * multiplier) / 100
+///
+/// This is algebraically identical to the split form
+/// (`boosted = amount * allocation_pct / 100`, `principal = amount - boosted`,
+/// `virtual = boosted * multiplier`) but defers the `/ 100` until after all
+/// multiplication, so e.g. `amount = 1, allocation_pct = 1, multiplier = 1000`
+/// yields `10` instead of truncating `boosted` to `0` and returning `1`.
 ///
 /// With no boost (allocation_pct = 0) total_stake == amount.
 fn compute_total_stake(amount: i128, allocation_pct: u32, multiplier: u32) -> i128 {
-    let boosted = amount * allocation_pct as i128 / 100;
-    let principal = amount - boosted;
-    let virtual_stake = boosted * multiplier as i128;
-    principal + virtual_stake
+    let alloc = allocation_pct as i128;
+    let mult = multiplier as i128;
+    amount * (100 - alloc + alloc * mult) / 100
 }
 
 fn compute_credits(
@@ -1656,6 +1660,11 @@ impl FarmingPool {
         Ok(total_credits)
     }
 
+    /// Admin sets a user's boost allocation (1-100%). Requires an active
+    /// flexible `UserStake` for `user` (#285): boosting an address with no
+    /// stake is rejected with `NoActiveStake` instead of storing an inert
+    /// allocation. A time-locked `Position` alone does not satisfy this —
+    /// boost only accrues via the `UserStake` path.
     pub fn set_boost(env: Env, user: Address, allocation_pct: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
         require_staking_not_paused(&env)?;
