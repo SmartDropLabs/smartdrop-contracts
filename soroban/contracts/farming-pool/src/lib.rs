@@ -958,12 +958,56 @@ impl FarmingPool {
         get_admin(&env)?.require_auth();
         bump_instance(&env);
 
+        // Capture the old WASM hash before replacing it so the upgrade event
+        // provides a complete audit trail of which version was replaced (#291).
+        let old_wasm_hash = env.deployer().get_current_contract_wasm_hash();
+
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("upgraded")),
-            new_wasm_hash.clone(),
+            (old_wasm_hash, new_wasm_hash.clone()),
         );
         env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
+
+    /// Admin: re-initialize a user's banked credits after TTL expiry (#290).
+    ///
+    /// If a user's `BankedCredits` storage entry expired due to TTL, this
+    /// function allows the admin to restore it from verified off-chain records.
+    /// The admin must provide the correct position and stake credit totals as
+    /// known from the last checkpoint before expiry.
+    ///
+    /// This does NOT restore the user's stake or position (those require a new
+    /// `stake` or `lock_assets` call) — only their banked credit history so
+    /// they do not lose previously-earned credits.
+    pub fn recover_banked_credits(
+        env: Env,
+        user: Address,
+        position_credits: i128,
+        stake_credits: i128,
+    ) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        if position_credits < 0 || stake_credits < 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+        bump_instance(&env);
+
+        set_banked_credits(
+            &env,
+            &user,
+            BankedCreditTotals {
+                position_credits,
+                stake_credits,
+            },
+        );
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("recov")),
+            (user, position_credits, stake_credits),
+        );
         Ok(())
     }
 
