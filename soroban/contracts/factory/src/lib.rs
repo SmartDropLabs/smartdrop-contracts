@@ -964,6 +964,9 @@ impl Factory {
         }
 
         let old_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
+        if new_hash == old_hash {
+            return Err(FactoryError::SameWasmHash);
+        }
         env.storage().instance().set(&DataKey::WasmHash, &new_hash);
         #[allow(deprecated)]
         env.events().publish(
@@ -1106,6 +1109,7 @@ impl Factory {
         let next_count = pool_id
             .checked_add(1)
             .ok_or(FactoryError::PoolCountOverflow)?;
+        env.storage().instance().set(&DataKey::PoolCount, &next_count);
         let wasm_hash = load_wasm_hash(&env)?;
         let salt = pool_salt(&env, pool_id);
 
@@ -1174,9 +1178,6 @@ impl Factory {
         admin_pool_ids.push_back(pool_id);
         env.storage().persistent().set(&admin_key, &admin_pool_ids);
         bump_admin_pools(&env, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::PoolCount, &next_count);
 
         // Emit enriched event so indexers get the full pool parameters in one shot.
         #[allow(deprecated)]
