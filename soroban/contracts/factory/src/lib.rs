@@ -23,6 +23,9 @@ const LEDGERS_PER_DAY: u128 = 17_280;
 // Minimum stake in the asset's smallest units. This is 0.1 token for the
 // standard 7-decimal Stellar asset convention and prevents dust positions.
 const MIN_STAKE_AMOUNT: i128 = 1_000_000;
+// Maximum stake per position, mirroring the farming pool's own limit so a
+// `min_stake_amount` the pool would reject is caught here first (issue #323).
+const MAX_STAKE_AMOUNT: i128 = 10i128.pow(18);
 // Minimum lock period in ledgers required to prevent flash-loan-style attacks.
 const MIN_LOCK_PERIOD: u32 = 1;
 
@@ -51,6 +54,16 @@ fn daily_rate_to_credit_rate(daily_rate: u128) -> Result<i128, FactoryError> {
     }
     let per_ledger = daily_rate.div_ceil(LEDGERS_PER_DAY);
     i128::try_from(per_ledger).map_err(|_| FactoryError::InvalidCreditRate)
+}
+
+/// Publishes a `pool_gap` event for a pool ID below `PoolCount` whose record is
+/// missing from storage (expired or never written), so callers and indexers
+/// can see gaps in the registry instead of the ID being skipped silently
+/// (issue #325).
+fn publish_pool_gap(env: &Env, pool_id: u32) {
+    #[allow(deprecated)]
+    env.events()
+        .publish((symbol_short!("factory"), symbol_short!("pool_gap")), pool_id);
 }
 
 fn bump_instance(env: &Env) {
@@ -366,6 +379,10 @@ impl Factory {
     /// full-registry maintenance independent of read patterns, use
     /// `refresh_pool_ttls`.
     ///
+    /// A pool ID below the registry count whose record is missing from storage
+    /// is left out of `records` and reported with a `("factory", "pool_gap")`
+    /// event carrying the ID, so gaps are visible to callers and indexers.
+    ///
     /// Returns `NotInitialized` if the factory has not been initialized.
     pub fn list_pools(
         env: Env,
@@ -396,6 +413,8 @@ impl Factory {
             if let Some(record) = env.storage().persistent().get::<DataKey, PoolRecord>(&key) {
                 bump_pool(&env, pool_id);
                 records.push_back((pool_id, record));
+            } else {
+                publish_pool_gap(&env, pool_id);
             }
         }
 
@@ -446,6 +465,8 @@ impl Factory {
             if let Some(record) = env.storage().persistent().get::<DataKey, PoolRecord>(&key) {
                 bump_pool(&env, pool_id);
                 insert_sorted(&mut records, (pool_id, record), sort);
+            } else {
+                publish_pool_gap(&env, pool_id);
             }
         }
 
@@ -1125,7 +1146,9 @@ impl Factory {
         } else {
             min_stake_amount
         };
-        if effective_min_stake < MIN_STAKE_AMOUNT {
+        // A non-positive request means "use the default"; anything else must lie
+        // within [MIN_STAKE_AMOUNT, MAX_STAKE_AMOUNT] so the pool is usable.
+        if effective_min_stake < MIN_STAKE_AMOUNT || effective_min_stake > MAX_STAKE_AMOUNT {
             return Err(FactoryError::InvalidMinStakeAmount);
         }
 
