@@ -528,6 +528,9 @@ impl Factory {
                     next_start_id = scan_end;
                     break;
                 }
+                // (#327) The limit check runs *before* pushing, so `pool_id`
+                // is the first unreturned match: resuming from it includes it
+                // in the next page instead of skipping it.
                 if records.len() >= capped_limit {
                     next_start_id = pool_id;
                     break;
@@ -548,6 +551,9 @@ impl Factory {
         }
 
         for pool_id in start_id..scan_end {
+            // (#327) Same invariant as the indexed path above: resume at the
+            // first unprocessed ID so a match sitting on the limit boundary
+            // is returned by the next page rather than skipped.
             if records.len() >= capped_limit {
                 next_start_id = pool_id;
                 break;
@@ -636,6 +642,10 @@ impl Factory {
     /// every ~45 days (between TTL_THRESHOLD of ~30 days and TTL_EXTEND_TO of
     /// ~60 days) to ensure all pool records remain accessible.
     ///
+    /// # Events
+    /// Emits a `ttl_ref` event with `(start_id, end)` so off-chain monitoring
+    /// can track when each pool range was last refreshed (#328).
+    ///
     /// # Security implications of being permissionless (#168)
     /// Any caller may extend pool-record TTLs. The blast radius is intentionally
     /// bounded and non-hazardous:
@@ -688,12 +698,25 @@ impl Factory {
     /// Supports key rotation and future governance handoffs without redeploying
     /// the factory. Emits a `adm_xfr` event with `(old_admin, new_admin)`.
     ///
+    /// Rejects the zero address (`GAAA...WHF`) with `InvalidAdmin`: handing
+    /// the factory to an unusable admin would permanently lock it (#329).
+    ///
     /// Returns `NotInitialized` if the factory has not been initialized.
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), FactoryError> {
         require_initialized(&env)?;
         let current = load_admin(&env)?;
         current.require_auth();
         bump_instance(&env);
+        // Validate after auth so unauthenticated callers still hit the auth
+        // check first (mirrors `set_pool_wasm_hash`'s validate-after-auth order).
+        if new_admin
+            == Address::from_string(&String::from_str(
+                &env,
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            ))
+        {
+            return Err(FactoryError::InvalidAdmin);
+        }
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         increment_admin_transfer_count(&env);
         #[allow(deprecated)]
@@ -964,6 +987,9 @@ impl Factory {
         }
 
         let old_hash: BytesN<32> = env.storage().instance().get(&DataKey::WasmHash).unwrap();
+        if new_hash == old_hash {
+            return Err(FactoryError::SameWasmHash);
+        }
         env.storage().instance().set(&DataKey::WasmHash, &new_hash);
         #[allow(deprecated)]
         env.events().publish(
@@ -1042,9 +1068,10 @@ impl Factory {
     /// admin action" design surface.
     ///
     /// The `pool_crtd` event includes `admin`, `asset`, `credit_rate`,
-    /// `global_multiplier`, and `min_lock_period` alongside `pool_id` and
-    /// `pool_address` so off-chain indexers can reconstruct the full pool
-    /// state — including who created it — without a follow-up RPC call (#233).
+    /// `global_multiplier`, `min_lock_period`, and `min_stake_amount`
+    /// alongside `pool_id` and `pool_address` so off-chain indexers can
+    /// reconstruct the full pool state — including who created it — without
+    /// a follow-up RPC call (#233, #330).
     ///
     /// On failure, no event is emitted: a validation failure reverts this
     /// invocation, and Soroban discards contract events published by reverted
@@ -1106,6 +1133,7 @@ impl Factory {
         let next_count = pool_id
             .checked_add(1)
             .ok_or(FactoryError::PoolCountOverflow)?;
+        env.storage().instance().set(&DataKey::PoolCount, &next_count);
         let wasm_hash = load_wasm_hash(&env)?;
         let salt = pool_salt(&env, pool_id);
 
@@ -1174,11 +1202,10 @@ impl Factory {
         admin_pool_ids.push_back(pool_id);
         env.storage().persistent().set(&admin_key, &admin_pool_ids);
         bump_admin_pools(&env, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::PoolCount, &next_count);
 
         // Emit enriched event so indexers get the full pool parameters in one shot.
+        // `effective_min_stake` is the resolved dust-thresholded value actually
+        // passed to the pool's `initialize` (#330), not the raw caller input.
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("factory"), symbol_short!("pool_crtd")),
@@ -1192,6 +1219,7 @@ impl Factory {
                 min_lock_period,
                 daily_rate,
                 wasm_hash,
+                effective_min_stake,
             ),
         );
 

@@ -10,7 +10,9 @@ use soroban_sdk::{
 };
 pub use types::PoolError;
 use types::{
-    BankedCreditTotals, BoostConfig, DataKey, ListWhitelistedResponse, Position, UserStake,
+    AdminActionEvent, AdminActionHistoryPage, BankedCreditTotals, BoostConfig, BoostEvent,
+    BoostHistoryPage, DataKey, ListWhitelistedResponse, Position, StakeEvent, StakeHistoryPage,
+    UserStake, WhitelistEvent, WhitelistHistoryPage,
 };
 
 // Expose compiled WASM bytes so sibling crates (e.g. `factory`) can upload the
@@ -670,6 +672,86 @@ fn set_locked_users_list(env: &Env, users: &Vec<Address>) {
         .set(&DataKey::LockedUsers, users);
 }
 
+// ── History recording helpers ────────────────────────────────────────────────
+
+fn record_whitelist_event(env: &Env, user: &Address, added: bool) {
+    let count: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::WhitelistEventCount)
+        .unwrap_or(0);
+    let event = WhitelistEvent {
+        user: user.clone(),
+        added,
+        ledger: env.ledger().sequence(),
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::WhitelistHistory(count), &event);
+    env.storage()
+        .instance()
+        .set(&DataKey::WhitelistEventCount, &(count + 1));
+}
+
+fn record_boost_event(env: &Env, user: &Address, old_allocation: u32, new_allocation: u32) {
+    let count: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::BoostEventCount)
+        .unwrap_or(0);
+    let event = BoostEvent {
+        user: user.clone(),
+        old_allocation,
+        new_allocation,
+        ledger: env.ledger().sequence(),
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::BoostHistory(count), &event);
+    env.storage()
+        .instance()
+        .set(&DataKey::BoostEventCount, &(count + 1));
+}
+
+fn record_stake_event(env: &Env, user: &Address, action: soroban_sdk::Symbol, amount: i128) {
+    let count: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::StakeEventCount)
+        .unwrap_or(0);
+    let event = StakeEvent {
+        user: user.clone(),
+        action,
+        amount,
+        ledger: env.ledger().sequence(),
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::StakeHistory(count), &event);
+    env.storage()
+        .instance()
+        .set(&DataKey::StakeEventCount, &(count + 1));
+}
+
+fn record_admin_action(env: &Env, action: soroban_sdk::Symbol, admin: &Address) {
+    let count: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::AdminActionCount)
+        .unwrap_or(0);
+    let event = AdminActionEvent {
+        action,
+        admin: admin.clone(),
+        ledger: env.ledger().sequence(),
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::AdminActionHistory(count), &event);
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminActionCount, &(count + 1));
+}
+
 // ── Boost calculation ─────────────────────────────────────────────────────────
 
 /// Compute the effective total stake for credit accrual.
@@ -1014,7 +1096,8 @@ impl FarmingPool {
 
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         bump_instance(&env);
 
         // Capture the old WASM hash before replacing it so the upgrade event
@@ -1029,6 +1112,9 @@ impl FarmingPool {
             (symbol_short!("pool"), symbol_short!("upgraded")),
             (old_wasm_hash, new_wasm_hash.clone()),
         );
+
+        record_admin_action(&env, symbol_short!("upgrade"), &admin);
+
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
@@ -1084,6 +1170,9 @@ impl FarmingPool {
         if amount <= 0 {
             return Err(PoolError::InvalidAmount);
         }
+        if amount > MAX_STAKE_AMOUNT {
+            return Err(PoolError::ExceedsMaxStake);
+        }
 
         if whitelist_enabled(&env) && !is_user_whitelisted(&env, &user) {
             return Err(PoolError::NotWhitelisted);
@@ -1093,6 +1182,9 @@ impl FarmingPool {
         let min_stake = Self::get_min_stake_amount(env.clone())?;
         if total_amount < min_stake {
             return Err(PoolError::BelowMinimumStake);
+        }
+        if total_amount > MAX_STAKE_AMOUNT {
+            return Err(PoolError::ExceedsMaxStake);
         }
 
         bump_instance(&env);
@@ -1144,8 +1236,11 @@ impl FarmingPool {
 
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("locked")),
-            (user, amount, position.amount),
+            (user.clone(), amount, position.amount),
         );
+
+        record_stake_event(&env, &user, symbol_short!("lock"), amount);
+
         Ok(())
     }
 
@@ -1156,6 +1251,9 @@ impl FarmingPool {
 
         if amount <= 0 {
             return Err(PoolError::InvalidAmount);
+        }
+        if amount > MAX_STAKE_AMOUNT {
+            return Err(PoolError::ExceedsMaxStake);
         }
         bump_instance(&env);
 
@@ -1204,8 +1302,11 @@ impl FarmingPool {
 
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("unlocked")),
-            (user, amount, total_credits),
+            (user.clone(), amount, total_credits),
         );
+
+        record_stake_event(&env, &user, symbol_short!("unlock"), amount);
+
         Ok(())
     }
 
@@ -1261,7 +1362,8 @@ impl FarmingPool {
 
     pub fn pause(env: Env) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Paused, &true);
         env.storage().instance().set(&DataKey::PausedStaking, &true);
@@ -1270,6 +1372,9 @@ impl FarmingPool {
             .set(&DataKey::PausedWithdrawals, &true);
         env.events()
             .publish((symbol_short!("pool"), symbol_short!("paused")), ());
+
+        record_admin_action(&env, symbol_short!("paused"), &admin);
+
         Ok(())
     }
 
@@ -1297,7 +1402,8 @@ impl FarmingPool {
 
     pub fn unpause(env: Env) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage()
@@ -1308,6 +1414,9 @@ impl FarmingPool {
             .set(&DataKey::PausedWithdrawals, &false);
         env.events()
             .publish((symbol_short!("pool"), symbol_short!("unpaused")), ());
+
+        record_admin_action(&env, symbol_short!("unpaus"), &admin);
+
         Ok(())
     }
 
@@ -1525,9 +1634,12 @@ impl FarmingPool {
 
         let mut users = get_whitelisted_users_list(&env);
         if !users.contains(&user) {
-            users.push_back(user);
+            users.push_back(user.clone());
             set_whitelisted_users_list(&env, &users);
         }
+
+        record_whitelist_event(&env, &user, true);
+
         Ok(())
     }
 
@@ -1548,6 +1660,9 @@ impl FarmingPool {
             }
         }
         set_whitelisted_users_list(&env, &new_users);
+
+        record_whitelist_event(&env, &user, false);
+
         Ok(())
     }
 
@@ -1671,6 +1786,9 @@ impl FarmingPool {
         if amount <= 0 {
             return Err(PoolError::InvalidAmount);
         }
+        if amount > MAX_STAKE_AMOUNT {
+            return Err(PoolError::ExceedsMaxStake);
+        }
 
         if whitelist_enabled(&env) && !is_user_whitelisted(&env, &from) {
             return Err(PoolError::NotWhitelisted);
@@ -1723,8 +1841,10 @@ impl FarmingPool {
 
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("staked")),
-            (from, amount),
+            (from.clone(), amount),
         );
+
+        record_stake_event(&env, &from, symbol_short!("stake"), amount);
 
         Ok(())
     }
@@ -1789,6 +1909,8 @@ impl FarmingPool {
             (from.clone(), amount, total_credits),
         );
 
+        record_stake_event(&env, &from, symbol_short!("unstake"), stake_amount);
+
         Ok(total_credits)
     }
 
@@ -1831,8 +1953,11 @@ impl FarmingPool {
         let multiplier = read_global_multiplier(&env);
         env.events().publish(
             (symbol_short!("boost"), symbol_short!("applied")),
-            (user, allocation_pct, multiplier),
+            (user.clone(), allocation_pct, multiplier),
         );
+
+        record_boost_event(&env, &user, old_alloc, allocation_pct);
+
         Ok(())
     }
 
@@ -1855,7 +1980,8 @@ impl FarmingPool {
     /// `MAX_GLOBAL_MULTIPLIER` — see #89 for the overflow-safety derivation.
     pub fn set_global_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         if !(1..=MAX_GLOBAL_MULTIPLIER).contains(&multiplier) {
             return Err(PoolError::InvalidGlobalMultiplier);
         }
@@ -1877,6 +2003,9 @@ impl FarmingPool {
             (symbol_short!("boost"), symbol_short!("mult_set")),
             (old_multiplier, multiplier),
         );
+
+        record_admin_action(&env, symbol_short!("mult"), &admin);
+
         Ok(())
     }
 
@@ -1892,7 +2021,8 @@ impl FarmingPool {
     /// when computing credits for users who have not yet checkpointed.
     pub fn set_credit_rate(env: Env, new_rate: i128) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         if new_rate <= 0 || new_rate > MAX_CREDIT_RATE {
             return Err(PoolError::InvalidCreditRate);
         }
@@ -1907,15 +2037,16 @@ impl FarmingPool {
             (symbol_short!("pool"), symbol_short!("rate_set")),
             (old_rate, new_rate, env.ledger().sequence()),
         );
+
+        record_admin_action(&env, symbol_short!("cr_rate"), &admin);
+
         Ok(())
     }
 
     pub fn set_min_lock_period(env: Env, new_period: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
-        if new_period > MAX_LOCK_PERIOD {
-            return Err(PoolError::InvalidLockPeriod);
-        }
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         bump_instance(&env);
 
         let old_period = read_min_lock_period(&env);
@@ -1937,9 +2068,12 @@ impl FarmingPool {
             .instance()
             .set(&DataKey::MinLockPeriod, &new_period);
         env.events().publish(
-            (symbol_short!("pool"), soroban_sdk::Symbol::new(&env, "min_lock_set")),
+            (symbol_short!("pool"), symbol_short!("lk_per")),
             (old_period, new_period),
         );
+
+        record_admin_action(&env, symbol_short!("lk_per"), &admin);
+
         Ok(())
     }
 
@@ -2028,7 +2162,8 @@ impl FarmingPool {
 
     pub fn set_min_stake_amount(env: Env, amount: i128) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         bump_instance(&env);
 
         if amount <= 0 || amount > MAX_STAKE_AMOUNT {
@@ -2043,6 +2178,8 @@ impl FarmingPool {
             (symbol_short!("pool"), symbol_short!("minst_set")),
             (old_amount, amount),
         );
+
+        record_admin_action(&env, symbol_short!("min_stk"), &admin);
 
         Ok(())
     }
@@ -2329,6 +2466,148 @@ impl FarmingPool {
         }
 
         Ok(ListWhitelistedResponse { users: page, total })
+    }
+
+    // ── History / audit trail query functions ────────────────────────────────
+
+    /// Return a paginated list of whitelist history events.
+    ///
+    /// `offset`: zero-based index of the first event to return.
+    /// `limit`: maximum number of events to return per call.
+    pub fn get_whitelist_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<WhitelistHistoryPage, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::WhitelistEventCount)
+            .unwrap_or(0);
+        let mut events: Vec<WhitelistEvent> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, WhitelistEvent>(&DataKey::WhitelistHistory(i))
+            {
+                events.push_back(event);
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(WhitelistHistoryPage { events, total })
+    }
+
+    /// Return a paginated list of boost allocation history events.
+    ///
+    /// `offset`: zero-based index of the first event to return.
+    /// `limit`: maximum number of events to return per call.
+    pub fn get_boost_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<BoostHistoryPage, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BoostEventCount)
+            .unwrap_or(0);
+        let mut events: Vec<BoostEvent> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, BoostEvent>(&DataKey::BoostHistory(i))
+            {
+                events.push_back(event);
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(BoostHistoryPage { events, total })
+    }
+
+    /// Return a paginated list of stake/unstake/lock/unlock history events.
+    ///
+    /// `offset`: zero-based index of the first event to return.
+    /// `limit`: maximum number of events to return per call.
+    pub fn get_stake_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<StakeHistoryPage, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StakeEventCount)
+            .unwrap_or(0);
+        let mut events: Vec<StakeEvent> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, StakeEvent>(&DataKey::StakeHistory(i))
+            {
+                events.push_back(event);
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(StakeHistoryPage { events, total })
+    }
+
+    /// Return a paginated list of admin action history events.
+    ///
+    /// `offset`: zero-based index of the first event to return.
+    /// `limit`: maximum number of events to return per call.
+    pub fn get_admin_action_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<AdminActionHistoryPage, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminActionCount)
+            .unwrap_or(0);
+        let mut events: Vec<AdminActionEvent> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, AdminActionEvent>(&DataKey::AdminActionHistory(i))
+            {
+                events.push_back(event);
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(AdminActionHistoryPage { events, total })
     }
 
 }

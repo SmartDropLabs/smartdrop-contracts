@@ -32,8 +32,7 @@ pub enum PoolError {
     LockPeriodNotElapsed = 16,
     /// Returned when `set_boost` receives an `allocation_pct` outside 1-100.
     InvalidAllocation = 17,
-    /// Returned when the minimum lock period exceeds the allowed maximum.
-    InvalidLockPeriod = 18,
+    ExceedsMaxStake = 18,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.
@@ -155,6 +154,23 @@ pub enum DataKey {
     StakedUsers,
     /// Ordered list of all users with active locked positions (persistent storage).
     LockedUsers,
+    // ── History storage keys ────────────────────────────────────────────────
+    /// Global counter for whitelist events.
+    WhitelistEventCount,
+    /// Whitelist event by index (u32 -> WhitelistEvent).
+    WhitelistHistory(u32),
+    /// Global counter for boost events.
+    BoostEventCount,
+    /// Boost event by index (u32 -> BoostEvent).
+    BoostHistory(u32),
+    /// Global counter for stake/unstake/lock/unlock events.
+    StakeEventCount,
+    /// Stake event by index (u32 -> StakeEvent).
+    StakeHistory(u32),
+    /// Global counter for admin action events.
+    AdminActionCount,
+    /// Admin action event by index (u32 -> AdminActionEvent).
+    AdminActionHistory(u32),
 }
 
 /// Paginated response for `get_whitelisted_users`.
@@ -164,5 +180,81 @@ pub struct ListWhitelistedResponse {
     /// Whitelisted addresses in the requested page.
     pub users: Vec<Address>,
     /// Total number of whitelisted addresses.
+    pub total: u32,
+}
+
+// ─── History / audit trail types ─────────────────────────────────────────────
+
+/// A single whitelist change event (add or remove).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct WhitelistEvent {
+    pub user: Address,
+    pub added: bool,
+    pub ledger: u32,
+}
+
+/// A single boost allocation change event.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoostEvent {
+    pub user: Address,
+    pub old_allocation: u32,
+    pub new_allocation: u32,
+    pub ledger: u32,
+}
+
+/// A single stake/unstake/lock/unlock transaction event.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StakeEvent {
+    pub user: Address,
+    /// "stake", "unstake", "lock", "unlock", or "emergency"
+    pub action: soroban_sdk::Symbol,
+    pub amount: i128,
+    pub ledger: u32,
+}
+
+/// A single admin action event (parameter change, upgrade, pause, etc.).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminActionEvent {
+    /// What was changed: "credit_rate", "multiplier", "pause", "unpause",
+    /// "min_lock", "min_stake", "upgrade", "admin_transfer", "migrate",
+    /// "whitelist_enable", "whitelist_disable", "recover_credits"
+    pub action: soroban_sdk::Symbol,
+    pub admin: Address,
+    pub ledger: u32,
+}
+
+/// Paginated response for whitelist history queries.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct WhitelistHistoryPage {
+    pub events: Vec<WhitelistEvent>,
+    pub total: u32,
+}
+
+/// Paginated response for boost history queries.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoostHistoryPage {
+    pub events: Vec<BoostEvent>,
+    pub total: u32,
+}
+
+/// Paginated response for stake history queries.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StakeHistoryPage {
+    pub events: Vec<StakeEvent>,
+    pub total: u32,
+}
+
+/// Paginated response for admin action history queries.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminActionHistoryPage {
+    pub events: Vec<AdminActionEvent>,
     pub total: u32,
 }

@@ -507,6 +507,23 @@ fn test_transfer_admin_non_admin_rejected() {
 }
 
 #[test]
+fn test_transfer_admin_rejects_zero_address() {
+    // #329: handing the factory to the zero address would permanently lock
+    // it, so the transfer must be rejected and the admin left unchanged.
+    let t = setup();
+    let zero_admin = Address::from_string(&soroban_sdk::String::from_str(
+        &t.env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+    assert_eq!(
+        t.client.try_transfer_admin(&zero_admin),
+        Err(Ok(FactoryError::InvalidAdmin))
+    );
+    assert_eq!(t.client.admin(), t.admin);
+    assert_eq!(t.client.admin_transfer_count(), 0);
+}
+
+#[test]
 fn test_transfer_admin_emits_event_with_old_and_new_admin() {
     let t = setup();
     let new_admin = Address::generate(&t.env);
@@ -1309,7 +1326,10 @@ fn test_create_pool_emits_pool_crtd_event_with_payload() {
                     2u32,
                     30u32,
                     5_184_000u128,
-                    t.wasm_hash.clone()
+                    t.wasm_hash.clone(),
+                    // `min_stake_amount` was passed as 0, so the event carries
+                    // the resolved dust-threshold default (#330).
+                    1_000_000i128,
                 )
                     .into_val(&t.env),
             )
