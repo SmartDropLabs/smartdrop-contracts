@@ -6,7 +6,7 @@ use soroban_sdk::{
     contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, String, Symbol, Val,
     Vec,
 };
-use types::{DataKey, ListPoolsResponse, PoolRecord, PoolSort};
+use types::{DataKey, ListPoolsResponse, PoolRecord, PoolSort, PoolStatus};
 
 pub use types::FactoryError;
 pub use types::PoolParams;
@@ -455,14 +455,16 @@ impl Factory {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(FactoryError::AlreadyInitialized);
         }
-        if admin
-            == Address::from_string(&soroban_sdk::String::from_str(
-                &env,
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-            ))
-        {
+        
+        // Issue #374: Validate admin address before storing
+        let zero_admin = Address::from_string(&soroban_sdk::String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        if admin == zero_admin {
             return Err(FactoryError::InvalidAdmin);
         }
+        
         if pool_wasm_hash == BytesN::from_array(&env, &[0u8; 32]) {
             return Err(FactoryError::InvalidWasmHash);
         }
@@ -694,10 +696,14 @@ impl Factory {
     /// Callers can specify `scan_limit` (up to 50) to tune the scan window. Callers resume pagination
     /// using `next_start_id` until `next_start_id == total`.
     ///
-    /// # Indexer Recommendation
-    /// For off-chain applications (such as frontends and analytics) requiring zero-gas instant lookups
-    /// across thousands of pools, developers should index the `(symbol_short!("factory"), symbol_short!("pool_crtd"))`
-    /// events emitted by `create_pool`, which include `asset` and `pool_id` in their payload.
+    /// # Asset Index
+    /// `create_pool` maintains a secondary on-chain index, `DataKey::AssetPools(asset) -> Vec<u32>`
+    /// (with `DataKey::AssetPoolCount(asset)` as its constant-time companion), so this lookup reads
+    /// only the pool IDs registered for `asset` instead of walking the whole registry. The bounded
+    /// registry scan below is only a fallback for records that predate the index (#397). Off-chain
+    /// applications that need lookups across thousands of pools with no transaction at all should
+    /// still index the `(symbol_short!("factory"), symbol_short!("pool_crtd"))` events emitted by
+    /// `create_pool`, which include `asset` and `pool_id` in their payload.
     ///
     /// Returns `NotInitialized` if the factory has not been initialized.
     pub fn get_pools_by_asset_range(
@@ -914,8 +920,17 @@ impl Factory {
     /// let their TTL lapse, or archive/white-list them off-chain rather than
     /// relying on attacker interference.
     ///
+    /// Returns a `RefreshPoolTtlsResponse` listing the IDs that were actually
+    /// refreshed (#393). The existence check was already in place; the sweep
+    /// previously returned `Ok(())`, so a caller could not tell which IDs had
+    /// a record and were kept alive versus which were skipped as missing.
+    ///
     /// Returns `NotInitialized` if the factory has not been initialized.
-    pub fn refresh_pool_ttls(env: Env, start_id: u32, limit: u32) -> Result<(), FactoryError> {
+    pub fn refresh_pool_ttls(
+        env: Env,
+        start_id: u32,
+        limit: u32,
+    ) -> Result<RefreshPoolTtlsResponse, FactoryError> {
         require_initialized(&env)?;
         bump_instance(&env);
         let count: u32 = env
@@ -925,9 +940,14 @@ impl Factory {
             .unwrap_or(0);
         let capped_limit = limit.min(20);
         let end = start_id.saturating_add(capped_limit).min(count);
+        let mut refreshed: Vec<u32> = Vec::new(&env);
+        let mut missing = 0u32;
         for pool_id in start_id..end {
             if env.storage().persistent().has(&DataKey::Pool(pool_id)) {
                 bump_pool(&env, pool_id);
+                refreshed.push_back(pool_id);
+            } else {
+                missing += 1;
             }
         }
         #[allow(deprecated)]
@@ -935,7 +955,11 @@ impl Factory {
             (symbol_short!("factory"), symbol_short!("ttl_ref")),
             (start_id, end),
         );
-        Ok(())
+        Ok(RefreshPoolTtlsResponse {
+            refreshed,
+            end_id: end,
+            missing,
+        })
     }
 
     /// Transfer admin rights to `new_admin`. Current admin must authorise.
@@ -1262,6 +1286,54 @@ impl Factory {
         Ok(end)
     }
 
+    /// Query the health status of an individual pool (Issue #375).
+    ///
+    /// Returns a `PoolStatus` struct containing the pool's address, pause status,
+    /// and total staked amount. This provides a centralized way to check pool
+    /// health without querying each pool contract directly.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized,
+    /// `PoolNotFound` for an unknown `pool_id`, or `PoolQueryFailed` if the
+    /// deployed pool does not respond to the status queries.
+    pub fn pool_status(env: Env, pool_id: u32) -> Result<PoolStatus, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        let no_args: Vec<Val> = vec![&env];
+        
+        // Query is_paused status
+        let is_paused = match env.try_invoke_contract::<bool, soroban_sdk::Error>(
+            &record.address,
+            &Symbol::new(&env, "is_paused"),
+            no_args.clone(),
+        ) {
+            Ok(Ok(v)) => v,
+            _ => return Err(FactoryError::PoolQueryFailed),
+        };
+
+        // Query total_staked
+        let total_staked = match env.try_invoke_contract::<i128, soroban_sdk::Error>(
+            &record.address,
+            &Symbol::new(&env, "total_staked"),
+            no_args,
+        ) {
+            Ok(Ok(v)) => v,
+            _ => return Err(FactoryError::PoolQueryFailed),
+        };
+
+        Ok(PoolStatus {
+            address: record.address,
+            is_paused,
+            total_staked,
+        })
+    }
+
     /// Update the WASM hash used for future `create_pool` deployments. Admin-only.
     ///
     /// Allows the admin to point future pool deployments at a corrected or upgraded
@@ -1398,6 +1470,80 @@ impl Factory {
         let admin = load_admin(&env)?;
         validate_factory_admin(&env, &admin)?;
         admin.require_auth();
+        bump_instance(&env);
+
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCreationPaused)
+            .unwrap_or(false);
+        if paused {
+            return Err(FactoryError::PoolCreationPaused);
+        }
+
+        if min_stake_amount <= 0 {
+            return Err(FactoryError::InvalidMinStakeAmount);
+        }
+
+        validate_asset(&env, &asset)?;
+
+        if global_multiplier < 1 {
+            return Err(FactoryError::InvalidGlobalMultiplier);
+        }
+        let credit_rate = daily_rate_to_credit_rate(daily_rate)?;
+        let min_lock_period: u32 = min_lock_period
+            .try_into()
+            .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
+        if min_lock_period < MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodTooShort);
+        }
+        let effective_min_stake = min_stake_amount;
+        // The requested amount must lie within [MIN_STAKE_AMOUNT,
+        // MAX_STAKE_AMOUNT] so the pool is usable.
+        if effective_min_stake < MIN_STAKE_AMOUNT || effective_min_stake > MAX_STAKE_AMOUNT {
+            return Err(FactoryError::InvalidMinStakeAmount);
+        }
+
+        let pool_id: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap();
+        let next_count = pool_id
+            .checked_add(1)
+            .ok_or(FactoryError::PoolCountOverflow)?;
+        env.storage().instance().set(&DataKey::PoolCount, &next_count);
+        let wasm_hash = load_wasm_hash(&env)?;
+        let salt = pool_salt(&env, pool_id);
+
+        // Deploy a fresh farming-pool instance. The resulting address is
+        // deterministic: keccak256(factory_address || salt).
+        let pool_address = env
+            .deployer()
+            .with_current_contract(salt)
+            .deploy_v2(wasm_hash.clone(), ());
+
+        // Call the freshly deployed pool's `initialize` directly via
+        // `invoke_contract` rather than depending on the `farming-pool`
+        // crate's generated Client: pulling that crate in as a normal
+        // dependency causes its own `#[contractimpl]`-exported WASM symbols
+        // (e.g. `admin`, `transfer_admin`) to collide with the factory's own
+        // exports of the same names when both are linked into one cdylib.
+        let init_args: Vec<Val> = vec![
+            &env,
+            admin.into_val(&env),
+            asset.into_val(&env),
+            global_multiplier.into_val(&env),
+            credit_rate.into_val(&env),
+            min_lock_period.into_val(&env),
+            effective_min_stake.into_val(&env),
+        ];
+        
+        // Issue #373: Initialize the pool before emitting pool_crtd event to ensure
+        // the event is only emitted if pool creation succeeds. If initialization
+        // fails, the entire transaction reverts and no event is published.
+        let _: () = env.invoke_contract(&pool_address, &Symbol::new(&env, "initialize"), init_args);
+
+        let record = PoolRecord {
+            address: pool_address.clone(),
+            asset: asset.clone(),
+            credit_rate,
         create_pool_inner(
             env,
             admin,
@@ -1409,6 +1555,36 @@ impl Factory {
         )
     }
 
+        let wasm_key = DataKey::PoolsByWasmHash(wasm_hash.clone());
+        let mut wasm_pool_ids: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&wasm_key)
+            .unwrap_or_else(|| vec![&env]);
+        wasm_pool_ids.push_back(pool_id);
+        env.storage().persistent().set(&wasm_key, &wasm_pool_ids);
+        bump_wasm_pools(&env, &wasm_hash);
+
+        // Issue #373: Emit enriched event AFTER successful pool initialization.
+        // This ensures indexers only record pools that were fully created.
+        // `effective_min_stake` is the resolved dust-thresholded value actually
+        // passed to the pool's `initialize` (#330), not the raw caller input.
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("pool_crtd")),
+            (
+                pool_id,
+                pool_address,
+                admin,
+                asset,
+                credit_rate,
+                global_multiplier,
+                min_lock_period,
+                daily_rate,
+                wasm_hash,
+                effective_min_stake,
+            ),
+        );
     /// Create multiple pools atomically using the same validation and setup as
     /// `create_pool`. If any item is invalid, the transaction rolls back every
     /// pool created earlier in this batch.

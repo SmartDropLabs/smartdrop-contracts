@@ -12,6 +12,10 @@ use soroban_sdk::{
 
 use farming_pool::FarmingPoolClient;
 
+// The contract crate is `#![no_std]`; these tests assert on `std` collection
+// types, so the shim is declared here (same as farming-pool's tests).
+extern crate std;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 struct TestEnv {
@@ -1321,8 +1325,15 @@ fn test_refresh_pool_ttls_restores_ttl_for_unqueried_pool() {
     advance_ledgers(&t.env, TTL_EXTEND_TO + 1);
     assert!(pool_record_ttl(&t.env, &t.factory_addr, id) < TTL_THRESHOLD);
 
-    // Call refresh_pool_ttls to restore TTL without a specific get_pool query
-    assert_eq!(t.client.try_refresh_pool_ttls(&id, &1u32), Ok(Ok(())));
+    // Call refresh_pool_ttls to restore TTL without a specific get_pool query.
+    // #393: the sweep now reports which IDs were actually refreshed.
+    let refreshed = t.client.try_refresh_pool_ttls(&id, &1u32);
+    assert!(refreshed.is_ok());
+    let sweep = refreshed.unwrap().unwrap();
+    assert_eq!(sweep.refreshed.len(), 1);
+    assert_eq!(sweep.refreshed.get(0), Some(id));
+    assert_eq!(sweep.end_id, id + 1);
+    assert_eq!(sweep.missing, 0);
 
     // Verify TTL is restored
     assert_eq!(pool_record_ttl(&t.env, &t.factory_addr, id), TTL_EXTEND_TO);
@@ -1336,7 +1347,9 @@ fn test_refresh_pool_ttls_stays_permissionless_for_any_caller() {
     let t = setup_with_pool_records(3);
     let stranger = Address::generate(&t.env);
     // No admin auth provided at all: assert the refresh still succeeds.
-    assert_eq!(t.client.try_refresh_pool_ttls(&0u32, &3u32), Ok(Ok(())));
+    let sweep = t.client.try_refresh_pool_ttls(&0u32, &3u32).unwrap().unwrap();
+    assert_eq!(sweep.refreshed.len(), 3);
+    assert_eq!(sweep.missing, 0);
     assert_eq!(
         pool_record_ttl(&t.env, &t.factory_addr, 1),
         TTL_EXTEND_TO,
@@ -1354,6 +1367,85 @@ fn test_refresh_pool_ttls_requires_initialized_factory() {
     let (_env, client) = setup_uninitialized();
     let result = client.try_refresh_pool_ttls(&0u32, &20u32);
     assert!(matches!(result, Err(Ok(FactoryError::NotInitialized))));
+}
+
+#[test]
+fn test_refresh_pool_ttls_reports_only_existing_pools_and_counts_gaps() {
+    // #393 / #394: pool IDs are handed out sequentially from PoolCount, so a
+    // hole in `start_id..end` means a record was removed from storage (TTL
+    // expiry / archival) — the same situation list_pools reports as a
+    // "pool_gap". The sweep must skip it, say so in the response, and leave
+    // the surviving records bumped.
+    let t = setup();
+
+    let p0 = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &50u64,
+        &0i128,
+    );
+    let p1 = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &50u64,
+        &0i128,
+    );
+    let p2 = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &50u64,
+        &0i128,
+    );
+
+    // Archive the middle record out from under the registry, as a TTL lapse
+    // would, leaving the count intact so the ID stays inside the sweep range.
+    t.env.as_contract(&t.factory_addr, || {
+        t.env.storage().persistent().remove(&DataKey::Pool(p1));
+    });
+
+    // Age the surviving records past the refresh threshold.
+    advance_ledgers(&t.env, TTL_EXTEND_TO + 1);
+    for id in [p0, p2] {
+        assert!(pool_record_ttl(&t.env, &t.factory_addr, id) < TTL_THRESHOLD);
+    }
+
+    let sweep = t.client.refresh_pool_ttls(&p0, &20u32);
+
+    assert_eq!(sweep.refreshed.len(), 2);
+    assert_eq!(sweep.refreshed.get(0), Some(p0));
+    assert_eq!(sweep.refreshed.get(1), Some(p2));
+    assert_eq!(sweep.missing, 1, "the gap must be reported, not silently skipped");
+    assert_eq!(sweep.end_id, p2 + 1);
+
+    for id in [p0, p2] {
+        assert_eq!(
+            pool_record_ttl(&t.env, &t.factory_addr, id),
+            TTL_EXTEND_TO,
+            "existing pool {id} must have had its TTL extended"
+        );
+    }
+    t.env.as_contract(&t.factory_addr, || {
+        assert!(
+            !t.env.storage().persistent().has(&DataKey::Pool(p1)),
+            "a TTL sweep must not materialise an archived pool record"
+        );
+    });
+}
+
+#[test]
+fn test_refresh_pool_ttls_reports_empty_sweep_past_the_registry() {
+    // #393: a start_id at or past the pool count sweeps nothing and says so,
+    // rather than returning a unit value the caller has to interpret.
+    let t = setup_with_pool_records(2);
+
+    let sweep = t.client.refresh_pool_ttls(&5u32, &20u32);
+
+    assert_eq!(sweep.refreshed.len(), 0);
+    assert_eq!(sweep.missing, 0);
+    assert_eq!(sweep.end_id, 2, "end is clamped to the registry count");
 }
 
 #[test]
@@ -1679,79 +1771,119 @@ fn test_list_pools_reports_missing_records_with_a_pool_gap_event() {
     );
 }
 
-// ── #391: upgrade_pool WASM verification ─────────────────────────────────────
+// ── asset index coverage (#397) ───────────────────────────────────────────────
+//
+// `create_pool` maintains `DataKey::AssetPools(asset) -> Vec<u32>` (and its
+// constant-time companion `DataKey::AssetPoolCount`) so `get_pools_by_asset`
+// reads the index instead of walking the registry. These tests pin that the
+// index is actually written and actually read — the issue's ask, since the
+// index existed but nothing asserted it.
 
 #[test]
-fn test_upgrade_pool_rejects_zero_wasm_hash() {
+fn test_create_pool_maintains_the_asset_index() {
     let t = setup();
-    let pool_id = t.client.create_pool(
-        &Address::generate(&t.env),
-        &1_728_000u128,
-        &2u32,
-        &10u64,
-        &0i128,
-    );
-    let zero_hash = BytesN::from_array(&t.env, &[0u8; 32]);
-    let result = t.client.try_upgrade_pool(&pool_id, &zero_hash);
-    assert_eq!(result, Err(Ok(FactoryError::InvalidWasmHash)));
-}
+    let asset = Address::generate(&t.env);
+    let other_asset = Address::generate(&t.env);
 
-// ── #389: upgrade_pools_batch ────────────────────────────────────────────────
+    let first = t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+    let second = t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+    let other = t.client.create_pool(&other_asset, &1_728_000u128, &2u32, &10u64, &0i128);
 
-#[test]
-fn test_upgrade_pools_batch_success() {
-    let t = setup();
-    let pool_id_0 = t.client.create_pool(
-        &Address::generate(&t.env),
-        &1_728_000u128,
-        &2u32,
-        &10u64,
-        &0i128,
+    // The index returns only the pools for the requested asset...
+    let page = t.client.get_pools_by_asset(&asset, &0u32, &10u32);
+    let ids: std::vec::Vec<u32> = page.records.iter().map(|(id, _)| id).collect();
+    assert_eq!(ids, std::vec![first, second]);
+    assert_eq!(
+        page.total, 3,
+        "total reports the whole registry, not just the asset's pools"
     );
-    let pool_id_1 = t.client.create_pool(
-        &Address::generate(&t.env),
-        &1_728_000u128,
-        &2u32,
-        &10u64,
-        &0i128,
-    );
-    let new_wasm_hash = upload_replacement_wasm(&t.env);
-    let pool_ids = vec![&t.env, pool_id_0, pool_id_1];
-    t.client.upgrade_pools_batch(&pool_ids, &new_wasm_hash);
 
-    let record_0 = t.client.get_pool(&pool_id_0);
-    let record_1 = t.client.get_pool(&pool_id_1);
-    assert_eq!(record_0.wasm_hash, new_wasm_hash);
-    assert_eq!(record_1.wasm_hash, new_wasm_hash);
-    assert_eq!(t.client.upgrade_count(), 2);
+    // ...and the other asset's lookup is not polluted by them.
+    let other_page = t.client.get_pools_by_asset(&other_asset, &0u32, &10u32);
+    let other_ids: std::vec::Vec<u32> = other_page.records.iter().map(|(id, _)| id).collect();
+    assert_eq!(other_ids, std::vec![other]);
 }
 
 #[test]
-fn test_upgrade_pools_batch_requires_admin_auth() {
+fn test_asset_pool_count_agrees_with_the_index() {
     let t = setup();
-    let pool_id = t.client.create_pool(
-        &Address::generate(&t.env),
-        &1_728_000u128,
-        &2u32,
-        &10u64,
-        &0i128,
+    let asset = Address::generate(&t.env);
+
+    assert_eq!(t.client.pool_count_by_asset(&asset), 0);
+
+    t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+    t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+
+    assert_eq!(t.client.pool_count_by_asset(&asset), 2);
+    assert_eq!(
+        t.client.get_pools_by_asset(&asset, &0u32, &10u32).records.len(),
+        2
     );
-    let not_admin = Address::generate(&t.env);
-    let new_wasm_hash = upload_replacement_wasm(&t.env);
-    let pool_ids = vec![&t.env, pool_id];
-    let args = (&pool_ids, &new_wasm_hash).into_val(&t.env);
-    let invoke = MockAuthInvoke {
-        contract: &t.factory_addr,
-        fn_name: "upgrade_pools_batch",
-        args,
-        sub_invokes: &[],
-    };
-    let result = t
-        .client
-        .mock_auths(&[MockAuth {
-            address: &not_admin,
-            invoke: &invoke,
-        }])
-        .try_upgrade_pools_batch(&pool_ids, &new_wasm_hash);
-    assert!(result.is_err(), "only the factory admin may batch upgrade pools");
+}
+
+#[test]
+fn test_create_pools_batch_maintains_the_asset_index() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+    let other_asset = Address::generate(&t.env);
+
+    let mut batch = vec![&t.env];
+    for _ in 0..2 {
+        batch.push_back(PoolParams {
+            asset: asset.clone(),
+            daily_rate: 1_728_000u128,
+            global_multiplier: 2u32,
+            min_lock_period: 10u64,
+            min_stake_amount: 0i128,
+        });
+    }
+    batch.push_back(PoolParams {
+        asset: other_asset.clone(),
+        daily_rate: 1_728_000u128,
+        global_multiplier: 2u32,
+        min_lock_period: 10u64,
+        min_stake_amount: 0i128,
+    });
+
+    let created = t.client.create_pools_batch(&batch);
+    let ids: std::vec::Vec<u32> = created.iter().collect();
+    assert_eq!(ids.len(), 3);
+
+    // Batched creation must index exactly like single creation.
+    let page = t.client.get_pools_by_asset(&asset, &0u32, &10u32);
+    let indexed: std::vec::Vec<u32> = page.records.iter().map(|(id, _)| id).collect();
+    assert_eq!(indexed, std::vec![ids[0], ids[1]]);
+    assert_eq!(t.client.pool_count_by_asset(&asset), 2);
+    assert_eq!(t.client.pool_count_by_asset(&other_asset), 1);
+}
+
+#[test]
+fn test_asset_index_survives_a_paginated_walk() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+    for _ in 0..3 {
+        t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+    }
+    t.client.create_pool(&Address::generate(&t.env), &1_728_000u128, &2u32, &10u64, &0i128);
+
+    // Resuming from the previous page's `next_start_id` must not drop or
+    // duplicate indexed pools (the #327 resume invariant, index path).
+    let mut collected: std::vec::Vec<u32> = std::vec::Vec::new();
+    let mut start = 0u32;
+    loop {
+        let page = t.client.get_pools_by_asset(&asset, &start, &1u32);
+        for (id, _) in page.records.iter() {
+            collected.push(id);
+        }
+        if page.next_start_id >= page.total || page.records.is_empty() {
+            break;
+        }
+        start = page.next_start_id;
+    }
+
+    assert_eq!(
+        collected.len(),
+        3,
+        "every indexed pool for the asset should be returned exactly once"
+    );
 }

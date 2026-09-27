@@ -8,11 +8,12 @@ mod types;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, BytesN, Env, Executable, Vec,
 };
-pub use types::PoolError;
+pub use types::{PoolError, PoolInfo};
 use types::{
     AdminActionEvent, AdminActionHistoryPage, BankedCreditTotals, BoostConfig, BoostEvent,
     BoostHistoryPage, CreditRateEvent, CreditRateHistoryPage, DataKey, GlobalMultiplierEvent,
-    GlobalMultiplierHistoryPage, ListWhitelistedResponse, Position, StakeEvent, StakeHistoryPage,
+    GlobalMultiplierHistoryPage, ListWhitelistedResponse, Position, PoolInfo, StakeEvent,
+    StakeHistoryPage,
     UserStake, WhitelistEvent, WhitelistHistoryPage,
 };
 
@@ -1210,6 +1211,33 @@ impl FarmingPool {
     /// Lock assets for the minimum lock period. A top-up checkpoints the
     /// existing position and extends its whole-position unlock ledger to the
     /// later of the existing unlock ledger and a fresh period from this call.
+    ///
+    /// # Reentrancy posture (#398)
+    ///
+    /// `stake_token` is admin-supplied and therefore not necessarily a trusted
+    /// Stellar Asset Contract — a non-standard `transfer` could call back into
+    /// this contract while it is still executing. Two independent defenses
+    /// apply, in order:
+    ///
+    /// 1. **Checks-effects-interactions.** Every validation runs first, the
+    ///    position (including the extended unlock ledger) is written to
+    ///    storage, and only then is `token::transfer` called. A reentrant call
+    ///    therefore observes the already-updated position rather than a
+    ///    half-applied one, so it cannot withdraw or re-credit more than the
+    ///    post-deposit position allows. `token::Client::transfer` returns
+    ///    `()` on success and traps on failure, so a failed transfer reverts the
+    ///    whole invocation and leaves no partial deposit (see #363).
+    /// 2. **Host-level reentry prohibition.** Soroban's `ContractReentryMode`
+    ///    defaults to `Prohibited`, so a token that tries to reenter this
+    ///    contract during the transfer traps with "Contract re-entry is not
+    ///    allowed" before any of our code runs.
+    ///
+    /// Both properties are covered by the reentrancy tests in `test.rs`
+    /// (`test_lock_assets_reentrant_transfer_is_rejected_and_final_state_is_correct`
+    /// and `test_lock_assets_reverts_entirely_if_stake_token_naively_reenters`),
+    /// which use `MockReentrantToken` / `MockNaiveReentrantToken` to attempt
+    /// the reentry mid-transfer. No code change is required for the reported
+    /// concern; this comment records the verification.
     pub fn lock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
@@ -1242,6 +1270,10 @@ impl FarmingPool {
         let mut position = if let Some(mut existing) = get_position(&env, &user) {
             checkpoint_position(&env, &user, &mut existing);
             existing.amount += amount;
+            
+            // Issue #376: Update lock_ledger to current ledger for additional deposits
+            // This ensures the lock period is based on the most recent deposit, not the original
+            existing.lock_ledger = current;
             let fresh_unlock = current.saturating_add(read_min_lock_period(&env));
             existing.unlock_ledger = existing.unlock_ledger.max(fresh_unlock);
             existing
@@ -2046,7 +2078,7 @@ impl FarmingPool {
         let multiplier = read_global_multiplier(&env);
         env.events().publish(
             (symbol_short!("boost"), symbol_short!("applied")),
-            (user.clone(), allocation_pct, multiplier),
+            (user.clone(), old_alloc, allocation_pct, multiplier),
         );
 
         record_boost_event(&env, &user, old_alloc, allocation_pct);
@@ -2366,6 +2398,49 @@ impl FarmingPool {
     /// Alias for `total_distributed_credits` for consistency with other getter functions.
     pub fn get_total_distributed_credits(env: Env) -> Result<i128, PoolError> {
         Self::total_distributed_credits(env)
+    }
+
+    /// Aggregate pool overview in a single invocation (Issue #395).
+    ///
+    /// A pool dashboard previously needed up to six separate reads
+    /// (`total_staked`, `credit_rate`, the global multiplier, the min lock
+    /// period, the min stake amount and the paused flag), each paying its own
+    /// invocation cost and TTL bump. This returns the same values together,
+    /// read straight from instance storage.
+    ///
+    /// Note on the issue's field list: it mentions "total credits" and
+    /// "number of stakers". Credits are covered by the two maintained
+    /// counters below. Staker count is not, because the pool keeps no
+    /// staker-count entry — it is derived by paging `get_positions`, so
+    /// inventing a field here would report a number nothing maintains.
+    ///
+    /// Returns `NotInitialized` if the pool has not been initialized.
+    pub fn get_pool_info(env: Env) -> Result<PoolInfo, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        Ok(PoolInfo {
+            total_staked: env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalStaked)
+                .unwrap_or(0),
+            total_banked_credits: read_total_banked_credits(&env),
+            total_distributed_credits: env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalDistributedCredits)
+                .unwrap_or(0),
+            credit_rate: read_credit_rate(&env),
+            global_multiplier: read_global_multiplier(&env),
+            min_lock_period: read_min_lock_period(&env),
+            min_stake_amount: env
+                .storage()
+                .instance()
+                .get(&DataKey::MinStakeAmount)
+                .unwrap_or(1),
+            is_paused: pool_is_paused(&env),
+        })
     }
 
     /// Return the total credits currently banked across all users.
