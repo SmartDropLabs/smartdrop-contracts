@@ -8,11 +8,12 @@ mod types;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, BytesN, Env, Executable, Vec,
 };
-pub use types::PoolError;
+pub use types::{PoolError, PoolInfo};
 use types::{
     AdminActionEvent, AdminActionHistoryPage, BankedCreditTotals, BoostConfig, BoostEvent,
     BoostHistoryPage, CreditRateEvent, CreditRateHistoryPage, DataKey, GlobalMultiplierEvent,
-    GlobalMultiplierHistoryPage, ListWhitelistedResponse, Position, StakeEvent, StakeHistoryPage,
+    GlobalMultiplierHistoryPage, ListWhitelistedResponse, Position, PoolInfo, StakeEvent,
+    StakeHistoryPage,
     UserStake, WhitelistEvent, WhitelistHistoryPage,
 };
 
@@ -2344,6 +2345,49 @@ impl FarmingPool {
     /// Alias for `total_distributed_credits` for consistency with other getter functions.
     pub fn get_total_distributed_credits(env: Env) -> Result<i128, PoolError> {
         Self::total_distributed_credits(env)
+    }
+
+    /// Aggregate pool overview in a single invocation (Issue #395).
+    ///
+    /// A pool dashboard previously needed up to six separate reads
+    /// (`total_staked`, `credit_rate`, the global multiplier, the min lock
+    /// period, the min stake amount and the paused flag), each paying its own
+    /// invocation cost and TTL bump. This returns the same values together,
+    /// read straight from instance storage.
+    ///
+    /// Note on the issue's field list: it mentions "total credits" and
+    /// "number of stakers". Credits are covered by the two maintained
+    /// counters below. Staker count is not, because the pool keeps no
+    /// staker-count entry — it is derived by paging `get_positions`, so
+    /// inventing a field here would report a number nothing maintains.
+    ///
+    /// Returns `NotInitialized` if the pool has not been initialized.
+    pub fn get_pool_info(env: Env) -> Result<PoolInfo, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        Ok(PoolInfo {
+            total_staked: env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalStaked)
+                .unwrap_or(0),
+            total_banked_credits: read_total_banked_credits(&env),
+            total_distributed_credits: env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalDistributedCredits)
+                .unwrap_or(0),
+            credit_rate: read_credit_rate(&env),
+            global_multiplier: read_global_multiplier(&env),
+            min_lock_period: read_min_lock_period(&env),
+            min_stake_amount: env
+                .storage()
+                .instance()
+                .get(&DataKey::MinStakeAmount)
+                .unwrap_or(1),
+            is_paused: pool_is_paused(&env),
+        })
     }
 
     /// Return the total credits currently banked across all users.
