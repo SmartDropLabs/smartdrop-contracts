@@ -26,6 +26,8 @@ pub enum DataKey {
     PoolCreationPaused,
     /// Pool IDs matching a specific asset address.
     AssetPools(Address),
+    /// Number of pools registered for a specific asset address.
+    AssetPoolCount(Address),
     /// Running count of admin transfers performed.
     AdminTransferCount,
     /// Running total of successful `upgrade_pool` calls, for version tracking (#258).
