@@ -4,8 +4,9 @@ use super::*;
 use soroban_sdk::{
     symbol_short,
     testutils::{
-        storage::Persistent as _, Address as _, AuthorizedFunction, AuthorizedInvocation,
-        Events as _, Ledger, MockAuth, MockAuthInvoke,
+        storage::{Instance as _, Persistent as _},
+        Address as _, AuthorizedFunction, AuthorizedInvocation, Events as _, Ledger, MockAuth,
+        MockAuthInvoke,
     },
     vec, Address, BytesN, Env, IntoVal, Symbol,
 };
@@ -168,6 +169,10 @@ fn pool_record_ttl(env: &Env, factory_addr: &Address, pool_id: u32) -> u32 {
     env.as_contract(factory_addr, || {
         env.storage().persistent().get_ttl(&DataKey::Pool(pool_id))
     })
+}
+
+fn factory_instance_ttl(env: &Env, factory_addr: &Address) -> u32 {
+    env.as_contract(factory_addr, || env.storage().instance().get_ttl())
 }
 
 #[test]
@@ -1369,6 +1374,18 @@ fn test_list_pools_bumps_pool_record_ttl() {
 
     assert!(t.client.try_list_pools(&id, &1u32).is_ok());
     assert_eq!(pool_record_ttl(&t.env, &t.factory_addr, id), TTL_EXTEND_TO);
+}
+
+#[test]
+fn test_list_pools_empty_page_bumps_factory_instance_ttl() {
+    let t = setup();
+
+    advance_ledgers(&t.env, TTL_EXTEND_TO - TTL_THRESHOLD + 1);
+    assert!(factory_instance_ttl(&t.env, &t.factory_addr) < TTL_THRESHOLD);
+
+    let page = t.client.list_pools(&0, &10);
+    assert!(page.records.is_empty());
+    assert_eq!(factory_instance_ttl(&t.env, &t.factory_addr), TTL_EXTEND_TO);
 }
 
 #[test]
