@@ -100,6 +100,25 @@ pub struct ListPoolsResponse {
     pub has_more: bool,
 }
 
+/// Result of a `refresh_pool_ttls` sweep (Issue #393).
+///
+/// The existence check already guards each `bump_pool` call, so IDs whose
+/// record is missing are simply skipped — but the caller previously had no
+/// way to learn which IDs were actually refreshed, which made verifying a
+/// keep-alive sweep (and reconciling against a known registry) guesswork.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct RefreshPoolTtlsResponse {
+    /// IDs whose persistent record existed and had its TTL extended, ascending.
+    pub refreshed: Vec<u32>,
+    /// First ID not covered by the sweep (`start_id + capped_limit`, clamped to
+    /// the registry count) — the resume point for the next page.
+    pub end_id: u32,
+    /// Number of IDs in `start_id..end_id` whose record was missing from
+    /// storage and therefore skipped.
+    pub missing: u32,
+}
+
 /// Typed errors returned by the factory contract.
 ///
 /// Using `#[contracterror]` exposes these as a stable on-chain error code so
