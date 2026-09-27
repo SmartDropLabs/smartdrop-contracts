@@ -187,6 +187,40 @@ fn test_stake_emits_event() {
 }
 
 #[test]
+fn test_unstake_emits_event() {
+    let t = setup(2, 1);
+    let amount = 1_000i128;
+    t.client.stake(&t.user, &amount);
+    advance_ledgers(&t.env, 10);
+    t.client.unstake(&t.user, &amount);
+
+    assert_eq!(
+        t.env.events().all().filter_by_contract(&t.contract_id),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("chkpt").into_val(&t.env)
+                ],
+                (t.user.clone(), 10_000i128, 10_000i128).into_val(&t.env),
+            ),
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("unstaked").into_val(&t.env)
+                ],
+                (t.user.clone(), amount, 10_000i128).into_val(&t.env),
+            )
+        ]
+    );
+}
+
+#[test]
 fn test_total_staked_tracks_locked_and_flexible_positions() {
     let t = setup(2, 1);
 
@@ -1366,13 +1400,19 @@ fn test_multiple_locks_credit_only_new_amount_for_later_ledgers() {
 #[test]
 fn test_lock_assets_rejects_zero_amount() {
     let t = setup(1, 1);
-    assert!(t.client.try_lock_assets(&t.user, &0i128).is_err());
+    assert_eq!(
+        t.client.try_lock_assets(&t.user, &0i128),
+        Err(Ok(PoolError::InvalidAmount))
+    );
 }
 
 #[test]
 fn test_lock_assets_rejects_negative_amount() {
     let t = setup(1, 1);
-    assert!(t.client.try_lock_assets(&t.user, &-1i128).is_err());
+    assert_eq!(
+        t.client.try_lock_assets(&t.user, &-1i128),
+        Err(Ok(PoolError::InvalidAmount))
+    );
 }
 
 #[test]
@@ -3610,7 +3650,7 @@ fn test_checkpoint_uses_current_multiplier_after_change() {
     assert_eq!(credits, 25_000);
     
     // Verify the stake record has been updated with new multiplier
-    let stake = t.client.get_stake(&t.user).unwrap().unwrap();
+    let stake = t.client.get_stake(&t.user).unwrap();
     assert_eq!(stake.multiplier, 2, "Checkpoint should update to current multiplier");
 }
 

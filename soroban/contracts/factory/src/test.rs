@@ -762,6 +762,65 @@ fn test_create_pool_returns_incrementing_ids() {
 }
 
 #[test]
+fn test_create_pools_batch_returns_ids_and_registers_every_pool() {
+    let t = setup();
+    let asset_a = Address::generate(&t.env);
+    let asset_b = Address::generate(&t.env);
+    let pools = vec![
+        &t.env,
+        PoolParams {
+            asset: asset_a.clone(),
+            daily_rate: 17_280_000,
+            global_multiplier: 2,
+            min_lock_period: 100,
+            min_stake_amount: 1_000_000,
+        },
+        PoolParams {
+            asset: asset_b.clone(),
+            daily_rate: 34_560_000,
+            global_multiplier: 3,
+            min_lock_period: 200,
+            min_stake_amount: 2_000_000,
+        },
+    ];
+
+    let ids = t.client.create_pools_batch(&pools);
+
+    assert_eq!(ids, vec![&t.env, 0, 1]);
+    assert_eq!(t.client.pool_count(), 2);
+    assert_eq!(t.client.get_pool(&0).asset, asset_a);
+    assert_eq!(t.client.get_pool(&1).asset, asset_b);
+}
+
+#[test]
+fn test_create_pools_batch_rolls_back_when_any_pool_is_invalid() {
+    let t = setup();
+    let pools = vec![
+        &t.env,
+        PoolParams {
+            asset: Address::generate(&t.env),
+            daily_rate: 17_280_000,
+            global_multiplier: 2,
+            min_lock_period: 100,
+            min_stake_amount: 1_000_000,
+        },
+        PoolParams {
+            asset: Address::generate(&t.env),
+            daily_rate: 17_280_000,
+            global_multiplier: 0,
+            min_lock_period: 100,
+            min_stake_amount: 1_000_000,
+        },
+    ];
+
+    assert_eq!(
+        t.client.try_create_pools_batch(&pools),
+        Err(Ok(FactoryError::InvalidGlobalMultiplier))
+    );
+    assert_eq!(t.client.pool_count(), 0);
+}
+
+#[test]
 fn test_get_pool_returns_correct_record() {
     let env = Env::default();
     env.mock_all_auths();
