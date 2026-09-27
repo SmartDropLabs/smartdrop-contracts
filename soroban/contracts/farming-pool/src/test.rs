@@ -247,6 +247,19 @@ fn test_total_distributed_credits_starts_at_zero() {
 }
 
 #[test]
+fn test_get_total_earned_counts_credits_when_checkpointed() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+
+    assert_eq!(t.client.get_credits(&t.user), 10_000);
+    assert_eq!(t.client.get_total_earned(), 0);
+
+    t.client.unstake(&t.user, &1_000);
+    assert_eq!(t.client.get_total_earned(), 10_000);
+}
+
+#[test]
 fn test_total_distributed_credits_counts_banked_stake_accrual_on_checkpoint() {
     let t = setup(2, 1);
     t.client.stake(&t.user, &1_000);

@@ -2406,6 +2406,14 @@ impl FarmingPool {
         Self::total_distributed_credits(env)
     }
 
+    /// Return the total credits earned across users and staking systems.
+    ///
+    /// Accrual is included when a user's stake or position is checkpointed;
+    /// uncheckpointed accrual remains available through the per-user queries.
+    pub fn get_total_earned(env: Env) -> Result<i128, PoolError> {
+        Self::total_distributed_credits(env)
+    }
+
     /// Aggregate pool overview in a single invocation (Issue #395).
     ///
     /// A pool dashboard previously needed up to six separate reads
