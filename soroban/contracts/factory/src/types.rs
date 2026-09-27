@@ -100,6 +100,18 @@ pub struct ListPoolsResponse {
     pub has_more: bool,
 }
 
+/// Result of a `refresh_pool_ttls` sweep (#393).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RefreshPoolTtlsResponse {
+    /// Pool IDs in the scanned range that had a record and were refreshed.
+    pub refreshed: Vec<u32>,
+    /// The scanned range's end (exclusive); pass as the next `start_id`.
+    pub end_id: u32,
+    /// Count of pool IDs in the scanned range with no record (gaps).
+    pub missing: u32,
+}
+
 /// Pool health status returned by `pool_status` (Issue #375).
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]

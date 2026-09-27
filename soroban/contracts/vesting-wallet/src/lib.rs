@@ -26,6 +26,15 @@ fn bump_instance(env: &Env) {
         .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
+/// The Stellar zero/void address, used as the "unusable address" sentinel
+/// (soroban-sdk has no `Address::default()`).
+fn zero_address(env: &Env) -> Address {
+    Address::from_string(&soroban_sdk::String::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ))
+}
+
 fn require_initialized(env: &Env) -> Result<(), VestingError> {
     if !env.storage().instance().has(&DataKey::Beneficiary) {
         return Err(VestingError::NotInitialized);
@@ -173,7 +182,7 @@ impl VestingWallet {
         }
         // #405 — a zero beneficiary can never call `release` (it cannot sign),
         // so the entire vested amount would be stranded with no recovery path.
-        if beneficiary == Address::default() {
+        if beneficiary == zero_address(&env) {
             return Err(VestingError::InvalidInput);
         }
         assert!(total_amount > 0, "total_amount must be positive");
@@ -246,7 +255,11 @@ impl VestingWallet {
 
         let vested = compute_vested(&env)?;
         let released = get_released(&env);
-        let releasable = vested.saturating_sub(released);
+        // `i128::saturating_sub` only guards against overflow, not against a
+        // negative result — after `emergency_withdraw` freezes `vested` below
+        // `released`, an unclamped subtraction would try to transfer a
+        // negative amount.
+        let releasable = vested.saturating_sub(released).max(0);
 
         if releasable == 0 {
             return Ok(0);
@@ -439,10 +452,11 @@ impl VestingWallet {
             revoked: is_revoked(&env),
             vested_amount: vested,
             released_amount: released,
-            // Saturating, not plain subtraction: after revocation the frozen
-            // vested amount can be lower than what was already released, and a
-            // negative "releasable" would be nonsense to a caller.
-            releasable_amount: vested.saturating_sub(released),
+            // `i128::saturating_sub` alone only guards against overflow, not a
+            // negative result: after revocation the frozen vested amount can be
+            // lower than what was already released, so clamp with `.max(0)` —
+            // a negative "releasable" would be nonsense to a caller.
+            releasable_amount: vested.saturating_sub(released).max(0),
         })
     }
 
@@ -496,7 +510,7 @@ impl VestingWallet {
     /// `release`, which would strand the remaining vested amount.
     pub fn transfer_beneficiary(env: Env, new_beneficiary: Address) -> Result<(), VestingError> {
         require_initialized(&env)?;
-        if new_beneficiary == Address::default() {
+        if new_beneficiary == zero_address(&env) {
             return Err(VestingError::InvalidInput);
         }
         let admin = get_admin(&env);
