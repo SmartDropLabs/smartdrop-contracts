@@ -700,3 +700,55 @@ fn test_admin_only_entry_points_require_admin_auth() {
     t.client.revoke();
     assert!(t.client.revoked());
 }
+
+// ── beneficiary validation tests (#405) ───────────────────────────────────────
+
+#[test]
+fn test_initialize_rejects_the_zero_beneficiary() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_sac = StellarAssetClient::new(&env, &asset.address());
+    token_sac.mint(&admin, &1_000i128);
+
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    let start = env.ledger().sequence();
+    let result = client.try_initialize(
+        &Address::default(), // #405: unusable beneficiary
+        &asset.address(),
+        &1_000i128,
+        &start,
+        &start,
+        &start + 200,
+        &false,
+        &admin,
+    );
+
+    assert!(
+        matches!(result, Err(Ok(VestingError::InvalidInput))),
+        "initialize must reject the zero beneficiary address"
+    );
+}
+
+#[test]
+fn test_transfer_beneficiary_rejects_the_zero_address() {
+    let t = setup(0, 200, 1_000);
+    let good = Address::generate(&t.env);
+
+    let rejected = t
+        .client
+        .try_transfer_beneficiary(&Address::default());
+    assert!(
+        matches!(rejected, Err(Ok(VestingError::InvalidInput))),
+        "transfer_beneficiary must reject the zero address, which could strand the funds"
+    );
+
+    // A real address still works, and the rejected call changed nothing.
+    t.client.transfer_beneficiary(&good);
+    assert_eq!(t.client.beneficiary(), good);
+}

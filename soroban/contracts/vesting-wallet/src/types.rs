@@ -11,6 +11,9 @@ pub enum VestingError {
     Unauthorized = 5,
     TotalAmountTooLarge = 6,
     ArithmeticOverflow = 7,
+    /// A supplied address is unusable (e.g. the zero address as beneficiary),
+    /// which would strand released funds permanently (#405).
+    InvalidInput = 8,
 }
 
 /// Storage keys for all instance data in the vesting wallet.

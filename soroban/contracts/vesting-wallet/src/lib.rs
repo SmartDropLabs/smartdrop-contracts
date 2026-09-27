@@ -171,6 +171,11 @@ impl VestingWallet {
         if env.storage().instance().has(&DataKey::Beneficiary) {
             return Err(VestingError::AlreadyInitialized);
         }
+        // #405 — a zero beneficiary can never call `release` (it cannot sign),
+        // so the entire vested amount would be stranded with no recovery path.
+        if beneficiary == Address::default() {
+            return Err(VestingError::InvalidInput);
+        }
         assert!(total_amount > 0, "total_amount must be positive");
         assert!(
             start_ledger >= env.ledger().sequence(),
@@ -428,8 +433,15 @@ impl VestingWallet {
     }
 
     /// Transfer beneficiary rights to `new_beneficiary`. Admin must authorise.
+    ///
+    /// #405 — the same zero-address check as `initialize` applies here: the
+    /// admin cannot hand the schedule to an address that can never call
+    /// `release`, which would strand the remaining vested amount.
     pub fn transfer_beneficiary(env: Env, new_beneficiary: Address) -> Result<(), VestingError> {
         require_initialized(&env)?;
+        if new_beneficiary == Address::default() {
+            return Err(VestingError::InvalidInput);
+        }
         let admin = get_admin(&env);
         admin.require_auth();
         bump_instance(&env);
