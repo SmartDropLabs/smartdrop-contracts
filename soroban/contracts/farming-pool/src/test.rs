@@ -670,6 +670,58 @@ fn test_get_pool_info_requires_initialized_pool() {
 }
 
 #[test]
+fn test_set_credit_rate_event_carries_old_and_new_rate_across_changes() {
+    // #396: an indexer can only track rate history if `rate_set` carries the
+    // rate the pool is leaving as well as the one it is moving to. The event
+    // does publish (old_rate, new_rate, ledger), so this test pins that
+    // contract across a sequence of changes: each event's first payload value
+    // is the previous event's second, which is what makes deltas computable
+    // without reading storage.
+    let t = setup_with_lock_period(2, 10, 12);
+
+    t.client.set_credit_rate(&25i128);
+    t.client.set_credit_rate(&40i128);
+    t.client.set_credit_rate(&5i128);
+
+    assert_eq!(
+        t.env.events().all(),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("rate_set").into_val(&t.env)
+                ],
+                (10i128, 25i128, 0u32).into_val(&t.env),
+            ),
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("rate_set").into_val(&t.env)
+                ],
+                (25i128, 40i128, 0u32).into_val(&t.env),
+            ),
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("rate_set").into_val(&t.env)
+                ],
+                (40i128, 5i128, 0u32).into_val(&t.env),
+            )
+        ]
+    );
+
+    // Final value still matches the public getter.
+    assert_eq!(t.client.credit_rate().unwrap(), 5i128);
+}
+
+#[test]
 fn test_set_credit_rate_updates_public_getters() {
     let t = setup_with_lock_period(2, 1, 12);
     t.client.set_credit_rate(&4i128);
