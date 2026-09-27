@@ -1233,6 +1233,10 @@ impl FarmingPool {
         let mut position = if let Some(mut existing) = get_position(&env, &user) {
             checkpoint_position(&env, &user, &mut existing);
             existing.amount += amount;
+            
+            // Issue #376: Update lock_ledger to current ledger for additional deposits
+            // This ensures the lock period is based on the most recent deposit, not the original
+            existing.lock_ledger = current;
             let fresh_unlock = current.saturating_add(read_min_lock_period(&env));
             existing.unlock_ledger = existing.unlock_ledger.max(fresh_unlock);
             existing

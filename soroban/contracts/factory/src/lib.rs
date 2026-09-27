@@ -6,7 +6,7 @@ use soroban_sdk::{
     contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, String, Symbol, Val,
     Vec,
 };
-use types::{DataKey, ListPoolsResponse, PoolRecord, PoolSort};
+use types::{DataKey, ListPoolsResponse, PoolRecord, PoolSort, PoolStatus};
 
 pub use types::FactoryError;
 
@@ -296,14 +296,16 @@ impl Factory {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(FactoryError::AlreadyInitialized);
         }
-        if admin
-            == Address::from_string(&soroban_sdk::String::from_str(
-                &env,
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-            ))
-        {
+        
+        // Issue #374: Validate admin address before storing
+        let zero_admin = Address::from_string(&soroban_sdk::String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        if admin == zero_admin {
             return Err(FactoryError::InvalidAdmin);
         }
+        
         if pool_wasm_hash == BytesN::from_array(&env, &[0u8; 32]) {
             return Err(FactoryError::InvalidWasmHash);
         }
@@ -1017,6 +1019,54 @@ impl Factory {
         Ok(end)
     }
 
+    /// Query the health status of an individual pool (Issue #375).
+    ///
+    /// Returns a `PoolStatus` struct containing the pool's address, pause status,
+    /// and total staked amount. This provides a centralized way to check pool
+    /// health without querying each pool contract directly.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized,
+    /// `PoolNotFound` for an unknown `pool_id`, or `PoolQueryFailed` if the
+    /// deployed pool does not respond to the status queries.
+    pub fn pool_status(env: Env, pool_id: u32) -> Result<PoolStatus, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        let no_args: Vec<Val> = vec![&env];
+        
+        // Query is_paused status
+        let is_paused = match env.try_invoke_contract::<bool, soroban_sdk::Error>(
+            &record.address,
+            &Symbol::new(&env, "is_paused"),
+            no_args.clone(),
+        ) {
+            Ok(Ok(v)) => v,
+            _ => return Err(FactoryError::PoolQueryFailed),
+        };
+
+        // Query total_staked
+        let total_staked = match env.try_invoke_contract::<i128, soroban_sdk::Error>(
+            &record.address,
+            &Symbol::new(&env, "total_staked"),
+            no_args,
+        ) {
+            Ok(Ok(v)) => v,
+            _ => return Err(FactoryError::PoolQueryFailed),
+        };
+
+        Ok(PoolStatus {
+            address: record.address,
+            is_paused,
+            total_staked,
+        })
+    }
+
     /// Update the WASM hash used for future `create_pool` deployments. Admin-only.
     ///
     /// Allows the admin to point future pool deployments at a corrected or upgraded
@@ -1224,6 +1274,10 @@ impl Factory {
             min_lock_period.into_val(&env),
             effective_min_stake.into_val(&env),
         ];
+        
+        // Issue #373: Initialize the pool before emitting pool_crtd event to ensure
+        // the event is only emitted if pool creation succeeds. If initialization
+        // fails, the entire transaction reverts and no event is published.
         let _: () = env.invoke_contract(&pool_address, &Symbol::new(&env, "initialize"), init_args);
 
         let record = PoolRecord {
@@ -1268,7 +1322,18 @@ impl Factory {
         env.storage().persistent().set(&admin_key, &admin_pool_ids);
         bump_admin_pools(&env, &admin);
 
-        // Emit enriched event so indexers get the full pool parameters in one shot.
+        let wasm_key = DataKey::PoolsByWasmHash(wasm_hash.clone());
+        let mut wasm_pool_ids: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&wasm_key)
+            .unwrap_or_else(|| vec![&env]);
+        wasm_pool_ids.push_back(pool_id);
+        env.storage().persistent().set(&wasm_key, &wasm_pool_ids);
+        bump_wasm_pools(&env, &wasm_hash);
+
+        // Issue #373: Emit enriched event AFTER successful pool initialization.
+        // This ensures indexers only record pools that were fully created.
         // `effective_min_stake` is the resolved dust-thresholded value actually
         // passed to the pool's `initialize` (#330), not the raw caller input.
         #[allow(deprecated)]
