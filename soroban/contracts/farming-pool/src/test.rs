@@ -627,6 +627,101 @@ fn test_admin_sets_global_multiplier() {
 }
 
 #[test]
+fn test_get_pool_info_aggregates_pool_parameters() {
+    // #395: a pool overview is one invocation, and its values must agree with
+    // the individual getters so the aggregate is not a second source of truth.
+    let t = setup_with_lock_period(3, 42, 12);
+
+    let info = t.client.get_pool_info();
+
+    assert_eq!(info.credit_rate, t.client.credit_rate().unwrap());
+    assert_eq!(info.min_lock_period, t.client.min_lock_period().unwrap());
+    assert_eq!(
+        info.min_stake_amount,
+        t.client.get_min_stake_amount().unwrap()
+    );
+    assert_eq!(info.total_staked, t.client.total_staked().unwrap());
+    assert_eq!(
+        info.total_distributed_credits,
+        t.client.total_distributed_credits().unwrap()
+    );
+    assert_eq!(
+        info.total_banked_credits,
+        t.client.total_banked_credits().unwrap()
+    );
+    assert_eq!(info.is_paused, t.client.is_paused().unwrap());
+
+    // Configured-at-initialize values are reflected.
+    assert_eq!(info.credit_rate, 42);
+    assert_eq!(info.global_multiplier, 3);
+    assert_eq!(info.min_lock_period, 12);
+    assert!(!info.is_paused);
+}
+
+#[test]
+fn test_get_pool_info_requires_initialized_pool() {
+    // #395: like every other getter, the aggregate must not answer for an
+    // uninitialized pool — a zeroed PoolInfo would be indistinguishable from
+    // a real pool that happens to hold nothing.
+    let (_env, client, _user) = setup_uninitialized();
+
+    let result = client.try_get_pool_info();
+    assert!(matches!(result, Err(Ok(PoolError::NotInitialized))));
+}
+
+#[test]
+fn test_set_credit_rate_event_carries_old_and_new_rate_across_changes() {
+    // #396: an indexer can only track rate history if `rate_set` carries the
+    // rate the pool is leaving as well as the one it is moving to. The event
+    // does publish (old_rate, new_rate, ledger), so this test pins that
+    // contract across a sequence of changes: each event's first payload value
+    // is the previous event's second, which is what makes deltas computable
+    // without reading storage.
+    let t = setup_with_lock_period(2, 10, 12);
+
+    t.client.set_credit_rate(&25i128);
+    t.client.set_credit_rate(&40i128);
+    t.client.set_credit_rate(&5i128);
+
+    assert_eq!(
+        t.env.events().all(),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("rate_set").into_val(&t.env)
+                ],
+                (10i128, 25i128, 0u32).into_val(&t.env),
+            ),
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("rate_set").into_val(&t.env)
+                ],
+                (25i128, 40i128, 0u32).into_val(&t.env),
+            ),
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("rate_set").into_val(&t.env)
+                ],
+                (40i128, 5i128, 0u32).into_val(&t.env),
+            )
+        ]
+    );
+
+    // Final value still matches the public getter.
+    assert_eq!(t.client.credit_rate().unwrap(), 5i128);
+}
+
+#[test]
 fn test_set_credit_rate_updates_public_getters() {
     let t = setup_with_lock_period(2, 1, 12);
     t.client.set_credit_rate(&4i128);

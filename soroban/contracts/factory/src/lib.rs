@@ -936,8 +936,17 @@ impl Factory {
     /// let their TTL lapse, or archive/white-list them off-chain rather than
     /// relying on attacker interference.
     ///
+    /// Returns a `RefreshPoolTtlsResponse` listing the IDs that were actually
+    /// refreshed (#393). The existence check was already in place; the sweep
+    /// previously returned `Ok(())`, so a caller could not tell which IDs had
+    /// a record and were kept alive versus which were skipped as missing.
+    ///
     /// Returns `NotInitialized` if the factory has not been initialized.
-    pub fn refresh_pool_ttls(env: Env, start_id: u32, limit: u32) -> Result<(), FactoryError> {
+    pub fn refresh_pool_ttls(
+        env: Env,
+        start_id: u32,
+        limit: u32,
+    ) -> Result<RefreshPoolTtlsResponse, FactoryError> {
         require_initialized(&env)?;
         bump_instance(&env);
         let count: u32 = env
@@ -947,9 +956,14 @@ impl Factory {
             .unwrap_or(0);
         let capped_limit = limit.min(20);
         let end = start_id.saturating_add(capped_limit).min(count);
+        let mut refreshed: Vec<u32> = Vec::new(&env);
+        let mut missing = 0u32;
         for pool_id in start_id..end {
             if env.storage().persistent().has(&DataKey::Pool(pool_id)) {
                 bump_pool(&env, pool_id);
+                refreshed.push_back(pool_id);
+            } else {
+                missing += 1;
             }
         }
         #[allow(deprecated)]
@@ -957,7 +971,11 @@ impl Factory {
             (symbol_short!("factory"), symbol_short!("ttl_ref")),
             (start_id, end),
         );
-        Ok(())
+        Ok(RefreshPoolTtlsResponse {
+            refreshed,
+            end_id: end,
+            missing,
+        })
     }
 
     /// Transfer admin rights to `new_admin`. Current admin must authorise.

@@ -193,6 +193,40 @@ pub struct ListWhitelistedResponse {
     pub total: u32,
 }
 
+/// Aggregate pool parameters returned by `get_pool_info` (Issue #395).
+///
+/// A pool overview previously needed several separate contract calls
+/// (`total_staked`, `credit_rate`, the global multiplier, the min lock
+/// period, the min stake amount and the paused flag), each paying its own
+/// invocation and TTL bump. This bundles the read-only pool configuration
+/// into one call for dashboards and analytics.
+///
+/// The issue text also names "total credits" and "number of stakers"; those
+/// are the maintained `total_distributed_credits` / `total_banked_credits`
+/// counters, included here so a full overview is a single round trip. There
+/// is no per-staker count kept in storage — staker counts are derived by
+/// paging `get_positions`, so no field for it is invented here.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolInfo {
+    /// Total value staked across all positions, in stroops.
+    pub total_staked: i128,
+    /// Credits earned banked by users but not yet withdrawn, in stroops.
+    pub total_banked_credits: i128,
+    /// Credits distributed to all users since initialization, in stroops.
+    pub total_distributed_credits: i128,
+    /// Current global credit rate.
+    pub credit_rate: i128,
+    /// Current global reward multiplier.
+    pub global_multiplier: u32,
+    /// Minimum lock period in ledgers.
+    pub min_lock_period: u32,
+    /// Minimum amount accepted by `stake`, in stroops.
+    pub min_stake_amount: i128,
+    /// Whether the pool is currently paused.
+    pub is_paused: bool,
+}
+
 // ─── History / audit trail types ─────────────────────────────────────────────
 
 /// A single whitelist change event (add or remove).
