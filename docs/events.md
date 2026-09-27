@@ -190,8 +190,22 @@ Emitted by `set_global_multiplier`.
 
 ## 3. VestingWallet Contract (`soroban/contracts/vesting-wallet`)
 
+### `init`
+Emitted by `initialize` when the vesting schedule is created.
+
+* **Topics:** `(Symbol, Symbol)` -> `(symbol_short!("vest"), symbol_short!("init"))`
+* **Payload Structure (tuple order):**
+
+| Field | Rust Type | Description |
+| :--- | :--- | :--- |
+| `beneficiary` | `Address` | The beneficiary the schedule was created for. |
+| `token` | `Address` | The token being vested. |
+| `total_amount` | `i128` | Total amount pulled from `admin`. |
+| `start_ledger` | `u32` | Ledger at which linear vesting begins. |
+| `end_ledger` | `u32` | Ledger at which the full amount is vested. |
+
 ### `released`
-Emitted by `release` whenever a nonzero amount is transferred to the beneficiary.
+Emitted by `release` (and by `release_all`) whenever a nonzero amount is transferred to the beneficiary. A call with nothing to release emits nothing.
 
 * **Topics:** `(Symbol, Symbol)` -> `(symbol_short!("vest"), symbol_short!("released"))`
 * **Payload Structure (tuple order):**
@@ -200,6 +214,9 @@ Emitted by `release` whenever a nonzero amount is transferred to the beneficiary
 | :--- | :--- | :--- |
 | `beneficiary` | `Address` | The address that received the released tokens. |
 | `releasable` | `i128` | The amount transferred in this call. |
+| `released_total` | `i128` | The cumulative released total **after** this call. |
+
+See [`vesting-api.md`](vesting-api.md) for the full VestingWallet entry-point reference.
 
 ### `revoked`
 Emitted by `revoke` (admin-only, requires `revocable = true` and not already revoked).
