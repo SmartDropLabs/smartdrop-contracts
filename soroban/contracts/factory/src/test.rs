@@ -1321,8 +1321,15 @@ fn test_refresh_pool_ttls_restores_ttl_for_unqueried_pool() {
     advance_ledgers(&t.env, TTL_EXTEND_TO + 1);
     assert!(pool_record_ttl(&t.env, &t.factory_addr, id) < TTL_THRESHOLD);
 
-    // Call refresh_pool_ttls to restore TTL without a specific get_pool query
-    assert_eq!(t.client.try_refresh_pool_ttls(&id, &1u32), Ok(Ok(())));
+    // Call refresh_pool_ttls to restore TTL without a specific get_pool query.
+    // #393: the sweep now reports which IDs were actually refreshed.
+    let refreshed = t.client.try_refresh_pool_ttls(&id, &1u32);
+    assert!(refreshed.is_ok());
+    let sweep = refreshed.unwrap().unwrap();
+    assert_eq!(sweep.refreshed.len(), 1);
+    assert_eq!(sweep.refreshed.get(0), Some(id));
+    assert_eq!(sweep.end_id, id + 1);
+    assert_eq!(sweep.missing, 0);
 
     // Verify TTL is restored
     assert_eq!(pool_record_ttl(&t.env, &t.factory_addr, id), TTL_EXTEND_TO);
@@ -1336,7 +1343,9 @@ fn test_refresh_pool_ttls_stays_permissionless_for_any_caller() {
     let t = setup_with_pool_records(3);
     let stranger = Address::generate(&t.env);
     // No admin auth provided at all: assert the refresh still succeeds.
-    assert_eq!(t.client.try_refresh_pool_ttls(&0u32, &3u32), Ok(Ok(())));
+    let sweep = t.client.try_refresh_pool_ttls(&0u32, &3u32).unwrap().unwrap();
+    assert_eq!(sweep.refreshed.len(), 3);
+    assert_eq!(sweep.missing, 0);
     assert_eq!(
         pool_record_ttl(&t.env, &t.factory_addr, 1),
         TTL_EXTEND_TO,
@@ -1354,6 +1363,85 @@ fn test_refresh_pool_ttls_requires_initialized_factory() {
     let (_env, client) = setup_uninitialized();
     let result = client.try_refresh_pool_ttls(&0u32, &20u32);
     assert!(matches!(result, Err(Ok(FactoryError::NotInitialized))));
+}
+
+#[test]
+fn test_refresh_pool_ttls_reports_only_existing_pools_and_counts_gaps() {
+    // #393 / #394: pool IDs are handed out sequentially from PoolCount, so a
+    // hole in `start_id..end` means a record was removed from storage (TTL
+    // expiry / archival) — the same situation list_pools reports as a
+    // "pool_gap". The sweep must skip it, say so in the response, and leave
+    // the surviving records bumped.
+    let t = setup();
+
+    let p0 = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &50u64,
+        &0i128,
+    );
+    let p1 = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &50u64,
+        &0i128,
+    );
+    let p2 = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &50u64,
+        &0i128,
+    );
+
+    // Archive the middle record out from under the registry, as a TTL lapse
+    // would, leaving the count intact so the ID stays inside the sweep range.
+    t.env.as_contract(&t.factory_addr, || {
+        t.env.storage().persistent().remove(&DataKey::Pool(p1));
+    });
+
+    // Age the surviving records past the refresh threshold.
+    advance_ledgers(&t.env, TTL_EXTEND_TO + 1);
+    for id in [p0, p2] {
+        assert!(pool_record_ttl(&t.env, &t.factory_addr, id) < TTL_THRESHOLD);
+    }
+
+    let sweep = t.client.refresh_pool_ttls(&p0, &20u32);
+
+    assert_eq!(sweep.refreshed.len(), 2);
+    assert_eq!(sweep.refreshed.get(0), Some(p0));
+    assert_eq!(sweep.refreshed.get(1), Some(p2));
+    assert_eq!(sweep.missing, 1, "the gap must be reported, not silently skipped");
+    assert_eq!(sweep.end_id, p2 + 1);
+
+    for id in [p0, p2] {
+        assert_eq!(
+            pool_record_ttl(&t.env, &t.factory_addr, id),
+            TTL_EXTEND_TO,
+            "existing pool {id} must have had its TTL extended"
+        );
+    }
+    t.env.as_contract(&t.factory_addr, || {
+        assert!(
+            !t.env.storage().persistent().has(&DataKey::Pool(p1)),
+            "a TTL sweep must not materialise an archived pool record"
+        );
+    });
+}
+
+#[test]
+fn test_refresh_pool_ttls_reports_empty_sweep_past_the_registry() {
+    // #393: a start_id at or past the pool count sweeps nothing and says so,
+    // rather than returning a unit value the caller has to interpret.
+    let t = setup_with_pool_records(2);
+
+    let sweep = t.client.refresh_pool_ttls(&5u32, &20u32);
+
+    assert_eq!(sweep.refreshed.len(), 0);
+    assert_eq!(sweep.missing, 0);
+    assert_eq!(sweep.end_id, 2, "end is clamped to the registry count");
 }
 
 #[test]
