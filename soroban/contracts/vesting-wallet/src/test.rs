@@ -723,6 +723,133 @@ fn test_release_requires_beneficiary_auth() {
     assert!(released > 0);
 }
 
+// ── release_all tests (#407) ──────────────────────────────────────────────────
+
+#[test]
+fn test_release_all_claims_everything_vested_in_one_call() {
+    let t = setup(0, 100, 1_000);
+    // Mid-schedule: 60% vested, and none of it claimed yet.
+    advance_ledgers(&t.env, 60);
+
+    let released = t.client.release_all();
+
+    // One call claims the whole vested balance — no repeated release needed.
+    assert_eq!(released, 600);
+    assert_eq!(t.token.balance(&t.beneficiary), 600);
+    assert_eq!(t.client.released_amount(), 600);
+    assert_eq!(t.client.releasable(), 0);
+}
+
+#[test]
+fn test_release_all_returns_zero_before_anything_vests() {
+    let t = setup(50, 100, 1_000);
+    // Still before the cliff.
+    let released = t.client.release_all();
+
+    assert_eq!(released, 0);
+    assert_eq!(t.token.balance(&t.beneficiary), 0);
+}
+
+#[test]
+fn test_release_all_after_end_claims_the_entire_schedule() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 200);
+
+    assert_eq!(t.client.release_all(), 1_000);
+    assert_eq!(t.token.balance(&t.beneficiary), 1_000);
+}
+
+#[test]
+fn test_release_all_is_idempotent_after_a_full_claim() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 200);
+
+    assert_eq!(t.client.release_all(), 1_000);
+    // A second call has nothing left to hand over.
+    assert_eq!(t.client.release_all(), 0);
+    assert_eq!(t.token.balance(&t.beneficiary), 1_000);
+}
+
+#[test]
+fn test_release_all_emits_the_same_event_as_release() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+
+    let released = t.client.release_all();
+
+    assert_eq!(
+        t.env.events().all(),
+        vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                vec![
+                    &t.env,
+                    symbol_short!("vest").into_val(&t.env),
+                    symbol_short!("released").into_val(&t.env),
+                ],
+                (t.beneficiary.clone(), released, released).into_val(&t.env),
+            )
+        ],
+        "release_all must stay on the same audited event as release"
+    );
+}
+
+#[test]
+fn test_release_all_requires_beneficiary_auth() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+
+    t.env.mock_auths(&[MockAuth {
+        address: &t.beneficiary,
+        invoke: &MockAuthInvoke {
+            contract: &t.contract_id,
+            fn_name: "release_all",
+            args: vec![&t.env],
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(t.client.release_all() > 0);
+}
+
+#[test]
+fn test_release_all_rejects_an_unauthorized_caller() {
+    // The convenience entry point must not become a way for a third party to
+    // force a release at a time the beneficiary did not choose.
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+
+    t.env.mock_auths(&[]);
+
+    assert!(t.client.try_release_all().is_err());
+    assert_eq!(t.token.balance(&t.beneficiary), 0);
+}
+
+#[test]
+fn test_release_all_on_uninitialized_wallet_errors() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    assert!(matches!(
+        client.try_release_all(),
+        Err(Ok(VestingError::NotInitialized))
+    ));
+}
+
+#[test]
+fn test_release_all_counts_as_a_release_operation() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+    assert_eq!(t.client.release_count(), 0);
+
+    t.client.release_all();
+
+    assert_eq!(t.client.release_count(), 1);
+}
+
 // ── admin access-control regression tests (#406) ──────────────────────────────
 //
 // The reported `clawback` entry point does not exist in this contract, but

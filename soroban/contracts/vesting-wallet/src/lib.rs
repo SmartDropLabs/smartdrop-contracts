@@ -322,6 +322,25 @@ impl VestingWallet {
         Ok(())
     }
 
+    /// Claim every currently-vested token in a single call.
+    ///
+    /// Convenience wrapper over {@link VestingWallet::release}, which already
+    /// transfers the whole vested-but-unclaimed balance in one transfer, so
+    /// this adds a self-documenting entry point rather than a second code path
+    /// — the release logic, the beneficiary authorisation and the
+    /// `vest/released` event are identical because it delegates.
+    ///
+    /// Note the signature deliberately takes no `beneficiary` argument: the
+    /// beneficiary is read from storage and is the account that must authorise
+    /// the call, so an argument would either be ignored or let a third party
+    /// force a release at a time the beneficiary did not choose (#407).
+    ///
+    /// Returns the total amount transferred, which is 0 when nothing has vested
+    /// yet, and `NotInitialized` if the wallet was never initialized.
+    pub fn release_all(env: Env) -> Result<i128, VestingError> {
+        Self::release(env)
+    }
+
     /// Return the total amount vested as of the current ledger.
     pub fn vested_amount(env: Env) -> Result<i128, VestingError> {
         require_initialized(&env)?;
