@@ -311,7 +311,7 @@ fn test_total_credits_earned_tracks_lifetime_credits_across_withdrawals() {
     advance_ledgers(&t.env, 5);
     t.client.stake(&t.user, &500);
     advance_ledgers(&t.env, 5);
-    t.client.unstake(&t.user, &1_000);
+    t.client.unstake(&t.user, &500);
     assert_eq!(t.client.total_credits_earned(&t.user), 12_500);
 }
 
@@ -2693,7 +2693,7 @@ fn test_unstake_reentrant_transfer_is_rejected_and_final_state_is_correct() {
 
     client.initialize(&admin, &token_id, &2u32, &100i128, &0u32, &0i128);
 
-    seed_user_stake(&env, &farming_pool_id, &user, 500i128);
+    seed_user_stake(&env, &farming_pool_id, &user, 1_000i128);
 
     let reentrant_args: soroban_sdk::Vec<Val> =
         soroban_sdk::vec![&env, user.clone().into_val(&env)];
@@ -2725,7 +2725,7 @@ fn test_unstake_reverts_entirely_if_stake_token_naively_reenters() {
     seed_user_stake(&env, &farming_pool_id, &user, 500i128);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.unstake(&user, &1_000);
+        client.unstake(&user, &500);
     }));
     assert!(
         result.is_err(),
@@ -2939,7 +2939,7 @@ fn test_staked_user_count_increments_and_decrements_correctly() {
     assert_eq!(t.client.staked_user_count(), 2);
 
     // User 1 unstakes completely: count becomes 1
-    t.client.unstake(&t.user, &1_000);
+    t.client.unstake(&t.user, &1_500);
     assert_eq!(t.client.staked_user_count(), 1);
 
     // User 2 unlocks position completely: count becomes 0
@@ -3192,7 +3192,7 @@ fn test_active_stake_count_lifecycle() {
     assert_eq!(t.client.active_stake_count(), 2);
 
     // User 1 unstakes: active_stake_count becomes 1
-    t.client.unstake(&t.user, &1_000);
+    t.client.unstake(&t.user, &1_500);
     assert_eq!(t.client.active_stake_count(), 1);
 
     // Pool pauses, User 2 emergency withdraws: active_stake_count becomes 0
@@ -3807,4 +3807,57 @@ fn test_position_checkpoint_uses_current_multiplier() {
     // Position accrual doesn't use boost, so multiplier shouldn't affect it
     // Expected: 1000 * 1 * 20 = 20,000 (no boost for positions)
     assert_eq!(credits, 20_000);
+}
+
+// ── #392: withdraw_credits tests ──────────────────────────────────────────────
+
+#[test]
+fn test_withdraw_credits_success() {
+    let t = setup(1, 10);
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 5);
+
+    let credits = t.client.withdraw_credits(&t.user);
+    assert_eq!(credits, 50_000); // 1000 * 10 * 5 = 50,000
+
+    let stake = t.client.get_stake(&t.user).unwrap();
+    assert_eq!(stake.amount, 1_000);
+    assert_eq!(stake.credits_banked, 0);
+
+    // Immediate second withdrawal returns 0 because 0 ledgers elapsed
+    let immediate = t.client.withdraw_credits(&t.user);
+    assert_eq!(immediate, 0);
+}
+
+#[test]
+fn test_withdraw_credits_requires_active_stake() {
+    let t = setup(1, 10);
+    let res = t.client.try_withdraw_credits(&t.user);
+    assert_eq!(res, Err(Ok(PoolError::NoActiveStake)));
+}
+
+#[test]
+fn test_withdraw_credits_blocked_when_withdrawals_paused() {
+    let t = setup(1, 10);
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 5);
+
+    t.client.pause_withdrawals();
+    let res = t.client.try_withdraw_credits(&t.user);
+    assert_eq!(res, Err(Ok(PoolError::Paused)));
+}
+
+// ── #390: migrate schema version upgrade tests ───────────────────────────────
+
+#[test]
+fn test_migrate_upgrades_schema_version_step_by_step() {
+    let t = setup(1, 10);
+    t.env.as_contract(&t.contract_id, || {
+        t.env.storage().instance().set(&DataKey::SchemaVersion, &0u32);
+    });
+    assert_eq!(t.client.schema_version(), 0);
+
+    let prev = t.client.migrate();
+    assert_eq!(prev, 0);
+    assert_eq!(t.client.schema_version(), 1);
 }

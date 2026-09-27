@@ -1678,3 +1678,80 @@ fn test_list_pools_reports_missing_records_with_a_pool_gap_event() {
         ]
     );
 }
+
+// ── #391: upgrade_pool WASM verification ─────────────────────────────────────
+
+#[test]
+fn test_upgrade_pool_rejects_zero_wasm_hash() {
+    let t = setup();
+    let pool_id = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &10u64,
+        &0i128,
+    );
+    let zero_hash = BytesN::from_array(&t.env, &[0u8; 32]);
+    let result = t.client.try_upgrade_pool(&pool_id, &zero_hash);
+    assert_eq!(result, Err(Ok(FactoryError::InvalidWasmHash)));
+}
+
+// ── #389: upgrade_pools_batch ────────────────────────────────────────────────
+
+#[test]
+fn test_upgrade_pools_batch_success() {
+    let t = setup();
+    let pool_id_0 = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &10u64,
+        &0i128,
+    );
+    let pool_id_1 = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &10u64,
+        &0i128,
+    );
+    let new_wasm_hash = upload_replacement_wasm(&t.env);
+    let pool_ids = vec![&t.env, pool_id_0, pool_id_1];
+    t.client.upgrade_pools_batch(&pool_ids, &new_wasm_hash);
+
+    let record_0 = t.client.get_pool(&pool_id_0);
+    let record_1 = t.client.get_pool(&pool_id_1);
+    assert_eq!(record_0.wasm_hash, new_wasm_hash);
+    assert_eq!(record_1.wasm_hash, new_wasm_hash);
+    assert_eq!(t.client.upgrade_count(), 2);
+}
+
+#[test]
+fn test_upgrade_pools_batch_requires_admin_auth() {
+    let t = setup();
+    let pool_id = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &10u64,
+        &0i128,
+    );
+    let not_admin = Address::generate(&t.env);
+    let new_wasm_hash = upload_replacement_wasm(&t.env);
+    let pool_ids = vec![&t.env, pool_id];
+    let args = (&pool_ids, &new_wasm_hash).into_val(&t.env);
+    let invoke = MockAuthInvoke {
+        contract: &t.factory_addr,
+        fn_name: "upgrade_pools_batch",
+        args,
+        sub_invokes: &[],
+    };
+    let result = t
+        .client
+        .mock_auths(&[MockAuth {
+            address: &not_admin,
+            invoke: &invoke,
+        }])
+        .try_upgrade_pools_batch(&pool_ids, &new_wasm_hash);
+    assert!(result.is_err(), "only the factory admin may batch upgrade pools");
+}
