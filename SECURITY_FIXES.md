@@ -252,5 +252,47 @@ cargo test --package vesting-wallet test_admin_only_entry_points_require_admin_a
 
 ---
 
+## Issue #398: farming-pool lock_assets reentrancy
+
+### Problem
+The issue reported that `lock_assets` calls `token::transfer`, which could be
+a malicious contract that reenters the pool and manipulates state mid-transfer.
+
+### Analysis
+**The code already follows checks-effects-interactions.** Verified in
+`contracts/farming-pool/src/lib.rs`:
+
+- All validations (`amount <= 0`, `MAX_STAKE_AMOUNT`, minimum stake, whitelist)
+  run before any state change.
+- The position — including the extended `unlock_ledger` and the recomputed
+  `credit_rate` — is written with `set_position` **before**
+  `token::Client::new(&env, &stake_token).transfer(...)` is invoked, so a
+  reentrant observer sees the final post-deposit state, never a partial one.
+- A second, independent layer sits below the code: Soroban's
+  `ContractReentryMode` defaults to `Prohibited`, so a token attempting to
+  call back into `FarmingPool` during the transfer traps with
+  "Contract re-entry is not allowed" before any of this contract's code runs.
+
+### Fix Applied
+**No behavior change required.** Per the issue's instruction to "verify this is
+sufficient and add documentation":
+
+1. A `# Reentrancy posture (#398)` section on `lock_assets` documenting both
+   defense layers, the CEI ordering, the `()`-returns/traps-on-failure
+   transfer semantics (#363), and the two tests that prove it.
+2. This note.
+
+### Verification
+```bash
+cargo test --package farming-pool test_lock_assets_reentrant
+```
+Both existing tests pass without modification:
+`test_lock_assets_reentrant_transfer_is_rejected_and_final_state_is_correct`
+(graceful reentry is rejected, final position is correct) and
+`test_lock_assets_reverts_entirely_if_stake_token_naively_reenters` (a naive
+reentry traps the whole call and no partial position survives).
+
+---
+
 Last Updated: 2024-01-01  
-Fixed Issues: #357, #358, #363, #364, #406 (audit + regression test)
+Fixed Issues: #357, #358, #363, #364, #398 (verification + docs), #406 (audit + regression test)
