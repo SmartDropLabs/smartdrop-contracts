@@ -198,5 +198,101 @@ cargo test --package farming-pool
 
 ---
 
+## Issue #406: vesting-wallet clawback access control
+
+### Problem
+The issue reported that `clawback` in `contracts/vesting-wallet/src/lib.rs`
+"may not require proper admin authorization, allowing anyone to clawback
+vested tokens", and suggested adding `admin.require_auth()` to a
+`clawback(env, admin, beneficiary, amount)` function.
+
+### Analysis
+The reported function **does not exist** anywhere in the contract:
+`grep -n "clawback" soroban/contracts/vesting-wallet/src/*.rs` returns no
+matches. There is therefore no unauthenticated clawback to fix.
+
+Auditing every entry point that moves value or changes authority confirms the
+access control the issue is actually worried about ("No access control on
+sensitive operations") is already in place:
+
+| Entry point | Authorization |
+|---|---|
+| `initialize` | `admin.require_auth()` (funds are pulled from the admin) |
+| `release` | beneficiary `require_auth()` — see `test_release_requires_beneficiary_auth` |
+| `revoke` | stored admin `require_auth()` |
+| `emergency_withdraw` | stored admin `require_auth()` (drains to the admin) |
+| `transfer_beneficiary` | stored admin `require_auth()` |
+| `transfer_admin` | current admin `require_auth()` |
+
+The contract also has no notion of a token-level clawback at all: it only
+ever holds and releases the vested `total_amount` through the token's
+`transfer`, so a `clawback` entry point would be a **new** admin capability
+rather than a fix.
+
+### Fix Applied
+**No contract change** — deliberately not adding a `clawback` function. Adding
+a sensitive admin operation that the codebase has never had would expand the
+attack surface this issue was raised to protect, and nothing in the issue
+describes the intended semantics (who receives the clawed-back amount, how it
+interacts with `released_amount`, or whether it is allowed after revocation).
+
+What was added instead:
+
+1. This audit note, so the report is not silently re-raised.
+2. A regression test,
+   `test_admin_only_entry_points_require_admin_auth` (#406), that authorizes
+   **only a non-admin address** and asserts every admin-gated entry point
+   rejects the call and leaves state untouched. A future entry point added
+   without `require_auth()` fails this test.
+
+### Verification
+```bash
+cargo test --package vesting-wallet test_admin_only_entry_points_require_admin_auth
+```
+
+---
+
+## Issue #398: farming-pool lock_assets reentrancy
+
+### Problem
+The issue reported that `lock_assets` calls `token::transfer`, which could be
+a malicious contract that reenters the pool and manipulates state mid-transfer.
+
+### Analysis
+**The code already follows checks-effects-interactions.** Verified in
+`contracts/farming-pool/src/lib.rs`:
+
+- All validations (`amount <= 0`, `MAX_STAKE_AMOUNT`, minimum stake, whitelist)
+  run before any state change.
+- The position — including the extended `unlock_ledger` and the recomputed
+  `credit_rate` — is written with `set_position` **before**
+  `token::Client::new(&env, &stake_token).transfer(...)` is invoked, so a
+  reentrant observer sees the final post-deposit state, never a partial one.
+- A second, independent layer sits below the code: Soroban's
+  `ContractReentryMode` defaults to `Prohibited`, so a token attempting to
+  call back into `FarmingPool` during the transfer traps with
+  "Contract re-entry is not allowed" before any of this contract's code runs.
+
+### Fix Applied
+**No behavior change required.** Per the issue's instruction to "verify this is
+sufficient and add documentation":
+
+1. A `# Reentrancy posture (#398)` section on `lock_assets` documenting both
+   defense layers, the CEI ordering, the `()`-returns/traps-on-failure
+   transfer semantics (#363), and the two tests that prove it.
+2. This note.
+
+### Verification
+```bash
+cargo test --package farming-pool test_lock_assets_reentrant
+```
+Both existing tests pass without modification:
+`test_lock_assets_reentrant_transfer_is_rejected_and_final_state_is_correct`
+(graceful reentry is rejected, final position is correct) and
+`test_lock_assets_reverts_entirely_if_stake_token_naively_reenters` (a naive
+reentry traps the whole call and no partial position survives).
+
+---
+
 Last Updated: 2024-01-01  
-Fixed Issues: #357, #358, #363, #364
+Fixed Issues: #357, #358, #363, #364, #398 (verification + docs), #406 (audit + regression test)
