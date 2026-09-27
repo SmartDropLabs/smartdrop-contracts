@@ -1202,6 +1202,33 @@ impl FarmingPool {
     /// Lock assets for the minimum lock period. A top-up checkpoints the
     /// existing position and extends its whole-position unlock ledger to the
     /// later of the existing unlock ledger and a fresh period from this call.
+    ///
+    /// # Reentrancy posture (#398)
+    ///
+    /// `stake_token` is admin-supplied and therefore not necessarily a trusted
+    /// Stellar Asset Contract — a non-standard `transfer` could call back into
+    /// this contract while it is still executing. Two independent defenses
+    /// apply, in order:
+    ///
+    /// 1. **Checks-effects-interactions.** Every validation runs first, the
+    ///    position (including the extended unlock ledger) is written to
+    ///    storage, and only then is `token::transfer` called. A reentrant call
+    ///    therefore observes the already-updated position rather than a
+    ///    half-applied one, so it cannot withdraw or re-credit more than the
+    ///    post-deposit position allows. `token::Client::transfer` returns
+    ///    `()` on success and traps on failure, so a failed transfer reverts the
+    ///    whole invocation and leaves no partial deposit (see #363).
+    /// 2. **Host-level reentry prohibition.** Soroban's `ContractReentryMode`
+    ///    defaults to `Prohibited`, so a token that tries to reenter this
+    ///    contract during the transfer traps with "Contract re-entry is not
+    ///    allowed" before any of our code runs.
+    ///
+    /// Both properties are covered by the reentrancy tests in `test.rs`
+    /// (`test_lock_assets_reentrant_transfer_is_rejected_and_final_state_is_correct`
+    /// and `test_lock_assets_reverts_entirely_if_stake_token_naively_reenters`),
+    /// which use `MockReentrantToken` / `MockNaiveReentrantToken` to attempt
+    /// the reentry mid-transfer. No code change is required for the reported
+    /// concern; this comment records the verification.
     pub fn lock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
@@ -1234,6 +1261,10 @@ impl FarmingPool {
         let mut position = if let Some(mut existing) = get_position(&env, &user) {
             checkpoint_position(&env, &user, &mut existing);
             existing.amount += amount;
+            
+            // Issue #376: Update lock_ledger to current ledger for additional deposits
+            // This ensures the lock period is based on the most recent deposit, not the original
+            existing.lock_ledger = current;
             let fresh_unlock = current.saturating_add(read_min_lock_period(&env));
             existing.unlock_ledger = existing.unlock_ledger.max(fresh_unlock);
             existing
@@ -2020,7 +2051,7 @@ impl FarmingPool {
         let multiplier = read_global_multiplier(&env);
         env.events().publish(
             (symbol_short!("boost"), symbol_short!("applied")),
-            (user.clone(), allocation_pct, multiplier),
+            (user.clone(), old_alloc, allocation_pct, multiplier),
         );
 
         record_boost_event(&env, &user, old_alloc, allocation_pct);

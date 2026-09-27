@@ -12,6 +12,10 @@ use soroban_sdk::{
 
 use farming_pool::FarmingPoolClient;
 
+// The contract crate is `#![no_std]`; these tests assert on `std` collection
+// types, so the shim is declared here (same as farming-pool's tests).
+extern crate std;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 struct TestEnv {
@@ -1764,5 +1768,122 @@ fn test_list_pools_reports_missing_records_with_a_pool_gap_event() {
                 1u32.into_val(&t.env),
             )
         ]
+    );
+}
+
+// ── asset index coverage (#397) ───────────────────────────────────────────────
+//
+// `create_pool` maintains `DataKey::AssetPools(asset) -> Vec<u32>` (and its
+// constant-time companion `DataKey::AssetPoolCount`) so `get_pools_by_asset`
+// reads the index instead of walking the registry. These tests pin that the
+// index is actually written and actually read — the issue's ask, since the
+// index existed but nothing asserted it.
+
+#[test]
+fn test_create_pool_maintains_the_asset_index() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+    let other_asset = Address::generate(&t.env);
+
+    let first = t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+    let second = t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+    let other = t.client.create_pool(&other_asset, &1_728_000u128, &2u32, &10u64, &0i128);
+
+    // The index returns only the pools for the requested asset...
+    let page = t.client.get_pools_by_asset(&asset, &0u32, &10u32);
+    let ids: std::vec::Vec<u32> = page.records.iter().map(|(id, _)| id).collect();
+    assert_eq!(ids, std::vec![first, second]);
+    assert_eq!(
+        page.total, 3,
+        "total reports the whole registry, not just the asset's pools"
+    );
+
+    // ...and the other asset's lookup is not polluted by them.
+    let other_page = t.client.get_pools_by_asset(&other_asset, &0u32, &10u32);
+    let other_ids: std::vec::Vec<u32> = other_page.records.iter().map(|(id, _)| id).collect();
+    assert_eq!(other_ids, std::vec![other]);
+}
+
+#[test]
+fn test_asset_pool_count_agrees_with_the_index() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+
+    assert_eq!(t.client.pool_count_by_asset(&asset), 0);
+
+    t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+    t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+
+    assert_eq!(t.client.pool_count_by_asset(&asset), 2);
+    assert_eq!(
+        t.client.get_pools_by_asset(&asset, &0u32, &10u32).records.len(),
+        2
+    );
+}
+
+#[test]
+fn test_create_pools_batch_maintains_the_asset_index() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+    let other_asset = Address::generate(&t.env);
+
+    let mut batch = vec![&t.env];
+    for _ in 0..2 {
+        batch.push_back(PoolParams {
+            asset: asset.clone(),
+            daily_rate: 1_728_000u128,
+            global_multiplier: 2u32,
+            min_lock_period: 10u64,
+            min_stake_amount: 0i128,
+        });
+    }
+    batch.push_back(PoolParams {
+        asset: other_asset.clone(),
+        daily_rate: 1_728_000u128,
+        global_multiplier: 2u32,
+        min_lock_period: 10u64,
+        min_stake_amount: 0i128,
+    });
+
+    let created = t.client.create_pools_batch(&batch);
+    let ids: std::vec::Vec<u32> = created.iter().collect();
+    assert_eq!(ids.len(), 3);
+
+    // Batched creation must index exactly like single creation.
+    let page = t.client.get_pools_by_asset(&asset, &0u32, &10u32);
+    let indexed: std::vec::Vec<u32> = page.records.iter().map(|(id, _)| id).collect();
+    assert_eq!(indexed, std::vec![ids[0], ids[1]]);
+    assert_eq!(t.client.pool_count_by_asset(&asset), 2);
+    assert_eq!(t.client.pool_count_by_asset(&other_asset), 1);
+}
+
+#[test]
+fn test_asset_index_survives_a_paginated_walk() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+    for _ in 0..3 {
+        t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+    }
+    t.client.create_pool(&Address::generate(&t.env), &1_728_000u128, &2u32, &10u64, &0i128);
+
+    // Resuming from the previous page's `next_start_id` must not drop or
+    // duplicate indexed pools (the #327 resume invariant, index path).
+    let mut collected: std::vec::Vec<u32> = std::vec::Vec::new();
+    let mut start = 0u32;
+    loop {
+        let page = t.client.get_pools_by_asset(&asset, &start, &1u32);
+        for (id, _) in page.records.iter() {
+            collected.push(id);
+        }
+        if page.next_start_id >= page.total || page.records.is_empty() {
+            break;
+        }
+        start = page.next_start_id;
+    }
+
+    assert_eq!(
+        collected.len(),
+        3,
+        "every indexed pool for the asset should be returned exactly once"
     );
 }
