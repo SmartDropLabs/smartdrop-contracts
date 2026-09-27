@@ -3050,6 +3050,109 @@ fn test_unstake_count_increments_on_every_unstake_operation() {
 }
 
 #[test]
+fn test_get_all_positions_returns_empty_when_no_positions() {
+    let t = setup(1, 1);
+    let positions = t.client.get_all_positions(&0u32, &100u32);
+    assert_eq!(positions.len(), 0);
+}
+
+#[test]
+fn test_get_all_positions_returns_all_positions() {
+    let t = setup(1, 1);
+    let user2 = Address::generate(&t.env);
+    let user3 = Address::generate(&t.env);
+    t.token_sac.mint(&user2, &10_000);
+    t.token_sac.mint(&user3, &10_000);
+
+    t.client.lock_assets(&t.user, &1_000);
+    t.client.lock_assets(&user2, &2_000);
+    t.client.lock_assets(&user3, &3_000);
+
+    let positions = t.client.get_all_positions(&0u32, &100u32);
+    assert_eq!(positions.len(), 3);
+
+    // Verify each position has the correct amount
+    let mut found_1000 = false;
+    let mut found_2000 = false;
+    let mut found_3000 = false;
+    for (_, p) in positions.iter() {
+        if p.amount == 1_000 {
+            found_1000 = true;
+        }
+        if p.amount == 2_000 {
+            found_2000 = true;
+        }
+        if p.amount == 3_000 {
+            found_3000 = true;
+        }
+    }
+    assert!(found_1000, "should find position with amount 1000");
+    assert!(found_2000, "should find position with amount 2000");
+    assert!(found_3000, "should find position with amount 3000");
+}
+
+#[test]
+fn test_get_all_positions_paginates_with_limit() {
+    let t = setup(1, 1);
+    let user2 = Address::generate(&t.env);
+    let user3 = Address::generate(&t.env);
+    t.token_sac.mint(&user2, &10_000);
+    t.token_sac.mint(&user3, &10_000);
+
+    t.client.lock_assets(&t.user, &1_000);
+    t.client.lock_assets(&user2, &2_000);
+    t.client.lock_assets(&user3, &3_000);
+
+    // Request only 2 positions
+    let positions = t.client.get_all_positions(&0u32, &2u32);
+    assert_eq!(positions.len(), 2);
+}
+
+#[test]
+fn test_get_all_positions_with_start_offset() {
+    let t = setup(1, 1);
+    let user2 = Address::generate(&t.env);
+    let user3 = Address::generate(&t.env);
+    t.token_sac.mint(&user2, &10_000);
+    t.token_sac.mint(&user3, &10_000);
+
+    t.client.lock_assets(&t.user, &1_000);
+    t.client.lock_assets(&user2, &2_000);
+    t.client.lock_assets(&user3, &3_000);
+
+    // Skip first position, get remaining
+    let positions = t.client.get_all_positions(&1u32, &100u32);
+    assert_eq!(positions.len(), 2);
+}
+
+#[test]
+fn test_get_all_positions_start_beyond_total_returns_empty() {
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &1_000);
+
+    let positions = t.client.get_all_positions(&10u32, &100u32);
+    assert_eq!(positions.len(), 0);
+}
+
+#[test]
+fn test_get_all_positions_after_unlock_excludes_removed_position() {
+    let t = setup(1, 1);
+    let user2 = Address::generate(&t.env);
+    t.token_sac.mint(&user2, &10_000);
+
+    t.client.lock_assets(&t.user, &1_000);
+    t.client.lock_assets(&user2, &2_000);
+
+    // Advance past lock period and unlock user1
+    advance_ledgers(&t.env, 100);
+    t.client.unlock_assets(&t.user, &1_000);
+
+    let positions = t.client.get_all_positions(&0u32, &100u32);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions.get(0).unwrap().1.amount, 2_000);
+}
+
+#[test]
 fn test_checkpoint_emits_chkpt_event() {
     let t = setup(1, 10);
     t.client.stake(&t.user, &1_000);
