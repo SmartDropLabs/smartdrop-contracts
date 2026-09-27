@@ -33,6 +33,8 @@ pub enum PoolError {
     /// Returned when `set_boost` receives an `allocation_pct` outside 1-100.
     InvalidAllocation = 17,
     ExceedsMaxStake = 18,
+    /// Returned when `set_min_lock_period` exceeds `MAX_LOCK_PERIOD`.
+    InvalidLockPeriod = 19,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.

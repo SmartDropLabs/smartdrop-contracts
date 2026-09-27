@@ -2113,7 +2113,7 @@ impl FarmingPool {
         let admin = get_admin(&env)?;
         admin.require_auth();
         if new_period > MAX_LOCK_PERIOD {
-            return Err(PoolError::InvalidMinStakeAmount);
+            return Err(PoolError::InvalidLockPeriod);
         }
         bump_instance(&env);
 
