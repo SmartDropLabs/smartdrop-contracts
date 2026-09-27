@@ -1501,6 +1501,42 @@ fn test_unlock_assets_partial_keeps_remaining_position() {
     assert_eq!(t.token.balance(&t.contract_id), 300);
 }
 
+#[test]
+fn test_unlock_assets_emits_event_with_credits_earned() {
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+    t.client.unlock_assets(&t.user, &1_000);
+
+    // The unlocked event must include credits_earned (the delta from this
+    // checkpoint) alongside total_credits so indexers can track credit
+    // distributions without storage scans.
+    assert_eq!(
+        t.env.events().all().filter_by_contract(&t.contract_id),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("chkpt").into_val(&t.env)
+                ],
+                (t.user.clone(), 10_000i128, 10_000i128).into_val(&t.env),
+            ),
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("unlocked").into_val(&t.env)
+                ],
+                (t.user.clone(), 1_000i128, 10_000i128, 10_000i128).into_val(&t.env),
+            )
+        ]
+    );
+}
+
 // ── unlock_assets split-invariance (#123) ─────────────────────────────────────
 //
 // #75 covers *when* checkpoints happen (time-invariance); this covers a
@@ -1589,7 +1625,8 @@ fn test_unlock_assets_final_outcome_is_invariant_to_how_the_withdrawal_is_split(
                             soroban_sdk::symbol_short!("pool").into_val(&t.env),
                             soroban_sdk::symbol_short!("unlocked").into_val(&t.env)
                         ],
-                        (t.user.clone(), last_part, EXPECTED_TOTAL_CREDITS).into_val(&t.env),
+                        (t.user.clone(), last_part, EXPECTED_TOTAL_CREDITS, EXPECTED_TOTAL_CREDITS)
+                            .into_val(&t.env),
                     )
                 ],
                 "final cumulative total_credits must be identical across partitions {partition:?}",
@@ -1606,7 +1643,7 @@ fn test_unlock_assets_final_outcome_is_invariant_to_how_the_withdrawal_is_split(
                             soroban_sdk::symbol_short!("pool").into_val(&t.env),
                             soroban_sdk::symbol_short!("unlocked").into_val(&t.env)
                         ],
-                        (t.user.clone(), last_part, EXPECTED_TOTAL_CREDITS).into_val(&t.env),
+                        (t.user.clone(), last_part, 0i128, EXPECTED_TOTAL_CREDITS).into_val(&t.env),
                     )
                 ],
                 "final cumulative total_credits must be identical across partitions {partition:?}",

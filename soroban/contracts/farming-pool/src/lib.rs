@@ -1310,7 +1310,9 @@ impl FarmingPool {
             return Err(PoolError::LockPeriodNotElapsed);
         }
 
+        let credits_before = position.total_credits;
         checkpoint_position(&env, &user, &mut position);
+        let credits_earned = position.total_credits - credits_before;
         let total_credits = position.total_credits;
         position.amount -= amount;
 
@@ -1344,7 +1346,7 @@ impl FarmingPool {
 
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("unlocked")),
-            (user.clone(), amount, total_credits),
+            (user.clone(), amount, credits_earned, total_credits),
         );
 
         record_stake_event(&env, &user, symbol_short!("unlock"), amount);
