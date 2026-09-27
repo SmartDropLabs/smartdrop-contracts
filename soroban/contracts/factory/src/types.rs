@@ -100,6 +100,18 @@ pub struct ListPoolsResponse {
     pub has_more: bool,
 }
 
+/// Pool health status returned by `pool_status` (Issue #375).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolStatus {
+    /// Address of the pool contract.
+    pub address: Address,
+    /// Whether staking is currently paused in the pool.
+    pub is_paused: bool,
+    /// Current total amount staked in the pool.
+    pub total_staked: i128,
+}
+
 /// Typed errors returned by the factory contract.
 ///
 /// Using `#[contracterror]` exposes these as a stable on-chain error code so
