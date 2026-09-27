@@ -1,5 +1,16 @@
 use soroban_sdk::{contracterror, contracttype, Address, BytesN, Vec};
 
+/// Parameters for creating one farming pool through `create_pools_batch`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolParams {
+    pub asset: Address,
+    pub daily_rate: u128,
+    pub global_multiplier: u32,
+    pub min_lock_period: u64,
+    pub min_stake_amount: i128,
+}
+
 /// Storage keys used by the factory contract.
 #[contracttype]
 pub enum DataKey {
