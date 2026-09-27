@@ -324,6 +324,70 @@ fn test_set_pool_wasm_hash_rejects_zero_hash() {
     );
 }
 
+// #410 — the audit trail for a WASM-hash change is only useful if the event
+// carries the *previous* hash as well as the new one: without the old hash an
+// operator cannot tell which build was live before the change, so a rollback
+// decision has nothing to verify against. This pins both hashes in the emitted
+// event so a future edit to the payload cannot silently drop the old value.
+#[test]
+fn test_set_pool_wasm_hash_event_carries_old_and_new_hash() {
+    let t = setup();
+    let original_hash = t.wasm_hash.clone();
+    let new_hash = upload_replacement_wasm(&t.env);
+
+    t.client.set_pool_wasm_hash(&new_hash);
+
+    assert_eq!(
+        t.env.events().all(),
+        vec![
+            &t.env,
+            (
+                t.factory_addr.clone(),
+                vec![
+                    &t.env,
+                    symbol_short!("factory").into_val(&t.env),
+                    symbol_short!("wasm_set").into_val(&t.env),
+                ],
+                (original_hash, new_hash).into_val(&t.env),
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_set_pool_wasm_hash_event_old_hash_matches_superseded_value() {
+    let t = setup();
+    let first_hash = upload_replacement_wasm(&t.env);
+    let second_hash = BytesN::from_array(&t.env, &[7u8; 32]);
+
+    t.client.set_pool_wasm_hash(&first_hash);
+    t.client.set_pool_wasm_hash(&second_hash);
+
+    // The second change must report the first change's value as the old hash,
+    // which is only checkable by reading the events in order.
+    let events = t.env.events().all();
+    let wasm_set: Vec<_> = events
+        .events()
+        .iter()
+        .filter(|(_, topics, _)| {
+            topics
+                == &vec![
+                    &t.env,
+                    symbol_short!("factory").into_val(&t.env),
+                    symbol_short!("wasm_set").into_val(&t.env),
+                ]
+        })
+        .collect();
+
+    assert_eq!(wasm_set.len(), 2);
+    let (_, _, second_payload) = wasm_set[1];
+    assert_eq!(
+        second_payload,
+        (first_hash, second_hash).into_val(&t.env),
+        "the second event must pair the superseded hash with the new one"
+    );
+}
+
 // ── pool_count ────────────────────────────────────────────────────────────────
 
 #[test]
