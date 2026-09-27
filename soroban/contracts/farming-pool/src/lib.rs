@@ -2019,7 +2019,7 @@ impl FarmingPool {
         let multiplier = read_global_multiplier(&env);
         env.events().publish(
             (symbol_short!("boost"), symbol_short!("applied")),
-            (user.clone(), allocation_pct, multiplier),
+            (user.clone(), old_alloc, allocation_pct, multiplier),
         );
 
         record_boost_event(&env, &user, old_alloc, allocation_pct);
