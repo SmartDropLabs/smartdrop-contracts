@@ -2091,8 +2091,12 @@ impl FarmingPool {
     pub fn get_boost_config(env: Env, user: Address) -> Result<Option<BoostConfig>, PoolError> {
         require_initialized(&env)?;
         bump_instance(&env);
+        let multiplier = match get_user_stake(&env, &user) {
+            Some(stake) => stake.multiplier,
+            None => read_global_multiplier(&env),
+        };
         Ok(Some(BoostConfig {
-            multiplier: read_global_multiplier(&env),
+            multiplier,
             allocation_pct: get_user_boost(&env, &user).unwrap_or(0),
         }))
     }
