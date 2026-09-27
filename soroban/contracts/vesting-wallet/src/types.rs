@@ -65,3 +65,31 @@ pub struct VestingSchedule {
     pub end_ledger: u32,
     pub revocable: bool,
 }
+
+/// A vesting schedule plus its live progress, returned by
+/// `get_vesting_overview`.
+///
+/// `VestingSchedule` above carries the configured schedule only. A dashboard
+/// also needs how far along that schedule is, which previously meant three
+/// further contract calls (`vested_amount`, `released_amount`, `releasable`).
+/// This is a separate type rather than extra fields on `VestingSchedule` so the
+/// existing struct's layout — and therefore its XDR, which clients already
+/// decode — is unchanged (#409).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingOverview {
+    pub beneficiary: Address,
+    pub token: Address,
+    pub total_amount: i128,
+    pub start_ledger: u32,
+    pub cliff_ledger: u32,
+    pub end_ledger: u32,
+    pub revocable: bool,
+    pub revoked: bool,
+    /// Total vested as of the current ledger (frozen at revocation).
+    pub vested_amount: i128,
+    /// Cumulative amount already transferred to the beneficiary.
+    pub released_amount: i128,
+    /// Vested but not yet claimed; the amount `release_all` would transfer.
+    pub releasable_amount: i128,
+}

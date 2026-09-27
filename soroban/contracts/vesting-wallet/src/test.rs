@@ -673,6 +673,130 @@ fn test_get_vesting_schedule_uninitialized_returns_not_initialized() {
     ));
 }
 
+// ── get_vesting_overview tests (#409) ─────────────────────────────────────────
+//
+// A single-call schedule *and* progress read, so a dashboard does not have to
+// reconcile four separately-timed contract calls.
+
+#[test]
+fn test_get_vesting_overview_returns_schedule_and_progress() {
+    let t = setup_schedule(50, 200, 1_000, true);
+    advance_ledgers(&t.env, 100); // halfway between start and end
+
+    let overview = t.client.get_vesting_overview();
+
+    // Schedule fields match get_vesting_schedule exactly.
+    assert_eq!(overview.beneficiary, t.beneficiary);
+    assert_eq!(overview.token, t.token_address);
+    assert_eq!(overview.total_amount, 1_000);
+    assert_eq!(overview.start_ledger, t.start);
+    assert_eq!(overview.cliff_ledger, t.start + 50);
+    assert_eq!(overview.end_ledger, t.start + 250);
+    assert!(overview.revocable);
+    assert!(!overview.revoked);
+
+    // Progress fields answer the three follow-up calls in one shot.
+    // Vesting runs from start (not cliff) to end = start + 50 + 200 = start+250,
+    // so at start+100 exactly 1000 * 100/250 is vested.
+    assert_eq!(overview.vested_amount, 400);
+    assert_eq!(overview.released_amount, 0);
+    assert_eq!(overview.releasable_amount, 400);
+}
+
+#[test]
+fn test_get_vesting_overview_reflects_amounts_already_released() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+    t.client.release(); // 500 out
+
+    let overview = t.client.get_vesting_overview();
+
+    assert_eq!(overview.vested_amount, 500);
+    assert_eq!(overview.released_amount, 500);
+    assert_eq!(overview.releasable_amount, 0);
+}
+
+#[test]
+fn test_get_vesting_overview_matches_the_individual_queries() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 40);
+
+    let overview = t.client.get_vesting_overview();
+
+    // The point of the combined call: it must agree with the separate reads.
+    assert_eq!(overview.vested_amount, t.client.vested_amount());
+    assert_eq!(overview.released_amount, t.client.released_amount());
+    assert_eq!(overview.releasable_amount, t.client.releasable());
+}
+
+#[test]
+fn test_get_vesting_overview_is_zero_before_the_cliff() {
+    let t = setup(50, 200, 1_000);
+
+    let overview = t.client.get_vesting_overview();
+
+    assert_eq!(overview.vested_amount, 0);
+    assert_eq!(overview.released_amount, 0);
+    assert_eq!(overview.releasable_amount, 0);
+}
+
+#[test]
+fn test_get_vesting_overview_reports_full_vesting_after_end() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 200);
+
+    let overview = t.client.get_vesting_overview();
+
+    assert_eq!(overview.vested_amount, 1_000);
+    assert_eq!(overview.releasable_amount, 1_000);
+}
+
+#[test]
+fn test_get_vesting_overview_reports_revocation() {
+    let t = setup_revocable(0, 200, 1_000);
+    advance_ledgers(&t.env, 100);
+    t.client.revoke();
+
+    let overview = t.client.get_vesting_overview();
+
+    assert!(overview.revoked);
+    // Vested is frozen at the revocation point, never decreasing below what has
+    // already been released.
+    assert_eq!(overview.vested_amount, 500);
+    assert_eq!(overview.released_amount, 0);
+    assert_eq!(overview.releasable_amount, 500);
+}
+
+#[test]
+fn test_get_vesting_overview_releasable_never_goes_negative_after_emergency_withdraw() {
+    // emergency_withdraw zeroes RevokedVested while released may already be
+    // non-zero, so releasable must saturate rather than wrap negative.
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+    t.client.release(); // 500 released
+    t.client.emergency_withdraw(); // zeroes the frozen vested amount
+
+    let overview = t.client.get_vesting_overview();
+
+    assert!(overview.revoked);
+    assert_eq!(overview.released_amount, 500);
+    assert_eq!(overview.releasable_amount, 0);
+    assert!(overview.releasable_amount >= 0);
+}
+
+#[test]
+fn test_get_vesting_overview_uninitialized_returns_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    assert!(matches!(
+        client.try_get_vesting_overview(),
+        Err(Ok(VestingError::NotInitialized))
+    ));
+}
+
 #[test]
 fn test_release_count_increments_on_release() {
     let t = setup(50, 200, 1_000);

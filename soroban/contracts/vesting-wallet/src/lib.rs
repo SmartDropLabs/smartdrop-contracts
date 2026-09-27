@@ -6,7 +6,7 @@ mod types;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
 use types::DataKey;
-pub use types::{AdminTransferred, VestingError, VestingSchedule};
+pub use types::{AdminTransferred, VestingError, VestingOverview, VestingSchedule};
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5 s/ledger).
 const TTL_THRESHOLD: u32 = 518_400;
@@ -405,6 +405,44 @@ impl VestingWallet {
             cliff_ledger: get_cliff_ledger(&env),
             end_ledger: get_end_ledger(&env),
             revocable: is_revocable(&env),
+        })
+    }
+
+    /// Return the whole schedule *and* its live progress in a single call.
+    ///
+    /// `get_vesting_schedule` returns the configured parameters only, so a
+    /// frontend still had to follow it with `vested_amount`,
+    /// `released_amount` and `releasable` — four round trips for one vesting
+    /// overview, and a real risk of the components disagreeing because they
+    /// were read at different ledgers. This returns all of it atomically.
+    ///
+    /// Kept as a separate type from `VestingSchedule` so that struct's layout —
+    /// and the XDR clients already decode — is untouched (#409).
+    ///
+    /// `releasable_amount` is what `release_all` would transfer right now.
+    /// Returns `NotInitialized` if the wallet has not been initialized.
+    pub fn get_vesting_overview(env: Env) -> Result<VestingOverview, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let vested = compute_vested(&env)?;
+        let released = get_released(&env);
+
+        Ok(VestingOverview {
+            beneficiary: get_beneficiary(&env),
+            token: get_token(&env),
+            total_amount: get_total_amount(&env),
+            start_ledger: get_start_ledger(&env),
+            cliff_ledger: get_cliff_ledger(&env),
+            end_ledger: get_end_ledger(&env),
+            revocable: is_revocable(&env),
+            revoked: is_revoked(&env),
+            vested_amount: vested,
+            released_amount: released,
+            // Saturating, not plain subtraction: after revocation the frozen
+            // vested amount can be lower than what was already released, and a
+            // negative "releasable" would be nonsense to a caller.
+            releasable_amount: vested.saturating_sub(released),
         })
     }
 
