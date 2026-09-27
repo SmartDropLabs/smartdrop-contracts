@@ -175,7 +175,8 @@ Emitted by `set_boost` when a user sets their allocation percentage.
 | Field | Rust Type | Description |
 | :--- | :--- | :--- |
 | `user` | `Address` | The user who set their boost allocation. |
-| `allocation_pct` | `u32` | The allocation percentage (1-100) applied. |
+| `old_allocation_pct` | `u32` | The previous allocation percentage (0 if user had no boost). |
+| `allocation_pct` | `u32` | The new allocation percentage (1-100) applied. |
 | `multiplier` | `u32` | The global multiplier in effect at the time of the call. |
 
 ### `mult_set` (boost)
