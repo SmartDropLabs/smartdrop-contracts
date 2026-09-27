@@ -355,6 +355,13 @@ impl VestingWallet {
         Ok(get_released(&env))
     }
 
+    /// Return whether the beneficiary has received the entire scheduled amount.
+    pub fn is_fully_released(env: Env) -> Result<bool, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(get_released(&env) == get_total_amount(&env))
+    }
+
     /// Return the amount currently available to release (vested minus released).
     pub fn releasable(env: Env) -> Result<i128, VestingError> {
         require_initialized(&env)?;

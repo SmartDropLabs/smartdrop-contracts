@@ -358,12 +358,15 @@ fn test_release_nothing_before_cliff() {
 #[test]
 fn test_release_full_amount_after_end() {
     let t = setup(0, 100, 1_000);
+    assert!(!t.client.is_fully_released());
     advance_ledgers(&t.env, 200); // past end
+    assert!(!t.client.is_fully_released());
 
     let amount = t.client.release();
     assert_eq!(amount, 1_000);
     assert_eq!(t.token.balance(&t.beneficiary), 1_000);
     assert_eq!(t.client.releasable(), 0);
+    assert!(t.client.is_fully_released());
 }
 
 #[test]
