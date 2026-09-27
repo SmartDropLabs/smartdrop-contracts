@@ -710,10 +710,14 @@ impl Factory {
     /// Callers can specify `scan_limit` (up to 50) to tune the scan window. Callers resume pagination
     /// using `next_start_id` until `next_start_id == total`.
     ///
-    /// # Indexer Recommendation
-    /// For off-chain applications (such as frontends and analytics) requiring zero-gas instant lookups
-    /// across thousands of pools, developers should index the `(symbol_short!("factory"), symbol_short!("pool_crtd"))`
-    /// events emitted by `create_pool`, which include `asset` and `pool_id` in their payload.
+    /// # Asset Index
+    /// `create_pool` maintains a secondary on-chain index, `DataKey::AssetPools(asset) -> Vec<u32>`
+    /// (with `DataKey::AssetPoolCount(asset)` as its constant-time companion), so this lookup reads
+    /// only the pool IDs registered for `asset` instead of walking the whole registry. The bounded
+    /// registry scan below is only a fallback for records that predate the index (#397). Off-chain
+    /// applications that need lookups across thousands of pools with no transaction at all should
+    /// still index the `(symbol_short!("factory"), symbol_short!("pool_crtd"))` events emitted by
+    /// `create_pool`, which include `asset` and `pool_id` in their payload.
     ///
     /// Returns `NotInitialized` if the factory has not been initialized.
     pub fn get_pools_by_asset_range(
