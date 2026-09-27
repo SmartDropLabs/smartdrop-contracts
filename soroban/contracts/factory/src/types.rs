@@ -23,6 +23,8 @@ pub enum DataKey {
     PoolsByAdmin(Address),
     /// List of pool IDs currently running a specific WASM hash.
     PoolsByWasmHash(BytesN<32>),
+    /// Hashes explicitly approved by the factory admin for pool upgrades.
+    ApprovedWasmHash(BytesN<32>),
     /// Aggregate value locked across every pool, maintained incrementally by
     /// `sync_pool_tvl` so `total_tvl` is an O(1) read (#249).
     TotalTvl,
