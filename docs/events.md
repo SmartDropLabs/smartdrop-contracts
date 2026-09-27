@@ -100,6 +100,7 @@ Emitted by `unlock_assets` when a user withdraws assets from the pool.
 | :--- | :--- | :--- |
 | `user` | `Address` | The wallet address that unlocked assets. |
 | `amount` | `i128` | The quantity of assets withdrawn in this call. |
+| `credits_earned` | `i128` | The credits accrued and checkpointed during this unlock call (i.e. the delta since the previous checkpoint). |
 | `total_credits` | `i128` | The user's checkpointed total credit balance at the time of withdrawal. |
 
 ### `paused`
