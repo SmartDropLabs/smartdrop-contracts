@@ -2,10 +2,15 @@
 
 use super::*;
 use soroban_sdk::{
+    symbol_short,
     testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
     token::{StellarAssetClient, TokenClient},
-    vec, Address, Env,
+    vec, Address, Env, IntoVal,
 };
+
+// The contract crate is `#![no_std]`; the event assertions below collect into
+// `std` collections, so the shim is declared here (same as factory's tests).
+extern crate std;
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -372,8 +377,38 @@ fn test_release_emits_event() {
     );
 }
 
+// #408 — indexers reconstruct vesting progress purely from these events, so
+// the payload is the audit trail: it must name the beneficiary, the amount
+// released by *this* call, and the cumulative total released afterwards.
+// Asserting only that "an event exists" would let any of those three values
+// regress (or the topic rename) without a single test failing, which is exactly
+// the failure mode the issue describes.
 #[test]
-fn test_release_emits_event_with_cumulative_total() {
+fn test_release_event_payload_identifies_beneficiary_and_amounts() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+
+    let released_now = t.client.release(); // half of 1_000 is vested at 50/100
+
+    assert_eq!(
+        t.env.events().all(),
+        vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                vec![
+                    &t.env,
+                    symbol_short!("vest").into_val(&t.env),
+                    symbol_short!("released").into_val(&t.env),
+                ],
+                (t.beneficiary.clone(), released_now, released_now).into_val(&t.env),
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_release_event_with_cumulative_total() {
     let t = setup(0, 100, 1_000);
     advance_ledgers(&t.env, 50);
     t.client.release(); // 500 released
@@ -381,8 +416,49 @@ fn test_release_emits_event_with_cumulative_total() {
     advance_ledgers(&t.env, 25);
     t.client.release(); // 250 releasable, cumulative total 750
 
+    // The second event must report this call's 250 *and* the running 750, so an
+    // indexer can track progress from the events alone.
     let events = t.env.events().all();
-    assert!(!events.events().is_empty());
+    let released_events: Vec<_> = events
+        .events()
+        .iter()
+        .filter(|(_, topics, _)| {
+            topics
+                == &vec![
+                    &t.env,
+                    symbol_short!("vest").into_val(&t.env),
+                    symbol_short!("released").into_val(&t.env),
+                ]
+        })
+        .collect();
+
+    assert_eq!(released_events.len(), 2);
+    let (_, _, second_payload) = released_events[1];
+    assert_eq!(
+        second_payload,
+        (t.beneficiary.clone(), 250i128, 750i128).into_val(&t.env),
+        "cumulative released total must be carried in the event"
+    );
+}
+
+#[test]
+fn test_release_with_nothing_releasable_emits_no_event() {
+    let t = setup(0, 100, 1_000);
+    // Before the cliff nothing is releasable, so there is no transfer to
+    // report: an event here would tell indexers a release happened when it
+    // did not.
+    let amount = t.client.release();
+
+    assert_eq!(amount, 0);
+    let released_events = t.env.events().all().events().iter().filter(|(_, topics, _)| {
+        topics
+            == &vec![
+                &t.env,
+                symbol_short!("vest").into_val(&t.env),
+                symbol_short!("released").into_val(&t.env),
+            ]
+    });
+    assert_eq!(released_events.count(), 0);
 }
 
 // ── revoke tests ──────────────────────────────────────────────────────────────
