@@ -87,6 +87,14 @@ fn bump_asset_pools(env: &Env, asset: &Address) {
     );
 }
 
+fn bump_asset_pool_count(env: &Env, asset: &Address) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::AssetPoolCount(asset.clone()),
+        TTL_THRESHOLD,
+        TTL_EXTEND_TO,
+    );
+}
+
 fn bump_admin_pools(env: &Env, admin: &Address) {
     env.storage().persistent().extend_ttl(
         &DataKey::PoolsByAdmin(admin.clone()),
@@ -397,6 +405,21 @@ fn create_pool_inner(
     env.storage().persistent().set(&asset_key, &asset_pool_ids);
     bump_asset_pools(&env, &asset);
 
+    let asset_pool_count_key = DataKey::AssetPoolCount(asset.clone());
+    let asset_pool_count: u32 = env
+        .storage()
+        .persistent()
+        .get(&asset_pool_count_key)
+        // Lazily initialize the counter for pools created before this index
+        // existed, preserving correct counts after a contract upgrade.
+        .unwrap_or(asset_pool_ids.len().saturating_sub(1))
+        .checked_add(1)
+        .ok_or(FactoryError::PoolCountOverflow)?;
+    env.storage()
+        .persistent()
+        .set(&asset_pool_count_key, &asset_pool_count);
+    bump_asset_pool_count(&env, &asset);
+
     let admin_key = DataKey::PoolsByAdmin(admin.clone());
     let mut admin_pool_ids: Vec<u32> = env
         .storage()
@@ -515,6 +538,18 @@ impl Factory {
             .instance()
             .get(&DataKey::PoolCount)
             .unwrap_or(0))
+    }
+
+    /// Return whether a pool record exists for `pool_id` without loading it.
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn pool_exists(env: Env, pool_id: u32) -> Result<bool, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let exists = env.storage().persistent().has(&DataKey::Pool(pool_id));
+        if exists {
+            bump_pool(&env, pool_id);
+        }
+        Ok(exists)
     }
 
     /// Return the `PoolRecord` for `pool_id`.
@@ -790,6 +825,32 @@ impl Factory {
         limit: u32,
     ) -> Result<ListPoolsResponse, FactoryError> {
         Self::get_pools_by_asset_range(env, asset, start_id, MAX_POOL_SCAN_PER_CALL, limit)
+    }
+
+    /// Return the number of pools registered for `asset` in constant time.
+    ///
+    /// Older factory deployments may not yet have a stored count; for those,
+    /// the existing asset index is used once to seed the counter.
+    pub fn pool_count_by_asset(env: Env, asset: Address) -> Result<u32, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let count_key = DataKey::AssetPoolCount(asset.clone());
+        if let Some(count) = env.storage().persistent().get::<DataKey, u32>(&count_key) {
+            bump_asset_pool_count(&env, &asset);
+            return Ok(count);
+        }
+
+        let asset_pool_ids: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetPools(asset.clone()))
+            .unwrap_or_else(|| vec![&env]);
+        let count = asset_pool_ids.len();
+        if count > 0 {
+            env.storage().persistent().set(&count_key, &count);
+            bump_asset_pool_count(&env, &asset);
+        }
+        Ok(count)
     }
 
     /// Return the list of pool IDs created by `admin`.
