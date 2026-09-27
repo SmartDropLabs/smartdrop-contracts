@@ -646,3 +646,57 @@ fn test_release_requires_beneficiary_auth() {
     let released = t.client.release();
     assert!(released > 0);
 }
+
+// ── admin access-control regression tests (#406) ──────────────────────────────
+//
+// The reported `clawback` entry point does not exist in this contract, but
+// the underlying concern — "no access control on sensitive operations" — is
+// worth pinning down. These tests authorize only a NON-admin address and
+// assert that every admin-gated entry point rejects the call, so any future
+// entry point added without `require_auth()` fails here.
+
+#[test]
+fn test_admin_only_entry_points_require_admin_auth() {
+    let t = setup_revocable(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+
+    let stranger = Address::generate(&t.env);
+
+    // Authorize the stranger for a harmless read only: no admin-gated entry
+    // point has a matching authorization, so `require_auth()` must fail.
+    t.env.mock_auths(&[]);
+
+    assert!(
+        t.client.try_revoke().is_err(),
+        "revoke must require the stored admin's authorization"
+    );
+    assert!(
+        t.client.try_emergency_withdraw().is_err(),
+        "emergency_withdraw must require the stored admin's authorization"
+    );
+    assert!(
+        t.client.try_transfer_beneficiary(&stranger).is_err(),
+        "transfer_beneficiary must require the stored admin's authorization"
+    );
+    assert!(
+        t.client.try_transfer_admin(&stranger).is_err(),
+        "transfer_admin must require the current admin's authorization"
+    );
+
+    // Nothing moved: the rejected calls must not have changed any state.
+    assert_eq!(t.client.beneficiary(), t.beneficiary);
+    assert_eq!(t.client.admin(), t.admin);
+    assert!(!t.client.revoked());
+    assert_eq!(t.client.released_amount(), 0);
+    assert_eq!(
+        t.token.balance(&t.contract_id),
+        1_000,
+        "vested tokens must still be held after rejected admin calls"
+    );
+
+    // The admin's own authorization still works, proving the rejections above
+    // were about authorization and not a broken fixture.
+    t.env.mock_all_auths();
+    t.client.revoke();
+    assert!(t.client.revoked());
+}
