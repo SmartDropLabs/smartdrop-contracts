@@ -461,6 +461,31 @@ fn test_release_with_nothing_releasable_emits_no_event() {
     assert_eq!(released_events.count(), 0);
 }
 
+#[test]
+fn test_release_immediately_after_cliff() {
+    // Cliff at +100 ledgers, period 200 (end = start + 300), total = 1000.
+    // Advance exactly to the cliff boundary and verify release works.
+    let t = setup(100, 200, 1_000);
+
+    // Before cliff: nothing releasable.
+    advance_ledgers(&t.env, 99);
+    assert_eq!(t.client.releasable(), 0);
+    assert_eq!(t.client.release(), 0);
+
+    // Advance to exactly cliff (start + 100).
+    advance_ledgers(&t.env, 1);
+    // Vested = 1000 * 100 / 300 = 333
+    let vested_at_cliff = t.client.vested_amount();
+    assert!(vested_at_cliff > 0, "tokens must be vested at cliff");
+    assert_eq!(vested_at_cliff, 333);
+
+    let released = t.client.release();
+    assert_eq!(released, 333);
+    assert_eq!(t.token.balance(&t.beneficiary), 333);
+    assert_eq!(t.client.released_amount(), 333);
+    assert_eq!(t.client.releasable(), 0);
+}
+
 // ── revoke tests ──────────────────────────────────────────────────────────────
 
 #[test]
