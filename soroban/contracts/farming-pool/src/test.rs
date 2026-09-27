@@ -647,22 +647,19 @@ fn test_get_pool_info_aggregates_pool_parameters() {
 
     let info = t.client.get_pool_info();
 
-    assert_eq!(info.credit_rate, t.client.credit_rate().unwrap());
-    assert_eq!(info.min_lock_period, t.client.min_lock_period().unwrap());
-    assert_eq!(
-        info.min_stake_amount,
-        t.client.get_min_stake_amount().unwrap()
-    );
-    assert_eq!(info.total_staked, t.client.total_staked().unwrap());
+    assert_eq!(info.credit_rate, t.client.credit_rate());
+    assert_eq!(info.min_lock_period, t.client.min_lock_period());
+    assert_eq!(info.min_stake_amount, t.client.get_min_stake_amount());
+    assert_eq!(info.total_staked, t.client.total_staked());
     assert_eq!(
         info.total_distributed_credits,
-        t.client.total_distributed_credits().unwrap()
+        t.client.total_distributed_credits()
     );
     assert_eq!(
         info.total_banked_credits,
-        t.client.total_banked_credits().unwrap()
+        t.client.total_banked_credits()
     );
-    assert_eq!(info.is_paused, t.client.is_paused().unwrap());
+    assert_eq!(info.is_paused, t.client.is_paused());
 
     // Configured-at-initialize values are reflected.
     assert_eq!(info.credit_rate, 42);
@@ -696,28 +693,14 @@ fn test_set_credit_rate_event_carries_old_and_new_rate_across_changes() {
     t.client.set_credit_rate(&40i128);
     t.client.set_credit_rate(&5i128);
 
+    // `events().all()` only reflects the most recent top-level call, so only
+    // the last `set_credit_rate` invocation's event is present here. It must
+    // pair the just-superseded rate (40) with the new one (5), not the
+    // pool's original rate.
     assert_eq!(
         t.env.events().all(),
         soroban_sdk::vec![
             &t.env,
-            (
-                t.contract_id.clone(),
-                soroban_sdk::vec![
-                    &t.env,
-                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
-                    soroban_sdk::symbol_short!("rate_set").into_val(&t.env)
-                ],
-                (10i128, 25i128, 0u32).into_val(&t.env),
-            ),
-            (
-                t.contract_id.clone(),
-                soroban_sdk::vec![
-                    &t.env,
-                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
-                    soroban_sdk::symbol_short!("rate_set").into_val(&t.env)
-                ],
-                (25i128, 40i128, 0u32).into_val(&t.env),
-            ),
             (
                 t.contract_id.clone(),
                 soroban_sdk::vec![
@@ -731,7 +714,7 @@ fn test_set_credit_rate_event_carries_old_and_new_rate_across_changes() {
     );
 
     // Final value still matches the public getter.
-    assert_eq!(t.client.credit_rate().unwrap(), 5i128);
+    assert_eq!(t.client.credit_rate(), 5i128);
 }
 
 #[test]
@@ -2236,7 +2219,10 @@ fn test_set_global_multiplier_callable_while_paused() {
     t.client.set_boost(&t.user, &50u32);
     t.client.pause();
     t.client.set_global_multiplier(&3u32);
-    assert_eq!(t.client.get_boost_config(&t.user).unwrap().multiplier, 3);
+    // The pool-level multiplier takes effect immediately; an existing
+    // staker's own snapshot (`get_boost_config`) only refreshes on their next
+    // interaction (stake/set_boost/etc.), by the same design as `credit_rate`.
+    assert_eq!(t.client.get_pool_info().global_multiplier, 3);
 }
 
 // ── multi-user isolation ──────────────────────────────────────────────────────

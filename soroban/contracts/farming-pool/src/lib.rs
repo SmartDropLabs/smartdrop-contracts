@@ -12,7 +12,7 @@ pub use types::{PoolError, PoolInfo};
 use types::{
     AdminActionEvent, AdminActionHistoryPage, BankedCreditTotals, BoostConfig, BoostEvent,
     BoostHistoryPage, CreditRateEvent, CreditRateHistoryPage, DataKey, GlobalMultiplierEvent,
-    GlobalMultiplierHistoryPage, ListWhitelistedResponse, Position, PoolInfo, StakeEvent,
+    GlobalMultiplierHistoryPage, ListWhitelistedResponse, Position, StakeEvent,
     StakeHistoryPage,
     UserStake, WhitelistEvent, WhitelistHistoryPage,
 };

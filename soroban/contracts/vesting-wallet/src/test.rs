@@ -393,8 +393,10 @@ fn test_release_event_payload_identifies_beneficiary_and_amounts() {
 
     let released_now = t.client.release(); // half of 1_000 is vested at 50/100
 
+    // Filtered to this contract's own events: `release` also triggers the
+    // stake token's `transfer` event, which is not part of this audit trail.
     assert_eq!(
-        t.env.events().all(),
+        t.env.events().all().filter_by_contract(&t.contract_id),
         vec![
             &t.env,
             (
@@ -419,28 +421,26 @@ fn test_release_event_with_cumulative_total() {
     advance_ledgers(&t.env, 25);
     t.client.release(); // 250 releasable, cumulative total 750
 
-    // The second event must report this call's 250 *and* the running 750, so an
-    // indexer can track progress from the events alone.
-    let events = t.env.events().all();
-    let released_events: Vec<_> = events
-        .events()
-        .iter()
-        .filter(|(_, topics, _)| {
-            topics
-                == &vec![
+    // `events().all()` only reflects the most recent top-level call, so only
+    // the second `release` invocation's event is present here. It must pair
+    // this call's amount (250) with the running cumulative total (750), so an
+    // indexer can track progress from the events alone. Filtered to this
+    // contract's own events since `release` also triggers the stake token's
+    // `transfer` event.
+    assert_eq!(
+        t.env.events().all().filter_by_contract(&t.contract_id),
+        vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                vec![
                     &t.env,
                     symbol_short!("vest").into_val(&t.env),
                     symbol_short!("released").into_val(&t.env),
-                ]
-        })
-        .collect();
-
-    assert_eq!(released_events.len(), 2);
-    let (_, _, second_payload) = released_events[1];
-    assert_eq!(
-        second_payload,
-        (t.beneficiary.clone(), 250i128, 750i128).into_val(&t.env),
-        "cumulative released total must be carried in the event"
+                ],
+                (t.beneficiary.clone(), 250i128, 750i128).into_val(&t.env),
+            )
+        ]
     );
 }
 
@@ -453,15 +453,7 @@ fn test_release_with_nothing_releasable_emits_no_event() {
     let amount = t.client.release();
 
     assert_eq!(amount, 0);
-    let released_events = t.env.events().all().events().iter().filter(|(_, topics, _)| {
-        topics
-            == &vec![
-                &t.env,
-                symbol_short!("vest").into_val(&t.env),
-                symbol_short!("released").into_val(&t.env),
-            ]
-    });
-    assert_eq!(released_events.count(), 0);
+    assert!(t.env.events().all().events().is_empty());
 }
 
 #[test]
@@ -930,7 +922,7 @@ fn test_release_all_emits_the_same_event_as_release() {
     let released = t.client.release_all();
 
     assert_eq!(
-        t.env.events().all(),
+        t.env.events().all().filter_by_contract(&t.contract_id),
         vec![
             &t.env,
             (
@@ -1074,12 +1066,12 @@ fn test_initialize_rejects_the_zero_beneficiary() {
 
     let start = env.ledger().sequence();
     let result = client.try_initialize(
-        &Address::default(), // #405: unusable beneficiary
+        &zero_address(&env), // #405: unusable beneficiary
         &asset.address(),
         &1_000i128,
         &start,
         &start,
-        &start + 200,
+        &(start + 200),
         &false,
         &admin,
     );
@@ -1097,7 +1089,7 @@ fn test_transfer_beneficiary_rejects_the_zero_address() {
 
     let rejected = t
         .client
-        .try_transfer_beneficiary(&Address::default());
+        .try_transfer_beneficiary(&zero_address(&t.env));
     assert!(
         matches!(rejected, Err(Ok(VestingError::InvalidInput))),
         "transfer_beneficiary must reject the zero address, which could strand the funds"

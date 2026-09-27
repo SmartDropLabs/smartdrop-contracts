@@ -368,27 +368,24 @@ fn test_set_pool_wasm_hash_event_old_hash_matches_superseded_value() {
     t.client.set_pool_wasm_hash(&first_hash);
     t.client.set_pool_wasm_hash(&second_hash);
 
-    // The second change must report the first change's value as the old hash,
-    // which is only checkable by reading the events in order.
-    let events = t.env.events().all();
-    let wasm_set: Vec<_> = events
-        .events()
-        .iter()
-        .filter(|(_, topics, _)| {
-            topics
-                == &vec![
+    // `events().all()` only reflects the most recent top-level call, so only
+    // the second `set_pool_wasm_hash` invocation's event is present here. It
+    // must report the first change's value as the old hash, not the
+    // factory's original hash.
+    assert_eq!(
+        t.env.events().all(),
+        vec![
+            &t.env,
+            (
+                t.factory_addr.clone(),
+                vec![
                     &t.env,
                     symbol_short!("factory").into_val(&t.env),
                     symbol_short!("wasm_set").into_val(&t.env),
-                ]
-        })
-        .collect();
-
-    assert_eq!(wasm_set.len(), 2);
-    let (_, _, second_payload) = wasm_set[1];
-    assert_eq!(
-        second_payload,
-        (first_hash, second_hash).into_val(&t.env),
+                ],
+                (first_hash, second_hash).into_val(&t.env),
+            )
+        ],
         "the second event must pair the superseded hash with the new one"
     );
 }

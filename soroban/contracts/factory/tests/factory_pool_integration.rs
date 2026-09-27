@@ -265,7 +265,7 @@ fn end_to_end_create_pool_then_stake_and_unstake() {
     let period2_ledgers: i128 = 20;
     advance_ledgers(&env, 20);
 
-    let total_credits = pool_client.unstake(&user);
+    let total_credits = pool_client.unstake(&user, &stake_amount);
 
     // Reconcile against farming-pool's own accrual formula:
     //   total_stake = principal + (boosted_amount * multiplier)
@@ -287,7 +287,7 @@ fn end_to_end_create_pool_then_stake_and_unstake() {
     assert_eq!(token.balance(&pool_address), 0);
 
     // Internal stake state is cleared: a second unstake has nothing to act on.
-    assert!(pool_client.try_unstake(&user).is_err());
+    assert!(pool_client.try_unstake(&user, &stake_amount).is_err());
 }
 
 /// Lock/unlock lifecycle against a factory-deployed pool: lock_assets →
@@ -470,7 +470,7 @@ fn total_tvl_tracks_stake_and_lock_after_sync() {
 
     // Withdraw the flexible stake, then re-sync: aggregate drops to the locked
     // portion only.
-    pool_client.unstake(&user);
+    pool_client.unstake(&user, &stake_amount);
     assert_eq!(factory_client.total_tvl(), stake_amount + lock_amount);
     factory_client.sync_pool_tvl(&pool_id);
     assert_eq!(factory_client.total_tvl(), lock_amount);
