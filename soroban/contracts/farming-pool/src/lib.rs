@@ -1267,6 +1267,9 @@ impl FarmingPool {
         add_total_locked(&env, amount);
 
         let stake_token = get_stake_token(&env)?;
+        // Issue #363: Soroban SDK's token::Client::transfer returns () on success
+        // and panics on failure, so no explicit validation is needed. The panic
+        // will revert the entire transaction, rolling back the position update above.
         token::TokenClient::new(&env, &stake_token).transfer(
             &user,
             env.current_contract_address(),

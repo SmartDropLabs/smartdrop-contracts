@@ -3577,3 +3577,91 @@ fn test_global_multiplier_history_offset_past_end_returns_empty() {
     assert_eq!(page.total, 1);
     assert_eq!(page.events.len(), 0);
 }
+
+// ── Issue #364: Test checkpoint with changed multiplier ──────────────────────
+
+/// Test that checkpoint correctly uses the current global multiplier when it
+/// has changed since the user staked (regression test for issue #358/#364).
+#[test]
+fn test_checkpoint_uses_current_multiplier_after_change() {
+    // Setup pool with multiplier=1
+    let t = setup(1, 1);
+    
+    // User stakes
+    t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &50u32);
+    
+    // Advance time
+    advance_ledgers(&t.env, 10);
+    
+    // Admin changes multiplier to 2
+    t.client.set_global_multiplier(&2u32);
+    
+    // Advance more time
+    advance_ledgers(&t.env, 10);
+    
+    // Get credits (this internally calls checkpoint)
+    let credits = t.client.get_credits(&t.user);
+    
+    // Expected calculation:
+    // - First 10 ledgers: effective_stake = 1000 * (100 - 50 + 50*1) / 100 = 1000, credits = 1000 * 1 * 10 = 10,000
+    // - Next 10 ledgers: effective_stake = 1000 * (100 - 50 + 50*2) / 100 = 1500, credits = 1500 * 1 * 10 = 15,000
+    // Total: 25,000
+    assert_eq!(credits, 25_000);
+    
+    // Verify the stake record has been updated with new multiplier
+    let stake = t.client.get_stake(&t.user).unwrap().unwrap();
+    assert_eq!(stake.multiplier, 2, "Checkpoint should update to current multiplier");
+}
+
+/// Test that get_credits and checkpoint use the same multiplier (issue #358).
+#[test]
+fn test_get_credits_consistent_with_checkpoint_after_multiplier_change() {
+    let t = setup(1, 1);
+    
+    t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &50u32);
+    advance_ledgers(&t.env, 10);
+    
+    // Change multiplier
+    t.client.set_global_multiplier(&3u32);
+    advance_ledgers(&t.env, 10);
+    
+    // Read credits without checkpointing
+    let credits_before = t.client.get_credits(&t.user);
+    
+    // Now trigger a checkpoint via set_boost
+    t.client.set_boost(&t.user, &50u32);
+    
+    // Credits after checkpoint should match what we read before
+    let credits_after = t.client.get_credits(&t.user);
+    assert_eq!(
+        credits_before, credits_after,
+        "get_credits should match checkpoint's calculation"
+    );
+}
+
+/// Test that position credits also use current multiplier after change.
+#[test]
+fn test_position_checkpoint_uses_current_multiplier() {
+    let t = setup_with_lock_period(1, 1, 10);
+    
+    // User locks assets
+    t.client.lock_assets(&t.user, &1_000);
+    
+    // Advance time
+    advance_ledgers(&t.env, 10);
+    
+    // Admin changes multiplier to 2
+    t.client.set_global_multiplier(&2u32);
+    
+    // Advance more time
+    advance_ledgers(&t.env, 10);
+    
+    // Get position credits
+    let credits = t.client.calculate_credits(&t.user);
+    
+    // Position accrual doesn't use boost, so multiplier shouldn't affect it
+    // Expected: 1000 * 1 * 20 = 20,000 (no boost for positions)
+    assert_eq!(credits, 20_000);
+}
