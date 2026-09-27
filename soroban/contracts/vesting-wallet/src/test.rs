@@ -2,10 +2,15 @@
 
 use super::*;
 use soroban_sdk::{
+    symbol_short,
     testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
     token::{StellarAssetClient, TokenClient},
-    vec, Address, Env,
+    vec, Address, Env, IntoVal,
 };
+
+// The contract crate is `#![no_std]`; the event assertions below collect into
+// `std` collections, so the shim is declared here (same as factory's tests).
+extern crate std;
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -372,8 +377,38 @@ fn test_release_emits_event() {
     );
 }
 
+// #408 — indexers reconstruct vesting progress purely from these events, so
+// the payload is the audit trail: it must name the beneficiary, the amount
+// released by *this* call, and the cumulative total released afterwards.
+// Asserting only that "an event exists" would let any of those three values
+// regress (or the topic rename) without a single test failing, which is exactly
+// the failure mode the issue describes.
 #[test]
-fn test_release_emits_event_with_cumulative_total() {
+fn test_release_event_payload_identifies_beneficiary_and_amounts() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+
+    let released_now = t.client.release(); // half of 1_000 is vested at 50/100
+
+    assert_eq!(
+        t.env.events().all(),
+        vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                vec![
+                    &t.env,
+                    symbol_short!("vest").into_val(&t.env),
+                    symbol_short!("released").into_val(&t.env),
+                ],
+                (t.beneficiary.clone(), released_now, released_now).into_val(&t.env),
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_release_event_with_cumulative_total() {
     let t = setup(0, 100, 1_000);
     advance_ledgers(&t.env, 50);
     t.client.release(); // 500 released
@@ -381,8 +416,49 @@ fn test_release_emits_event_with_cumulative_total() {
     advance_ledgers(&t.env, 25);
     t.client.release(); // 250 releasable, cumulative total 750
 
+    // The second event must report this call's 250 *and* the running 750, so an
+    // indexer can track progress from the events alone.
     let events = t.env.events().all();
-    assert!(!events.events().is_empty());
+    let released_events: Vec<_> = events
+        .events()
+        .iter()
+        .filter(|(_, topics, _)| {
+            topics
+                == &vec![
+                    &t.env,
+                    symbol_short!("vest").into_val(&t.env),
+                    symbol_short!("released").into_val(&t.env),
+                ]
+        })
+        .collect();
+
+    assert_eq!(released_events.len(), 2);
+    let (_, _, second_payload) = released_events[1];
+    assert_eq!(
+        second_payload,
+        (t.beneficiary.clone(), 250i128, 750i128).into_val(&t.env),
+        "cumulative released total must be carried in the event"
+    );
+}
+
+#[test]
+fn test_release_with_nothing_releasable_emits_no_event() {
+    let t = setup(0, 100, 1_000);
+    // Before the cliff nothing is releasable, so there is no transfer to
+    // report: an event here would tell indexers a release happened when it
+    // did not.
+    let amount = t.client.release();
+
+    assert_eq!(amount, 0);
+    let released_events = t.env.events().all().events().iter().filter(|(_, topics, _)| {
+        topics
+            == &vec![
+                &t.env,
+                symbol_short!("vest").into_val(&t.env),
+                symbol_short!("released").into_val(&t.env),
+            ]
+    });
+    assert_eq!(released_events.count(), 0);
 }
 
 // ── revoke tests ──────────────────────────────────────────────────────────────
@@ -597,6 +673,130 @@ fn test_get_vesting_schedule_uninitialized_returns_not_initialized() {
     ));
 }
 
+// ── get_vesting_overview tests (#409) ─────────────────────────────────────────
+//
+// A single-call schedule *and* progress read, so a dashboard does not have to
+// reconcile four separately-timed contract calls.
+
+#[test]
+fn test_get_vesting_overview_returns_schedule_and_progress() {
+    let t = setup_schedule(50, 200, 1_000, true);
+    advance_ledgers(&t.env, 100); // halfway between start and end
+
+    let overview = t.client.get_vesting_overview();
+
+    // Schedule fields match get_vesting_schedule exactly.
+    assert_eq!(overview.beneficiary, t.beneficiary);
+    assert_eq!(overview.token, t.token_address);
+    assert_eq!(overview.total_amount, 1_000);
+    assert_eq!(overview.start_ledger, t.start);
+    assert_eq!(overview.cliff_ledger, t.start + 50);
+    assert_eq!(overview.end_ledger, t.start + 250);
+    assert!(overview.revocable);
+    assert!(!overview.revoked);
+
+    // Progress fields answer the three follow-up calls in one shot.
+    // Vesting runs from start (not cliff) to end = start + 50 + 200 = start+250,
+    // so at start+100 exactly 1000 * 100/250 is vested.
+    assert_eq!(overview.vested_amount, 400);
+    assert_eq!(overview.released_amount, 0);
+    assert_eq!(overview.releasable_amount, 400);
+}
+
+#[test]
+fn test_get_vesting_overview_reflects_amounts_already_released() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+    t.client.release(); // 500 out
+
+    let overview = t.client.get_vesting_overview();
+
+    assert_eq!(overview.vested_amount, 500);
+    assert_eq!(overview.released_amount, 500);
+    assert_eq!(overview.releasable_amount, 0);
+}
+
+#[test]
+fn test_get_vesting_overview_matches_the_individual_queries() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 40);
+
+    let overview = t.client.get_vesting_overview();
+
+    // The point of the combined call: it must agree with the separate reads.
+    assert_eq!(overview.vested_amount, t.client.vested_amount());
+    assert_eq!(overview.released_amount, t.client.released_amount());
+    assert_eq!(overview.releasable_amount, t.client.releasable());
+}
+
+#[test]
+fn test_get_vesting_overview_is_zero_before_the_cliff() {
+    let t = setup(50, 200, 1_000);
+
+    let overview = t.client.get_vesting_overview();
+
+    assert_eq!(overview.vested_amount, 0);
+    assert_eq!(overview.released_amount, 0);
+    assert_eq!(overview.releasable_amount, 0);
+}
+
+#[test]
+fn test_get_vesting_overview_reports_full_vesting_after_end() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 200);
+
+    let overview = t.client.get_vesting_overview();
+
+    assert_eq!(overview.vested_amount, 1_000);
+    assert_eq!(overview.releasable_amount, 1_000);
+}
+
+#[test]
+fn test_get_vesting_overview_reports_revocation() {
+    let t = setup_revocable(0, 200, 1_000);
+    advance_ledgers(&t.env, 100);
+    t.client.revoke();
+
+    let overview = t.client.get_vesting_overview();
+
+    assert!(overview.revoked);
+    // Vested is frozen at the revocation point, never decreasing below what has
+    // already been released.
+    assert_eq!(overview.vested_amount, 500);
+    assert_eq!(overview.released_amount, 0);
+    assert_eq!(overview.releasable_amount, 500);
+}
+
+#[test]
+fn test_get_vesting_overview_releasable_never_goes_negative_after_emergency_withdraw() {
+    // emergency_withdraw zeroes RevokedVested while released may already be
+    // non-zero, so releasable must saturate rather than wrap negative.
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+    t.client.release(); // 500 released
+    t.client.emergency_withdraw(); // zeroes the frozen vested amount
+
+    let overview = t.client.get_vesting_overview();
+
+    assert!(overview.revoked);
+    assert_eq!(overview.released_amount, 500);
+    assert_eq!(overview.releasable_amount, 0);
+    assert!(overview.releasable_amount >= 0);
+}
+
+#[test]
+fn test_get_vesting_overview_uninitialized_returns_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    assert!(matches!(
+        client.try_get_vesting_overview(),
+        Err(Ok(VestingError::NotInitialized))
+    ));
+}
+
 #[test]
 fn test_release_count_increments_on_release() {
     let t = setup(50, 200, 1_000);
@@ -645,6 +845,133 @@ fn test_release_requires_beneficiary_auth() {
 
     let released = t.client.release();
     assert!(released > 0);
+}
+
+// ── release_all tests (#407) ──────────────────────────────────────────────────
+
+#[test]
+fn test_release_all_claims_everything_vested_in_one_call() {
+    let t = setup(0, 100, 1_000);
+    // Mid-schedule: 60% vested, and none of it claimed yet.
+    advance_ledgers(&t.env, 60);
+
+    let released = t.client.release_all();
+
+    // One call claims the whole vested balance — no repeated release needed.
+    assert_eq!(released, 600);
+    assert_eq!(t.token.balance(&t.beneficiary), 600);
+    assert_eq!(t.client.released_amount(), 600);
+    assert_eq!(t.client.releasable(), 0);
+}
+
+#[test]
+fn test_release_all_returns_zero_before_anything_vests() {
+    let t = setup(50, 100, 1_000);
+    // Still before the cliff.
+    let released = t.client.release_all();
+
+    assert_eq!(released, 0);
+    assert_eq!(t.token.balance(&t.beneficiary), 0);
+}
+
+#[test]
+fn test_release_all_after_end_claims_the_entire_schedule() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 200);
+
+    assert_eq!(t.client.release_all(), 1_000);
+    assert_eq!(t.token.balance(&t.beneficiary), 1_000);
+}
+
+#[test]
+fn test_release_all_is_idempotent_after_a_full_claim() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 200);
+
+    assert_eq!(t.client.release_all(), 1_000);
+    // A second call has nothing left to hand over.
+    assert_eq!(t.client.release_all(), 0);
+    assert_eq!(t.token.balance(&t.beneficiary), 1_000);
+}
+
+#[test]
+fn test_release_all_emits_the_same_event_as_release() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+
+    let released = t.client.release_all();
+
+    assert_eq!(
+        t.env.events().all(),
+        vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                vec![
+                    &t.env,
+                    symbol_short!("vest").into_val(&t.env),
+                    symbol_short!("released").into_val(&t.env),
+                ],
+                (t.beneficiary.clone(), released, released).into_val(&t.env),
+            )
+        ],
+        "release_all must stay on the same audited event as release"
+    );
+}
+
+#[test]
+fn test_release_all_requires_beneficiary_auth() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+
+    t.env.mock_auths(&[MockAuth {
+        address: &t.beneficiary,
+        invoke: &MockAuthInvoke {
+            contract: &t.contract_id,
+            fn_name: "release_all",
+            args: vec![&t.env],
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(t.client.release_all() > 0);
+}
+
+#[test]
+fn test_release_all_rejects_an_unauthorized_caller() {
+    // The convenience entry point must not become a way for a third party to
+    // force a release at a time the beneficiary did not choose.
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+
+    t.env.mock_auths(&[]);
+
+    assert!(t.client.try_release_all().is_err());
+    assert_eq!(t.token.balance(&t.beneficiary), 0);
+}
+
+#[test]
+fn test_release_all_on_uninitialized_wallet_errors() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    assert!(matches!(
+        client.try_release_all(),
+        Err(Ok(VestingError::NotInitialized))
+    ));
+}
+
+#[test]
+fn test_release_all_counts_as_a_release_operation() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+    assert_eq!(t.client.release_count(), 0);
+
+    t.client.release_all();
+
+    assert_eq!(t.client.release_count(), 1);
 }
 
 // ── admin access-control regression tests (#406) ──────────────────────────────

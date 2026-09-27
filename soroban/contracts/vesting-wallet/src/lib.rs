@@ -6,7 +6,7 @@ mod types;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
 use types::DataKey;
-pub use types::{AdminTransferred, VestingError, VestingSchedule};
+pub use types::{AdminTransferred, VestingError, VestingOverview, VestingSchedule};
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5 s/ledger).
 const TTL_THRESHOLD: u32 = 518_400;
@@ -322,6 +322,25 @@ impl VestingWallet {
         Ok(())
     }
 
+    /// Claim every currently-vested token in a single call.
+    ///
+    /// Convenience wrapper over {@link VestingWallet::release}, which already
+    /// transfers the whole vested-but-unclaimed balance in one transfer, so
+    /// this adds a self-documenting entry point rather than a second code path
+    /// — the release logic, the beneficiary authorisation and the
+    /// `vest/released` event are identical because it delegates.
+    ///
+    /// Note the signature deliberately takes no `beneficiary` argument: the
+    /// beneficiary is read from storage and is the account that must authorise
+    /// the call, so an argument would either be ignored or let a third party
+    /// force a release at a time the beneficiary did not choose (#407).
+    ///
+    /// Returns the total amount transferred, which is 0 when nothing has vested
+    /// yet, and `NotInitialized` if the wallet was never initialized.
+    pub fn release_all(env: Env) -> Result<i128, VestingError> {
+        Self::release(env)
+    }
+
     /// Return the total amount vested as of the current ledger.
     pub fn vested_amount(env: Env) -> Result<i128, VestingError> {
         require_initialized(&env)?;
@@ -386,6 +405,44 @@ impl VestingWallet {
             cliff_ledger: get_cliff_ledger(&env),
             end_ledger: get_end_ledger(&env),
             revocable: is_revocable(&env),
+        })
+    }
+
+    /// Return the whole schedule *and* its live progress in a single call.
+    ///
+    /// `get_vesting_schedule` returns the configured parameters only, so a
+    /// frontend still had to follow it with `vested_amount`,
+    /// `released_amount` and `releasable` — four round trips for one vesting
+    /// overview, and a real risk of the components disagreeing because they
+    /// were read at different ledgers. This returns all of it atomically.
+    ///
+    /// Kept as a separate type from `VestingSchedule` so that struct's layout —
+    /// and the XDR clients already decode — is untouched (#409).
+    ///
+    /// `releasable_amount` is what `release_all` would transfer right now.
+    /// Returns `NotInitialized` if the wallet has not been initialized.
+    pub fn get_vesting_overview(env: Env) -> Result<VestingOverview, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let vested = compute_vested(&env)?;
+        let released = get_released(&env);
+
+        Ok(VestingOverview {
+            beneficiary: get_beneficiary(&env),
+            token: get_token(&env),
+            total_amount: get_total_amount(&env),
+            start_ledger: get_start_ledger(&env),
+            cliff_ledger: get_cliff_ledger(&env),
+            end_ledger: get_end_ledger(&env),
+            revocable: is_revocable(&env),
+            revoked: is_revoked(&env),
+            vested_amount: vested,
+            released_amount: released,
+            // Saturating, not plain subtraction: after revocation the frozen
+            // vested amount can be lower than what was already released, and a
+            // negative "releasable" would be nonsense to a caller.
+            releasable_amount: vested.saturating_sub(released),
         })
     }
 
