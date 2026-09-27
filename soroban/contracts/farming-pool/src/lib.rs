@@ -2549,6 +2549,42 @@ impl FarmingPool {
         Ok(ListWhitelistedResponse { users: page, total })
     }
 
+    /// Return a paginated list of all time-locked positions.
+    ///
+    /// `start`: zero-based index of the first position to return.
+    /// `limit`: maximum number of positions to return per call.
+    ///
+    /// Returns a vector of `(Address, Position)` tuples. Call repeatedly with
+    /// increasing `start` until the returned vector is empty or has fewer than
+    /// `limit` elements to retrieve all positions.
+    ///
+    /// This is useful for TVL calculations, analytics, and protocol health
+    /// monitoring where off-chain systems need to iterate all stakers.
+    pub fn get_all_positions(
+        env: Env,
+        start: u32,
+        limit: u32,
+    ) -> Result<Vec<(Address, Position)>, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let locked_users = get_locked_users_list(&env);
+        let total = locked_users.len();
+        let mut positions: Vec<(Address, Position)> = Vec::new(&env);
+        let mut i = start;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            let user = locked_users.get(i).unwrap();
+            if let Some(position) = get_position(&env, &user) {
+                positions.push_back((user, position));
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(positions)
+    }
+
     // ── History / audit trail query functions ────────────────────────────────
 
     /// Return a paginated list of whitelist history events.

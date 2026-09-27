@@ -9,6 +9,7 @@ use soroban_sdk::{
 use types::{DataKey, ListPoolsResponse, PoolRecord, PoolSort, PoolStatus};
 
 pub use types::FactoryError;
+pub use types::PoolParams;
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
 const TTL_THRESHOLD: u32 = 518_400;
@@ -81,6 +82,14 @@ fn bump_pool(env: &Env, pool_id: u32) {
 fn bump_asset_pools(env: &Env, asset: &Address) {
     env.storage().persistent().extend_ttl(
         &DataKey::AssetPools(asset.clone()),
+        TTL_THRESHOLD,
+        TTL_EXTEND_TO,
+    );
+}
+
+fn bump_asset_pool_count(env: &Env, asset: &Address) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::AssetPoolCount(asset.clone()),
         TTL_THRESHOLD,
         TTL_EXTEND_TO,
     );
@@ -278,6 +287,172 @@ fn increment_admin_transfer_count(env: &Env) {
         .set(&DataKey::AdminTransferCount, &(count + 1));
 }
 
+fn validate_factory_admin(env: &Env, admin: &Address) -> Result<(), FactoryError> {
+    let zero_admin = Address::from_string(&String::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+    if admin == &zero_admin {
+        return Err(FactoryError::InvalidAdmin);
+    }
+    Ok(())
+}
+
+fn create_pool_inner(
+    env: Env,
+    admin: Address,
+    asset: Address,
+    daily_rate: u128,
+    global_multiplier: u32,
+    min_lock_period: u64,
+    min_stake_amount: i128,
+) -> Result<u32, FactoryError> {
+    bump_instance(&env);
+
+    let paused: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::PoolCreationPaused)
+        .unwrap_or(false);
+    if paused {
+        return Err(FactoryError::PoolCreationPaused);
+    }
+
+    if min_stake_amount <= 0 {
+        return Err(FactoryError::InvalidMinStakeAmount);
+    }
+
+    validate_asset(&env, &asset)?;
+
+    if global_multiplier < 1 {
+        return Err(FactoryError::InvalidGlobalMultiplier);
+    }
+    let credit_rate = daily_rate_to_credit_rate(daily_rate)?;
+    let min_lock_period: u32 = min_lock_period
+        .try_into()
+        .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
+    if min_lock_period < MIN_LOCK_PERIOD {
+        return Err(FactoryError::MinLockPeriodTooShort);
+    }
+    let effective_min_stake = min_stake_amount;
+    // The requested amount must lie within [MIN_STAKE_AMOUNT,
+    // MAX_STAKE_AMOUNT] so the pool is usable.
+    if effective_min_stake < MIN_STAKE_AMOUNT || effective_min_stake > MAX_STAKE_AMOUNT {
+        return Err(FactoryError::InvalidMinStakeAmount);
+    }
+
+    let pool_id: u32 = env.storage().instance().get(&DataKey::PoolCount).unwrap();
+    let next_count = pool_id
+        .checked_add(1)
+        .ok_or(FactoryError::PoolCountOverflow)?;
+    env.storage().instance().set(&DataKey::PoolCount, &next_count);
+    let wasm_hash = load_wasm_hash(&env)?;
+    let salt = pool_salt(&env, pool_id);
+
+    // Deploy a fresh farming-pool instance. The resulting address is
+    // deterministic: keccak256(factory_address || salt).
+    let pool_address = env
+        .deployer()
+        .with_current_contract(salt)
+        .deploy_v2(wasm_hash.clone(), ());
+
+    // Call the freshly deployed pool's `initialize` directly via
+    // `invoke_contract` rather than depending on the `farming-pool`
+    // crate's generated Client: pulling that crate in as a normal
+    // dependency causes its own `#[contractimpl]`-exported WASM symbols
+    // (e.g. `admin`, `transfer_admin`) to collide with the factory's own
+    // exports of the same names when both are linked into one cdylib.
+    let init_args: Vec<Val> = vec![
+        &env,
+        admin.into_val(&env),
+        asset.into_val(&env),
+        global_multiplier.into_val(&env),
+        credit_rate.into_val(&env),
+        min_lock_period.into_val(&env),
+        effective_min_stake.into_val(&env),
+    ];
+    let _: () = env.invoke_contract(&pool_address, &Symbol::new(&env, "initialize"), init_args);
+
+    let record = PoolRecord {
+        address: pool_address.clone(),
+        asset: asset.clone(),
+        credit_rate,
+        global_multiplier,
+        min_lock_period,
+        daily_rate,
+        wasm_hash: wasm_hash.clone(),
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::Pool(pool_id), &record);
+    bump_pool(&env, pool_id);
+
+    // A freshly deployed pool holds nothing, so its contribution to
+    // `total_tvl` starts at 0. Recording the baseline explicitly keeps the
+    // first `sync_pool_tvl` a pure delta against a known value (#249).
+    env.storage()
+        .persistent()
+        .set(&DataKey::PoolTvl(pool_id), &0i128);
+    bump_pool_tvl(&env, pool_id);
+
+    let asset_key = DataKey::AssetPools(asset.clone());
+    let mut asset_pool_ids: Vec<u32> = env
+        .storage()
+        .persistent()
+        .get(&asset_key)
+        .unwrap_or_else(|| vec![&env]);
+    asset_pool_ids.push_back(pool_id);
+    env.storage().persistent().set(&asset_key, &asset_pool_ids);
+    bump_asset_pools(&env, &asset);
+
+    let asset_pool_count_key = DataKey::AssetPoolCount(asset.clone());
+    let asset_pool_count: u32 = env
+        .storage()
+        .persistent()
+        .get(&asset_pool_count_key)
+        // Lazily initialize the counter for pools created before this index
+        // existed, preserving correct counts after a contract upgrade.
+        .unwrap_or(asset_pool_ids.len().saturating_sub(1))
+        .checked_add(1)
+        .ok_or(FactoryError::PoolCountOverflow)?;
+    env.storage()
+        .persistent()
+        .set(&asset_pool_count_key, &asset_pool_count);
+    bump_asset_pool_count(&env, &asset);
+
+    let admin_key = DataKey::PoolsByAdmin(admin.clone());
+    let mut admin_pool_ids: Vec<u32> = env
+        .storage()
+        .persistent()
+        .get(&admin_key)
+        .unwrap_or_else(|| vec![&env]);
+    admin_pool_ids.push_back(pool_id);
+    env.storage().persistent().set(&admin_key, &admin_pool_ids);
+    bump_admin_pools(&env, &admin);
+
+    // Emit enriched event so indexers get the full pool parameters in one shot.
+    // `effective_min_stake` is the resolved dust-thresholded value actually
+    // passed to the pool's `initialize` (#330), not the raw caller input.
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("factory"), symbol_short!("pool_crtd")),
+        (
+            pool_id,
+            pool_address,
+            admin,
+            asset,
+            credit_rate,
+            global_multiplier,
+            min_lock_period,
+            daily_rate,
+            wasm_hash,
+            effective_min_stake,
+        ),
+    );
+
+    Ok(pool_id)
+}
+
 #[contract]
 pub struct Factory;
 
@@ -365,6 +540,18 @@ impl Factory {
             .instance()
             .get(&DataKey::PoolCount)
             .unwrap_or(0))
+    }
+
+    /// Return whether a pool record exists for `pool_id` without loading it.
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn pool_exists(env: Env, pool_id: u32) -> Result<bool, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let exists = env.storage().persistent().has(&DataKey::Pool(pool_id));
+        if exists {
+            bump_pool(&env, pool_id);
+        }
+        Ok(exists)
     }
 
     /// Return the `PoolRecord` for `pool_id`.
@@ -640,6 +827,32 @@ impl Factory {
         limit: u32,
     ) -> Result<ListPoolsResponse, FactoryError> {
         Self::get_pools_by_asset_range(env, asset, start_id, MAX_POOL_SCAN_PER_CALL, limit)
+    }
+
+    /// Return the number of pools registered for `asset` in constant time.
+    ///
+    /// Older factory deployments may not yet have a stored count; for those,
+    /// the existing asset index is used once to seed the counter.
+    pub fn pool_count_by_asset(env: Env, asset: Address) -> Result<u32, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let count_key = DataKey::AssetPoolCount(asset.clone());
+        if let Some(count) = env.storage().persistent().get::<DataKey, u32>(&count_key) {
+            bump_asset_pool_count(&env, &asset);
+            return Ok(count);
+        }
+
+        let asset_pool_ids: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetPools(asset.clone()))
+            .unwrap_or_else(|| vec![&env]);
+        let count = asset_pool_ids.len();
+        if count > 0 {
+            env.storage().persistent().set(&count_key, &count);
+            bump_asset_pool_count(&env, &asset);
+        }
+        Ok(count)
     }
 
     /// Return the list of pool IDs created by `admin`.
@@ -1201,14 +1414,7 @@ impl Factory {
     ) -> Result<u32, FactoryError> {
         require_initialized(&env)?;
         let admin = load_admin(&env)?;
-        // Reject a zero-address admin before any auth checks to avoid misleading Unauthorized errors.
-        let zero_admin = Address::from_string(&String::from_str(
-            &env,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-        ));
-        if admin == zero_admin {
-            return Err(FactoryError::InvalidAdmin);
-        }
+        validate_factory_admin(&env, &admin)?;
         admin.require_auth();
         bump_instance(&env);
 
@@ -1284,43 +1490,16 @@ impl Factory {
             address: pool_address.clone(),
             asset: asset.clone(),
             credit_rate,
+        create_pool_inner(
+            env,
+            admin,
+            asset,
+            daily_rate,
             global_multiplier,
             min_lock_period,
-            daily_rate,
-            wasm_hash: wasm_hash.clone(),
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Pool(pool_id), &record);
-        bump_pool(&env, pool_id);
-
-        // A freshly deployed pool holds nothing, so its contribution to
-        // `total_tvl` starts at 0. Recording the baseline explicitly keeps the
-        // first `sync_pool_tvl` a pure delta against a known value (#249).
-        env.storage()
-            .persistent()
-            .set(&DataKey::PoolTvl(pool_id), &0i128);
-        bump_pool_tvl(&env, pool_id);
-
-        let asset_key = DataKey::AssetPools(asset.clone());
-        let mut asset_pool_ids: Vec<u32> = env
-            .storage()
-            .persistent()
-            .get(&asset_key)
-            .unwrap_or_else(|| vec![&env]);
-        asset_pool_ids.push_back(pool_id);
-        env.storage().persistent().set(&asset_key, &asset_pool_ids);
-        bump_asset_pools(&env, &asset);
-
-        let admin_key = DataKey::PoolsByAdmin(admin.clone());
-        let mut admin_pool_ids: Vec<u32> = env
-            .storage()
-            .persistent()
-            .get(&admin_key)
-            .unwrap_or_else(|| vec![&env]);
-        admin_pool_ids.push_back(pool_id);
-        env.storage().persistent().set(&admin_key, &admin_pool_ids);
-        bump_admin_pools(&env, &admin);
+            min_stake_amount,
+        )
+    }
 
         let wasm_key = DataKey::PoolsByWasmHash(wasm_hash.clone());
         let mut wasm_pool_ids: Vec<u32> = env
@@ -1352,8 +1531,28 @@ impl Factory {
                 effective_min_stake,
             ),
         );
+    /// Create multiple pools atomically using the same validation and setup as
+    /// `create_pool`. If any item is invalid, the transaction rolls back every
+    /// pool created earlier in this batch.
+    pub fn create_pools_batch(env: Env, pools: Vec<PoolParams>) -> Result<Vec<u32>, FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        validate_factory_admin(&env, &admin)?;
+        admin.require_auth();
 
-        Ok(pool_id)
+        let mut pool_ids = vec![&env];
+        for params in pools.iter() {
+            pool_ids.push_back(create_pool_inner(
+                env.clone(),
+                admin.clone(),
+                params.asset,
+                params.daily_rate,
+                params.global_multiplier,
+                params.min_lock_period,
+                params.min_stake_amount,
+            )?);
+        }
+        Ok(pool_ids)
     }
 }
 
