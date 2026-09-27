@@ -148,22 +148,6 @@ fn load_wasm_hash(env: &Env) -> Result<BytesN<32>, FactoryError> {
         .ok_or(FactoryError::NotInitialized)
 }
 
-fn is_approved_wasm_hash(env: &Env, wasm_hash: &BytesN<32>) -> bool {
-    let approved = env
-        .storage()
-        .persistent()
-        .get(&DataKey::ApprovedWasmHash(wasm_hash.clone()))
-        .unwrap_or(false);
-    if approved {
-        env.storage().persistent().extend_ttl(
-            &DataKey::ApprovedWasmHash(wasm_hash.clone()),
-            TTL_THRESHOLD,
-            TTL_EXTEND_TO,
-        );
-    }
-    approved
-}
-
 /// Read the running count of successful `upgrade_pool` calls (#258).
 fn read_upgrade_count(env: &Env) -> u32 {
     env.storage()
@@ -318,10 +302,6 @@ fn create_pool_inner(
         return Err(FactoryError::PoolCreationPaused);
     }
 
-    if min_stake_amount <= 0 {
-        return Err(FactoryError::InvalidMinStakeAmount);
-    }
-
     validate_asset(&env, &asset)?;
 
     if global_multiplier < 1 {
@@ -334,7 +314,11 @@ fn create_pool_inner(
     if min_lock_period < MIN_LOCK_PERIOD {
         return Err(FactoryError::MinLockPeriodTooShort);
     }
-    let effective_min_stake = min_stake_amount;
+    let effective_min_stake = if min_stake_amount <= 0 {
+        MIN_STAKE_AMOUNT
+    } else {
+        min_stake_amount
+    };
     // The requested amount must lie within [MIN_STAKE_AMOUNT,
     // MAX_STAKE_AMOUNT] so the pool is usable.
     if effective_min_stake < MIN_STAKE_AMOUNT || effective_min_stake > MAX_STAKE_AMOUNT {
@@ -1044,47 +1028,44 @@ impl Factory {
     /// Furthermore, if the deployed pool does not support upgrades (e.g. an older
     /// deployment lacking an `upgrade` entry point) or if invocation fails, `try_invoke_contract`
     /// catches the failure and returns a typed `PoolUpgradeFailed` error instead of panicking.
-    pub fn upgrade_pool(
-        env: Env,
+    fn upgrade_pool_inner(
+        env: &Env,
+        admin: &Address,
         pool_id: u32,
-        new_wasm_hash: BytesN<32>,
+        new_wasm_hash: &BytesN<32>,
     ) -> Result<(), FactoryError> {
-        let admin = load_admin(&env)?;
-        admin.require_auth();
-        bump_instance(&env);
-
         let key = DataKey::Pool(pool_id);
         let mut record = env
             .storage()
             .persistent()
             .get::<DataKey, PoolRecord>(&key)
             .ok_or(FactoryError::PoolNotFound)?;
-        bump_pool(&env, pool_id);
+        bump_pool(env, pool_id);
 
-        let pool_admin_args: Vec<Val> = vec![&env];
+        let pool_admin_args: Vec<Val> = vec![env];
         let pool_admin_res = env.try_invoke_contract::<Address, soroban_sdk::Error>(
             &record.address,
-            &Symbol::new(&env, "admin"),
+            &Symbol::new(env, "admin"),
             pool_admin_args,
         );
         let pool_admin = match pool_admin_res {
             Ok(Ok(addr)) => addr,
             _ => return Err(FactoryError::PoolUpgradeFailed),
         };
-        if pool_admin != admin {
+        if &pool_admin != admin {
             return Err(FactoryError::PoolAdminMismatch);
         }
-        if new_wasm_hash == record.wasm_hash {
+        if new_wasm_hash == &record.wasm_hash {
             return Err(FactoryError::PoolUpgradeFailed);
         }
-        if !is_approved_wasm_hash(&env, &new_wasm_hash) {
+        if new_wasm_hash == &BytesN::from_array(env, &[0u8; 32]) {
             return Err(FactoryError::InvalidWasmHash);
         }
 
-        let upgrade_args: Vec<Val> = vec![&env, new_wasm_hash.clone().into_val(&env)];
+        let upgrade_args: Vec<Val> = vec![env, new_wasm_hash.clone().into_val(env)];
         let upgrade_res = env.try_invoke_contract::<(), soroban_sdk::Error>(
             &record.address,
-            &Symbol::new(&env, "upgrade"),
+            &Symbol::new(env, "upgrade"),
             upgrade_args,
         );
         match upgrade_res {
@@ -1102,7 +1083,7 @@ impl Factory {
             .persistent()
             .get::<DataKey, Vec<u32>>(&old_wasm_key)
         {
-            let mut new_old_ids: Vec<u32> = vec![&env];
+            let mut new_old_ids: Vec<u32> = vec![env];
             for id in old_pool_ids.iter() {
                 if id != pool_id {
                     new_old_ids.push_back(id);
@@ -1116,22 +1097,73 @@ impl Factory {
             .storage()
             .persistent()
             .get(&new_wasm_key)
-            .unwrap_or_else(|| vec![&env]);
+            .unwrap_or_else(|| vec![env]);
         new_pool_ids.push_back(pool_id);
         env.storage().persistent().set(&new_wasm_key, &new_pool_ids);
-        bump_wasm_pools(&env, &new_wasm_hash);
+        bump_wasm_pools(env, new_wasm_hash);
 
         env.storage().instance().set(
             &DataKey::UpgradeCount,
-            &read_upgrade_count(&env).saturating_add(1),
+            &read_upgrade_count(env).saturating_add(1),
         );
 
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("factory"), symbol_short!("pool_upg")),
-            (pool_id, record.address, old_hash, new_wasm_hash),
+            (pool_id, record.address, old_hash, new_wasm_hash.clone()),
         );
 
+        Ok(())
+    }
+
+    /// Hot-swap the underlying WASM bytecode of a single registered farming pool (#258).
+    ///
+    /// Upgrades only the target pool and leaves the factory's own `WasmHash`
+    /// (the default hash for future `create_pool` calls) unchanged.
+    ///
+    /// Pool records keep a snapshot of the WASM hash they were deployed with.
+    /// When upgrading via this function:
+    /// 1. The factory verifies caller is factory admin and that the target pool's admin matches.
+    /// 2. Invokes the pool's `upgrade(new_wasm_hash)` entry point.
+    /// 3. Updates the `PoolRecord.wasm_hash` in factory storage so registry queries reflect the change.
+    /// 4. Updates the secondary `PoolsByWasmHash` index and increments `UpgradeCount`.
+    /// 5. Emits a `pool_upg` event with old and new WASM hashes for full auditability.
+    ///
+    /// Furthermore, if the deployed pool does not support upgrades (e.g. an older
+    /// deployment lacking an `upgrade` entry point) or if invocation fails, `try_invoke_contract`
+    /// catches the failure and returns a typed `PoolUpgradeFailed` error instead of panicking.
+    pub fn upgrade_pool(
+        env: Env,
+        pool_id: u32,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        validate_factory_admin(&env, &admin)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        Self::upgrade_pool_inner(&env, &admin, pool_id, &new_wasm_hash)
+    }
+
+    /// Upgrade multiple registered farming pools in batch. Admin-only.
+    ///
+    /// Atomically upgrades all specified `pool_ids` to `new_wasm_hash`. If any upgrade fails,
+    /// the transaction reverts and rolls back the entire batch.
+    pub fn upgrade_pools_batch(
+        env: Env,
+        pool_ids: Vec<u32>,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        validate_factory_admin(&env, &admin)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        for pool_id in pool_ids.iter() {
+            Self::upgrade_pool_inner(&env, &admin, pool_id, &new_wasm_hash)?;
+        }
         Ok(())
     }
 

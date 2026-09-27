@@ -1107,30 +1107,39 @@ impl FarmingPool {
     /// and should be tested in isolation.
     pub fn migrate(env: Env) -> Result<u32, PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         bump_instance(&env);
 
         let current = read_schema_version(&env);
-        let mut version = current;
-        while version < SCHEMA_VERSION {
-            match version {
-                0 => {
-                    // Initial schema tracking migration (v0 -> v1)
-                    version = 1;
-                }
-                _ => break,
-            }
-        }
+        let target = SCHEMA_VERSION;
 
-        env.storage()
-            .instance()
-            .set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
+        if current < target {
+            let mut version = current;
+            while version < target {
+                match version {
+                    0 => {
+                        // Initial schema tracking migration (v0 -> v1)
+                        version = 1;
+                    }
+                    1 => {
+                        // Schema migration v1 -> v2 (placeholder for v1 -> v2 transformations)
+                        version = 2;
+                    }
+                    _ => break,
+                }
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::SchemaVersion, &target);
+        }
 
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("migrated")),
-            (current, SCHEMA_VERSION),
+            (current, target),
         );
+        record_admin_action(&env, symbol_short!("migrate"), &admin);
         Ok(current)
     }
 
@@ -1399,12 +1408,7 @@ impl FarmingPool {
             .ledger()
             .sequence()
             .saturating_sub(position.checkpoint_ledger);
-        let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
-        let multiplier = read_global_multiplier(&env);
-        let accrued = compute_total_stake(position.amount, allocation_pct, multiplier)
-            .checked_mul(position.credit_rate)
-            .and_then(|t| t.checked_mul(elapsed as i128))
-            .expect("credits arithmetic overflow");
+        let accrued = compute_credits(position.amount, 0, 1, position.credit_rate, elapsed);
         Ok(position.total_credits + accrued)
     }
 
@@ -1423,12 +1427,7 @@ impl FarmingPool {
         };
         let current = env.ledger().sequence();
         let elapsed = current.saturating_sub(position.checkpoint_ledger);
-        let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
-        let multiplier = read_global_multiplier(&env);
-        let accrued = compute_total_stake(position.amount, allocation_pct, multiplier)
-            .checked_mul(position.credit_rate)
-            .and_then(|t| t.checked_mul(elapsed as i128))
-            .expect("credits arithmetic overflow");
+        let accrued = compute_credits(position.amount, 0, 1, position.credit_rate, elapsed);
         position.total_credits += accrued;
         position.checkpoint_ledger = current;
         position.credit_rate = read_credit_rate(&env);
@@ -2003,6 +2002,34 @@ impl FarmingPool {
         Ok(total_credits)
     }
 
+    /// Withdraw accrued credits from the caller's flexible stake without unstaking.
+    ///
+    /// Claims and resets `credits_banked` to 0 while keeping the staked amount intact.
+    /// Emits a `crd_wdr` event with `(user, credits)`.
+    pub fn withdraw_credits(env: Env, user: Address) -> Result<i128, PoolError> {
+        user.require_auth();
+        require_initialized(&env)?;
+        require_withdrawals_not_paused(&env)?;
+        bump_instance(&env);
+
+        let mut stake = get_user_stake(&env, &user).ok_or(PoolError::NoActiveStake)?;
+        checkpoint(&env, &user, &mut stake);
+        let credits = stake.credits_banked;
+        if credits > 0 {
+            subtract_total_banked_credits(&env, credits);
+        }
+        stake.credits_banked = 0;
+        set_user_stake(&env, &user, &stake);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("crd_wdr")),
+            (user.clone(), credits),
+        );
+
+        Ok(credits)
+    }
+
     /// Admin sets a user's boost allocation (0-100%). Requires an active
     /// flexible `UserStake` for `user` (#285): boosting an address with no
     /// stake is rejected with `NoActiveStake` instead of storing an inert
@@ -2012,7 +2039,7 @@ impl FarmingPool {
         require_initialized(&env)?;
         require_staking_not_paused(&env)?;
         get_admin(&env)?.require_auth();
-        if allocation_pct > 100 {
+        if allocation_pct == 0 || allocation_pct > 100 {
             return Err(PoolError::InvalidAllocation);
         }
         bump_instance(&env);
@@ -2171,7 +2198,7 @@ impl FarmingPool {
             .instance()
             .set(&DataKey::MinLockPeriod, &new_period);
         env.events().publish(
-            (symbol_short!("pool"), symbol_short!("lk_per")),
+            (symbol_short!("pool"), symbol_short!("lock_set")),
             (old_period, new_period),
         );
 
@@ -2249,12 +2276,7 @@ impl FarmingPool {
                     .ledger()
                     .sequence()
                     .saturating_sub(position.checkpoint_ledger);
-                let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
-                let multiplier = read_global_multiplier(&env);
-                let accrued = compute_total_stake(position.amount, allocation_pct, multiplier)
-                    .checked_mul(position.credit_rate)
-                    .and_then(|t| t.checked_mul(elapsed as i128))
-                    .expect("credits arithmetic overflow");
+                let accrued = compute_credits(position.amount, 0, 1, position.credit_rate, elapsed);
                 position.total_credits + accrued
             })
             .unwrap_or(0);
