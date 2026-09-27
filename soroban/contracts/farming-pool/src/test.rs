@@ -1942,6 +1942,26 @@ fn test_get_user_position_none_after_full_unlock() {
     assert!(t.client.get_user_position(&t.user).is_none());
 }
 
+#[test]
+fn test_get_stakers_pages_distinct_flexible_and_locked_users() {
+    let t = setup(1, 1);
+    let locked_only_user = Address::generate(&t.env);
+    t.token_sac.mint(&locked_only_user, &1_000_000);
+
+    t.client.stake(&t.user, &1_000);
+    t.client.lock_assets(&t.user, &500);
+    t.client.lock_assets(&locked_only_user, &500);
+
+    let first_page = t.client.get_stakers(&0, &1);
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page.get(0), Some(t.user.clone()));
+
+    let second_page = t.client.get_stakers(&1, &1);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page.get(0), Some(locked_only_user));
+    assert!(t.client.get_stakers(&2, &10).is_empty());
+}
+
 // ── pause / unpause tests ─────────────────────────────────────────────────────
 
 #[test]

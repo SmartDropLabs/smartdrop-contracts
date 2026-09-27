@@ -2590,6 +2590,30 @@ impl FarmingPool {
         Self::whitelist_count(env)
     }
 
+    /// Return a zero-based page of distinct users with an active stake or locked position.
+    pub fn get_stakers(env: Env, start: u32, limit: u32) -> Result<Vec<Address>, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let mut all = get_staked_users_list(&env);
+        for user in get_locked_users_list(&env).iter() {
+            if !all.contains(&user) {
+                all.push_back(user);
+            }
+        }
+
+        let mut page = Vec::new(&env);
+        let mut index = start;
+        let mut count = 0u32;
+        while index < all.len() && count < limit {
+            page.push_back(all.get(index).unwrap());
+            index += 1;
+            count += 1;
+        }
+
+        Ok(page)
+    }
+
     /// Return a paginated list of all users with active stakes.
     ///
     /// `offset`: zero-based index of the first user to return.
