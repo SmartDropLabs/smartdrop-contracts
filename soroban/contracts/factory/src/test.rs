@@ -4,13 +4,18 @@ use super::*;
 use soroban_sdk::{
     symbol_short,
     testutils::{
-        storage::Persistent as _, Address as _, AuthorizedFunction, AuthorizedInvocation,
-        Events as _, Ledger, MockAuth, MockAuthInvoke,
+        storage::{Instance as _, Persistent as _},
+        Address as _, AuthorizedFunction, AuthorizedInvocation, Events as _, Ledger, MockAuth,
+        MockAuthInvoke,
     },
     vec, Address, BytesN, Env, IntoVal, Symbol,
 };
 
 use farming_pool::FarmingPoolClient;
+
+// The contract crate is `#![no_std]`; these tests assert on `std` collection
+// types, so the shim is declared here (same as farming-pool's tests).
+extern crate std;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -166,6 +171,10 @@ fn pool_record_ttl(env: &Env, factory_addr: &Address, pool_id: u32) -> u32 {
     })
 }
 
+fn factory_instance_ttl(env: &Env, factory_addr: &Address) -> u32 {
+    env.as_contract(factory_addr, || env.storage().instance().get_ttl())
+}
+
 #[test]
 fn test_initialize_sets_admin() {
     let t = setup();
@@ -317,6 +326,67 @@ fn test_set_pool_wasm_hash_rejects_zero_hash() {
     assert_eq!(
         t.client.try_set_pool_wasm_hash(&zero_hash),
         Err(Ok(FactoryError::InvalidWasmHash))
+    );
+}
+
+// #410 — the audit trail for a WASM-hash change is only useful if the event
+// carries the *previous* hash as well as the new one: without the old hash an
+// operator cannot tell which build was live before the change, so a rollback
+// decision has nothing to verify against. This pins both hashes in the emitted
+// event so a future edit to the payload cannot silently drop the old value.
+#[test]
+fn test_set_pool_wasm_hash_event_carries_old_and_new_hash() {
+    let t = setup();
+    let original_hash = t.wasm_hash.clone();
+    let new_hash = upload_replacement_wasm(&t.env);
+
+    t.client.set_pool_wasm_hash(&new_hash);
+
+    assert_eq!(
+        t.env.events().all(),
+        vec![
+            &t.env,
+            (
+                t.factory_addr.clone(),
+                vec![
+                    &t.env,
+                    symbol_short!("factory").into_val(&t.env),
+                    symbol_short!("wasm_set").into_val(&t.env),
+                ],
+                (original_hash, new_hash).into_val(&t.env),
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_set_pool_wasm_hash_event_old_hash_matches_superseded_value() {
+    let t = setup();
+    let first_hash = upload_replacement_wasm(&t.env);
+    let second_hash = BytesN::from_array(&t.env, &[7u8; 32]);
+
+    t.client.set_pool_wasm_hash(&first_hash);
+    t.client.set_pool_wasm_hash(&second_hash);
+
+    // `events().all()` only reflects the most recent top-level call, so only
+    // the second `set_pool_wasm_hash` invocation's event is present here. It
+    // must report the first change's value as the old hash, not the
+    // factory's original hash.
+    assert_eq!(
+        t.env.events().all(),
+        vec![
+            &t.env,
+            (
+                t.factory_addr.clone(),
+                vec![
+                    &t.env,
+                    symbol_short!("factory").into_val(&t.env),
+                    symbol_short!("wasm_set").into_val(&t.env),
+                ],
+                (first_hash, second_hash).into_val(&t.env),
+            )
+        ],
+        "the second event must pair the superseded hash with the new one"
     );
 }
 
@@ -507,6 +577,23 @@ fn test_transfer_admin_non_admin_rejected() {
 }
 
 #[test]
+fn test_transfer_admin_rejects_zero_address() {
+    // #329: handing the factory to the zero address would permanently lock
+    // it, so the transfer must be rejected and the admin left unchanged.
+    let t = setup();
+    let zero_admin = Address::from_string(&soroban_sdk::String::from_str(
+        &t.env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+    assert_eq!(
+        t.client.try_transfer_admin(&zero_admin),
+        Err(Ok(FactoryError::InvalidAdmin))
+    );
+    assert_eq!(t.client.admin(), t.admin);
+    assert_eq!(t.client.admin_transfer_count(), 0);
+}
+
+#[test]
 fn test_transfer_admin_emits_event_with_old_and_new_admin() {
     let t = setup();
     let new_admin = Address::generate(&t.env);
@@ -558,7 +645,7 @@ fn test_upgrade_pool_hot_swaps_registered_pool_without_changing_factory_hash() {
                     symbol_short!("pool").into_val(&t.env),
                     symbol_short!("upgraded").into_val(&t.env),
                 ],
-                new_wasm_hash.clone().into_val(&t.env),
+                (original_factory_hash.clone(), new_wasm_hash.clone()).into_val(&t.env),
             ),
             (
                 t.factory_addr.clone(),
@@ -742,6 +829,65 @@ fn test_create_pool_returns_incrementing_ids() {
     assert_eq!(id_a, 0);
     assert_eq!(id_b, 1);
     assert_eq!(client.pool_count(), 2);
+}
+
+#[test]
+fn test_create_pools_batch_returns_ids_and_registers_every_pool() {
+    let t = setup();
+    let asset_a = Address::generate(&t.env);
+    let asset_b = Address::generate(&t.env);
+    let pools = vec![
+        &t.env,
+        PoolParams {
+            asset: asset_a.clone(),
+            daily_rate: 17_280_000,
+            global_multiplier: 2,
+            min_lock_period: 100,
+            min_stake_amount: 1_000_000,
+        },
+        PoolParams {
+            asset: asset_b.clone(),
+            daily_rate: 34_560_000,
+            global_multiplier: 3,
+            min_lock_period: 200,
+            min_stake_amount: 2_000_000,
+        },
+    ];
+
+    let ids = t.client.create_pools_batch(&pools);
+
+    assert_eq!(ids, vec![&t.env, 0, 1]);
+    assert_eq!(t.client.pool_count(), 2);
+    assert_eq!(t.client.get_pool(&0).asset, asset_a);
+    assert_eq!(t.client.get_pool(&1).asset, asset_b);
+}
+
+#[test]
+fn test_create_pools_batch_rolls_back_when_any_pool_is_invalid() {
+    let t = setup();
+    let pools = vec![
+        &t.env,
+        PoolParams {
+            asset: Address::generate(&t.env),
+            daily_rate: 17_280_000,
+            global_multiplier: 2,
+            min_lock_period: 100,
+            min_stake_amount: 1_000_000,
+        },
+        PoolParams {
+            asset: Address::generate(&t.env),
+            daily_rate: 17_280_000,
+            global_multiplier: 0,
+            min_lock_period: 100,
+            min_stake_amount: 1_000_000,
+        },
+    ];
+
+    assert_eq!(
+        t.client.try_create_pools_batch(&pools),
+        Err(Ok(FactoryError::InvalidGlobalMultiplier))
+    );
+    assert_eq!(t.client.pool_count(), 0);
 }
 
 #[test]
@@ -1228,6 +1374,18 @@ fn test_list_pools_bumps_pool_record_ttl() {
 }
 
 #[test]
+fn test_list_pools_empty_page_bumps_factory_instance_ttl() {
+    let t = setup();
+
+    advance_ledgers(&t.env, TTL_EXTEND_TO - TTL_THRESHOLD + 1);
+    assert!(factory_instance_ttl(&t.env, &t.factory_addr) < TTL_THRESHOLD);
+
+    let page = t.client.list_pools(&0, &10);
+    assert!(page.records.is_empty());
+    assert_eq!(factory_instance_ttl(&t.env, &t.factory_addr), TTL_EXTEND_TO);
+}
+
+#[test]
 fn test_refresh_pool_ttls_restores_ttl_for_unqueried_pool() {
     let t = setup();
     let id = t.client.create_pool(
@@ -1245,8 +1403,15 @@ fn test_refresh_pool_ttls_restores_ttl_for_unqueried_pool() {
     advance_ledgers(&t.env, TTL_EXTEND_TO + 1);
     assert!(pool_record_ttl(&t.env, &t.factory_addr, id) < TTL_THRESHOLD);
 
-    // Call refresh_pool_ttls to restore TTL without a specific get_pool query
-    assert_eq!(t.client.try_refresh_pool_ttls(&id, &1u32), Ok(Ok(())));
+    // Call refresh_pool_ttls to restore TTL without a specific get_pool query.
+    // #393: the sweep now reports which IDs were actually refreshed.
+    let refreshed = t.client.try_refresh_pool_ttls(&id, &1u32);
+    assert!(refreshed.is_ok());
+    let sweep = refreshed.unwrap().unwrap();
+    assert_eq!(sweep.refreshed.len(), 1);
+    assert_eq!(sweep.refreshed.get(0), Some(id));
+    assert_eq!(sweep.end_id, id + 1);
+    assert_eq!(sweep.missing, 0);
 
     // Verify TTL is restored
     assert_eq!(pool_record_ttl(&t.env, &t.factory_addr, id), TTL_EXTEND_TO);
@@ -1260,7 +1425,9 @@ fn test_refresh_pool_ttls_stays_permissionless_for_any_caller() {
     let t = setup_with_pool_records(3);
     let stranger = Address::generate(&t.env);
     // No admin auth provided at all: assert the refresh still succeeds.
-    assert_eq!(t.client.try_refresh_pool_ttls(&0u32, &3u32), Ok(Ok(())));
+    let sweep = t.client.try_refresh_pool_ttls(&0u32, &3u32).unwrap().unwrap();
+    assert_eq!(sweep.refreshed.len(), 3);
+    assert_eq!(sweep.missing, 0);
     assert_eq!(
         pool_record_ttl(&t.env, &t.factory_addr, 1),
         TTL_EXTEND_TO,
@@ -1278,6 +1445,85 @@ fn test_refresh_pool_ttls_requires_initialized_factory() {
     let (_env, client) = setup_uninitialized();
     let result = client.try_refresh_pool_ttls(&0u32, &20u32);
     assert!(matches!(result, Err(Ok(FactoryError::NotInitialized))));
+}
+
+#[test]
+fn test_refresh_pool_ttls_reports_only_existing_pools_and_counts_gaps() {
+    // #393 / #394: pool IDs are handed out sequentially from PoolCount, so a
+    // hole in `start_id..end` means a record was removed from storage (TTL
+    // expiry / archival) — the same situation list_pools reports as a
+    // "pool_gap". The sweep must skip it, say so in the response, and leave
+    // the surviving records bumped.
+    let t = setup();
+
+    let p0 = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &50u64,
+        &0i128,
+    );
+    let p1 = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &50u64,
+        &0i128,
+    );
+    let p2 = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &50u64,
+        &0i128,
+    );
+
+    // Archive the middle record out from under the registry, as a TTL lapse
+    // would, leaving the count intact so the ID stays inside the sweep range.
+    t.env.as_contract(&t.factory_addr, || {
+        t.env.storage().persistent().remove(&DataKey::Pool(p1));
+    });
+
+    // Age the surviving records past the refresh threshold.
+    advance_ledgers(&t.env, TTL_EXTEND_TO + 1);
+    for id in [p0, p2] {
+        assert!(pool_record_ttl(&t.env, &t.factory_addr, id) < TTL_THRESHOLD);
+    }
+
+    let sweep = t.client.refresh_pool_ttls(&p0, &20u32);
+
+    assert_eq!(sweep.refreshed.len(), 2);
+    assert_eq!(sweep.refreshed.get(0), Some(p0));
+    assert_eq!(sweep.refreshed.get(1), Some(p2));
+    assert_eq!(sweep.missing, 1, "the gap must be reported, not silently skipped");
+    assert_eq!(sweep.end_id, p2 + 1);
+
+    for id in [p0, p2] {
+        assert_eq!(
+            pool_record_ttl(&t.env, &t.factory_addr, id),
+            TTL_EXTEND_TO,
+            "existing pool {id} must have had its TTL extended"
+        );
+    }
+    t.env.as_contract(&t.factory_addr, || {
+        assert!(
+            !t.env.storage().persistent().has(&DataKey::Pool(p1)),
+            "a TTL sweep must not materialise an archived pool record"
+        );
+    });
+}
+
+#[test]
+fn test_refresh_pool_ttls_reports_empty_sweep_past_the_registry() {
+    // #393: a start_id at or past the pool count sweeps nothing and says so,
+    // rather than returning a unit value the caller has to interpret.
+    let t = setup_with_pool_records(2);
+
+    let sweep = t.client.refresh_pool_ttls(&5u32, &20u32);
+
+    assert_eq!(sweep.refreshed.len(), 0);
+    assert_eq!(sweep.missing, 0);
+    assert_eq!(sweep.end_id, 2, "end is clamped to the registry count");
 }
 
 #[test]
@@ -1309,7 +1555,10 @@ fn test_create_pool_emits_pool_crtd_event_with_payload() {
                     2u32,
                     30u32,
                     5_184_000u128,
-                    t.wasm_hash.clone()
+                    t.wasm_hash.clone(),
+                    // `min_stake_amount` was passed as 0, so the event carries
+                    // the resolved dust-threshold default (#330).
+                    1_000_000i128,
                 )
                     .into_val(&t.env),
             )
@@ -1533,4 +1782,186 @@ fn test_get_admin_pool_count_uninitialized_returns_not_initialized() {
     let admin = Address::generate(&_env);
     let result = client.try_get_admin_pool_count(&admin);
     assert!(matches!(result, Err(Ok(FactoryError::NotInitialized))));
+}
+
+// ── #323: min_stake_amount range ─────────────────────────────────────────────
+
+#[test]
+fn test_create_pool_rejects_minimum_stake_above_the_maximum() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+
+    let result = t.client.try_create_pool(
+        &asset,
+        &1_728_000u128,
+        &2u32,
+        &25u64,
+        &(10i128.pow(18) + 1),
+    );
+
+    assert_eq!(result, Err(Ok(FactoryError::InvalidMinStakeAmount)));
+    assert_eq!(t.client.pool_count(), 0);
+}
+
+#[test]
+fn test_create_pool_treats_a_non_positive_minimum_stake_as_the_default() {
+    let t = setup();
+
+    let negative = t.client.create_pool(
+        &Address::generate(&t.env),
+        &1_728_000u128,
+        &2u32,
+        &25u64,
+        &-5i128,
+    );
+
+    assert_eq!(negative, 0);
+}
+
+// ── #325: gaps in the registry are reported ─────────────────────────────────
+
+#[test]
+fn test_list_pools_reports_missing_records_with_a_pool_gap_event() {
+    let t = setup_with_pool_records(3);
+    t.env.as_contract(&t.factory_addr, || {
+        t.env.storage().persistent().remove(&DataKey::Pool(1));
+    });
+
+    let page = t.client.list_pools(&0u32, &10u32);
+
+    // The missing record is skipped in the page but not silently.
+    assert_eq!(page.records.len(), 2);
+    assert_eq!(page.total, 3);
+    assert_eq!(
+        t.env.events().all(),
+        vec![
+            &t.env,
+            (
+                t.factory_addr.clone(),
+                vec![
+                    &t.env,
+                    symbol_short!("factory").into_val(&t.env),
+                    symbol_short!("pool_gap").into_val(&t.env),
+                ],
+                1u32.into_val(&t.env),
+            )
+        ]
+    );
+}
+
+// ── asset index coverage (#397) ───────────────────────────────────────────────
+//
+// `create_pool` maintains `DataKey::AssetPools(asset) -> Vec<u32>` (and its
+// constant-time companion `DataKey::AssetPoolCount`) so `get_pools_by_asset`
+// reads the index instead of walking the registry. These tests pin that the
+// index is actually written and actually read — the issue's ask, since the
+// index existed but nothing asserted it.
+
+#[test]
+fn test_create_pool_maintains_the_asset_index() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+    let other_asset = Address::generate(&t.env);
+
+    let first = t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+    let second = t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+    let other = t.client.create_pool(&other_asset, &1_728_000u128, &2u32, &10u64, &0i128);
+
+    // The index returns only the pools for the requested asset...
+    let page = t.client.get_pools_by_asset(&asset, &0u32, &10u32);
+    let ids: std::vec::Vec<u32> = page.records.iter().map(|(id, _)| id).collect();
+    assert_eq!(ids, std::vec![first, second]);
+    assert_eq!(
+        page.total, 3,
+        "total reports the whole registry, not just the asset's pools"
+    );
+
+    // ...and the other asset's lookup is not polluted by them.
+    let other_page = t.client.get_pools_by_asset(&other_asset, &0u32, &10u32);
+    let other_ids: std::vec::Vec<u32> = other_page.records.iter().map(|(id, _)| id).collect();
+    assert_eq!(other_ids, std::vec![other]);
+}
+
+#[test]
+fn test_asset_pool_count_agrees_with_the_index() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+
+    assert_eq!(t.client.pool_count_by_asset(&asset), 0);
+
+    t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+    t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+
+    assert_eq!(t.client.pool_count_by_asset(&asset), 2);
+    assert_eq!(
+        t.client.get_pools_by_asset(&asset, &0u32, &10u32).records.len(),
+        2
+    );
+}
+
+#[test]
+fn test_create_pools_batch_maintains_the_asset_index() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+    let other_asset = Address::generate(&t.env);
+
+    let mut batch = vec![&t.env];
+    for _ in 0..2 {
+        batch.push_back(PoolParams {
+            asset: asset.clone(),
+            daily_rate: 1_728_000u128,
+            global_multiplier: 2u32,
+            min_lock_period: 10u64,
+            min_stake_amount: 0i128,
+        });
+    }
+    batch.push_back(PoolParams {
+        asset: other_asset.clone(),
+        daily_rate: 1_728_000u128,
+        global_multiplier: 2u32,
+        min_lock_period: 10u64,
+        min_stake_amount: 0i128,
+    });
+
+    let created = t.client.create_pools_batch(&batch);
+    let ids: std::vec::Vec<u32> = created.iter().collect();
+    assert_eq!(ids.len(), 3);
+
+    // Batched creation must index exactly like single creation.
+    let page = t.client.get_pools_by_asset(&asset, &0u32, &10u32);
+    let indexed: std::vec::Vec<u32> = page.records.iter().map(|(id, _)| id).collect();
+    assert_eq!(indexed, std::vec![ids[0], ids[1]]);
+    assert_eq!(t.client.pool_count_by_asset(&asset), 2);
+    assert_eq!(t.client.pool_count_by_asset(&other_asset), 1);
+}
+
+#[test]
+fn test_asset_index_survives_a_paginated_walk() {
+    let t = setup();
+    let asset = Address::generate(&t.env);
+    for _ in 0..3 {
+        t.client.create_pool(&asset, &1_728_000u128, &2u32, &10u64, &0i128);
+    }
+    t.client.create_pool(&Address::generate(&t.env), &1_728_000u128, &2u32, &10u64, &0i128);
+
+    // Resuming from the previous page's `next_start_id` must not drop or
+    // duplicate indexed pools (the #327 resume invariant, index path).
+    let mut collected: std::vec::Vec<u32> = std::vec::Vec::new();
+    let mut start = 0u32;
+    loop {
+        let page = t.client.get_pools_by_asset(&asset, &start, &1u32);
+        for (id, _) in page.records.iter() {
+            collected.push(id);
+        }
+        if page.next_start_id >= page.total || page.records.is_empty() {
+            break;
+        }
+        start = page.next_start_id;
+    }
+
+    assert_eq!(
+        collected.len(),
+        3,
+        "every indexed pool for the asset should be returned exactly once"
+    );
 }

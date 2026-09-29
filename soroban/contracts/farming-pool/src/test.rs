@@ -187,6 +187,40 @@ fn test_stake_emits_event() {
 }
 
 #[test]
+fn test_unstake_emits_event() {
+    let t = setup(2, 1);
+    let amount = 1_000i128;
+    t.client.stake(&t.user, &amount);
+    advance_ledgers(&t.env, 10);
+    t.client.unstake(&t.user, &amount);
+
+    assert_eq!(
+        t.env.events().all().filter_by_contract(&t.contract_id),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("chkpt").into_val(&t.env)
+                ],
+                (t.user.clone(), 10_000i128, 10_000i128).into_val(&t.env),
+            ),
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("unstaked").into_val(&t.env)
+                ],
+                (t.user.clone(), amount, 10_000i128).into_val(&t.env),
+            )
+        ]
+    );
+}
+
+#[test]
 fn test_total_staked_tracks_locked_and_flexible_positions() {
     let t = setup(2, 1);
 
@@ -197,7 +231,7 @@ fn test_total_staked_tracks_locked_and_flexible_positions() {
     t.client.lock_assets(&t.user, &500);
     assert_eq!(t.client.total_staked(), 1_500);
 
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert_eq!(t.client.total_staked(), 500);
 
     t.client.unlock_assets(&t.user, &500);
@@ -213,6 +247,19 @@ fn test_total_distributed_credits_starts_at_zero() {
 }
 
 #[test]
+fn test_get_total_earned_counts_credits_when_checkpointed() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+
+    assert_eq!(t.client.get_credits(&t.user), 10_000);
+    assert_eq!(t.client.get_total_earned(), 0);
+
+    t.client.unstake(&t.user, &1_000);
+    assert_eq!(t.client.get_total_earned(), 10_000);
+}
+
+#[test]
 fn test_total_distributed_credits_counts_banked_stake_accrual_on_checkpoint() {
     let t = setup(2, 1);
     t.client.stake(&t.user, &1_000);
@@ -224,7 +271,7 @@ fn test_total_distributed_credits_counts_banked_stake_accrual_on_checkpoint() {
     assert_eq!(t.client.total_distributed_credits(), 0);
 
     // unstake checkpoints and banks 10_000 credits.
-    let banked = t.client.unstake(&t.user);
+    let banked = t.client.unstake(&t.user, &1_000);
     assert_eq!(banked, 10_000);
     assert_eq!(t.client.total_distributed_credits(), 10_000);
 }
@@ -271,13 +318,13 @@ fn test_total_credits_earned_tracks_lifetime_credits_across_withdrawals() {
     assert_eq!(t.client.get_credits(&t.user), 10_000);
     assert_eq!(t.client.total_credits_earned(&t.user), 0);
 
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert_eq!(t.client.total_credits_earned(&t.user), 10_000);
 
     advance_ledgers(&t.env, 5);
     t.client.stake(&t.user, &500);
     advance_ledgers(&t.env, 5);
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &500);
     assert_eq!(t.client.total_credits_earned(&t.user), 12_500);
 }
 
@@ -291,12 +338,12 @@ fn test_total_banked_credits_tracks_current_bank_across_users() {
     advance_ledgers(&t.env, 10);
     assert_eq!(t.client.total_banked_credits(), 0);
 
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert_eq!(t.client.total_banked_credits(), 0);
 
     t.client.stake(&other, &2_000);
     advance_ledgers(&t.env, 5);
-    t.client.unstake(&other);
+    t.client.unstake(&other, &2_000);
     assert_eq!(t.client.total_banked_credits(), 0);
 }
 
@@ -336,6 +383,10 @@ fn test_upgrade_preserves_stake_storage_and_enables_new_wasm() {
     });
     let before = before.expect("stake storage must exist before upgrade");
     let new_wasm_hash = upload_upgrade_target_wasm(&t.env);
+    let old_wasm_hash = match t.contract_id.executable() {
+        Some(soroban_sdk::Executable::Wasm(hash)) => Some(hash),
+        _ => None,
+    };
 
     t.client.upgrade(&new_wasm_hash);
 
@@ -350,7 +401,7 @@ fn test_upgrade_preserves_stake_storage_and_enables_new_wasm() {
                     soroban_sdk::symbol_short!("pool").into_val(&t.env),
                     soroban_sdk::symbol_short!("upgraded").into_val(&t.env)
                 ],
-                new_wasm_hash.clone().into_val(&t.env),
+                (old_wasm_hash, new_wasm_hash.clone()).into_val(&t.env),
             )
         ]
     );
@@ -594,14 +645,20 @@ fn test_set_boost_rejects_zero_allocation() {
     // Soroban host wraps contract panics in HostError; use try_ client variants to inspect them.
     let t = setup(2, 1);
     t.client.stake(&t.user, &1_000);
-    assert!(t.client.try_set_boost(&t.user, &0u32).is_err());
+    assert_eq!(
+        t.client.try_set_boost(&t.user, &0u32),
+        Err(Ok(PoolError::InvalidAllocation))
+    );
 }
 
 #[test]
 fn test_set_boost_rejects_over_100_allocation() {
     let t = setup(2, 1);
     t.client.stake(&t.user, &1_000);
-    assert!(t.client.try_set_boost(&t.user, &101u32).is_err());
+    assert_eq!(
+        t.client.try_set_boost(&t.user, &101u32),
+        Err(Ok(PoolError::InvalidAllocation))
+    );
 }
 
 #[test]
@@ -621,7 +678,7 @@ fn test_set_boost_emits_boost_applied_event() {
                     soroban_sdk::symbol_short!("boost").into_val(&t.env),
                     soroban_sdk::symbol_short!("applied").into_val(&t.env)
                 ],
-                (t.user.clone(), 50u32, 2u32).into_val(&t.env),
+                (t.user.clone(), 0u32, 50u32, 2u32).into_val(&t.env),
             )
         ]
     );
@@ -680,6 +737,85 @@ fn test_set_global_multiplier_requires_admin_auth() {
         result.is_err(),
         "non-admin set_global_multiplier must be rejected"
     );
+}
+
+
+#[test]
+fn test_get_pool_info_aggregates_pool_parameters() {
+    // #395: a pool overview is one invocation, and its values must agree with
+    // the individual getters so the aggregate is not a second source of truth.
+    let t = setup_with_lock_period(3, 42, 12);
+
+    let info = t.client.get_pool_info();
+
+    assert_eq!(info.credit_rate, t.client.credit_rate());
+    assert_eq!(info.min_lock_period, t.client.min_lock_period());
+    assert_eq!(info.min_stake_amount, t.client.get_min_stake_amount());
+    assert_eq!(info.total_staked, t.client.total_staked());
+    assert_eq!(
+        info.total_distributed_credits,
+        t.client.total_distributed_credits()
+    );
+    assert_eq!(
+        info.total_banked_credits,
+        t.client.total_banked_credits()
+    );
+    assert_eq!(info.is_paused, t.client.is_paused());
+
+    // Configured-at-initialize values are reflected.
+    assert_eq!(info.credit_rate, 42);
+    assert_eq!(info.global_multiplier, 3);
+    assert_eq!(info.min_lock_period, 12);
+    assert!(!info.is_paused);
+}
+
+#[test]
+fn test_get_pool_info_requires_initialized_pool() {
+    // #395: like every other getter, the aggregate must not answer for an
+    // uninitialized pool — a zeroed PoolInfo would be indistinguishable from
+    // a real pool that happens to hold nothing.
+    let (_env, client, _user) = setup_uninitialized();
+
+    let result = client.try_get_pool_info();
+    assert!(matches!(result, Err(Ok(PoolError::NotInitialized))));
+}
+
+#[test]
+fn test_set_credit_rate_event_carries_old_and_new_rate_across_changes() {
+    // #396: an indexer can only track rate history if `rate_set` carries the
+    // rate the pool is leaving as well as the one it is moving to. The event
+    // does publish (old_rate, new_rate, ledger), so this test pins that
+    // contract across a sequence of changes: each event's first payload value
+    // is the previous event's second, which is what makes deltas computable
+    // without reading storage.
+    let t = setup_with_lock_period(2, 10, 12);
+
+    t.client.set_credit_rate(&25i128);
+    t.client.set_credit_rate(&40i128);
+    t.client.set_credit_rate(&5i128);
+
+    // `events().all()` only reflects the most recent top-level call, so only
+    // the last `set_credit_rate` invocation's event is present here. It must
+    // pair the just-superseded rate (40) with the new one (5), not the
+    // pool's original rate.
+    assert_eq!(
+        t.env.events().all(),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("rate_set").into_val(&t.env)
+                ],
+                (40i128, 5i128, 0u32).into_val(&t.env),
+            )
+        ]
+    );
+
+    // Final value still matches the public getter.
+    assert_eq!(t.client.credit_rate(), 5i128);
 }
 
 #[test]
@@ -901,7 +1037,7 @@ fn test_get_credits_matches_checkpoint_accrual_after_multiplier_change() {
     assert_eq!(viewed, 35_000);
 
     // unstake checkpoints → banked credits must equal the viewed total.
-    let banked = t.client.unstake(&t.user);
+    let banked = t.client.unstake(&t.user, &1_000);
     assert_eq!(banked, viewed);
 
     // The aggregate counter must agree with the banked amount too.
@@ -1045,7 +1181,7 @@ fn test_unstake_returns_tokens_and_credits() {
     t.client.stake(&t.user, &1_000);
     t.client.set_boost(&t.user, &50u32);
     advance_ledgers(&t.env, 10);
-    let credits = t.client.unstake(&t.user);
+    let credits = t.client.unstake(&t.user, &1_000);
     assert_eq!(credits, 15_000); // 1500 * 10
     assert_eq!(t.token.balance(&t.user), initial_balance);
     assert!(t.client.get_stake(&t.user).is_none());
@@ -1061,7 +1197,7 @@ fn test_flash_stake_unstake_in_same_ledger_yields_no_credits() {
 
     t.client.stake(&t.user, &1_000);
     t.client.set_boost(&t.user, &100u32);
-    let credits = t.client.unstake(&t.user);
+    let credits = t.client.unstake(&t.user, &1_000);
 
     assert_eq!(credits, 0, "flash staking must not mint credits");
     assert_eq!(
@@ -1184,7 +1320,7 @@ fn test_stake_unstake_round_trip_restores_balance_and_clears_stake() {
     assert_eq!(t.token.balance(&t.user), initial_balance - 2_500);
     advance_ledgers(&t.env, 4);
 
-    let credits = t.client.unstake(&t.user);
+    let credits = t.client.unstake(&t.user, &2_500);
     assert_eq!(credits, 10_000);
     assert_eq!(t.token.balance(&t.user), initial_balance);
     assert!(t.client.get_stake(&t.user).is_none());
@@ -1542,13 +1678,19 @@ fn test_multiple_locks_credit_only_new_amount_for_later_ledgers() {
 #[test]
 fn test_lock_assets_rejects_zero_amount() {
     let t = setup(1, 1);
-    assert!(t.client.try_lock_assets(&t.user, &0i128).is_err());
+    assert_eq!(
+        t.client.try_lock_assets(&t.user, &0i128),
+        Err(Ok(PoolError::InvalidAmount))
+    );
 }
 
 #[test]
 fn test_lock_assets_rejects_negative_amount() {
     let t = setup(1, 1);
-    assert!(t.client.try_lock_assets(&t.user, &-1i128).is_err());
+    assert_eq!(
+        t.client.try_lock_assets(&t.user, &-1i128),
+        Err(Ok(PoolError::InvalidAmount))
+    );
 }
 
 #[test]
@@ -1635,6 +1777,42 @@ fn test_unlock_assets_partial_keeps_remaining_position() {
     assert_eq!(pos.total_credits, 5_000);
     assert_eq!(t.token.balance(&t.user), initial_balance - 300);
     assert_eq!(t.token.balance(&t.contract_id), 300);
+}
+
+#[test]
+fn test_unlock_assets_emits_event_with_credits_earned() {
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+    t.client.unlock_assets(&t.user, &1_000);
+
+    // The unlocked event must include credits_earned (the delta from this
+    // checkpoint) alongside total_credits so indexers can track credit
+    // distributions without storage scans.
+    assert_eq!(
+        t.env.events().all().filter_by_contract(&t.contract_id),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("chkpt").into_val(&t.env)
+                ],
+                (t.user.clone(), 10_000i128, 10_000i128).into_val(&t.env),
+            ),
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("pool").into_val(&t.env),
+                    soroban_sdk::symbol_short!("unlocked").into_val(&t.env)
+                ],
+                (t.user.clone(), 1_000i128, 10_000i128, 10_000i128).into_val(&t.env),
+            )
+        ]
+    );
 }
 
 // ── unlock_assets split-invariance (#123) ─────────────────────────────────────
@@ -1725,7 +1903,8 @@ fn test_unlock_assets_final_outcome_is_invariant_to_how_the_withdrawal_is_split(
                             soroban_sdk::symbol_short!("pool").into_val(&t.env),
                             soroban_sdk::symbol_short!("unlocked").into_val(&t.env)
                         ],
-                        (t.user.clone(), last_part, EXPECTED_TOTAL_CREDITS).into_val(&t.env),
+                        (t.user.clone(), last_part, EXPECTED_TOTAL_CREDITS, EXPECTED_TOTAL_CREDITS)
+                            .into_val(&t.env),
                     )
                 ],
                 "final cumulative total_credits must be identical across partitions {partition:?}",
@@ -1742,7 +1921,7 @@ fn test_unlock_assets_final_outcome_is_invariant_to_how_the_withdrawal_is_split(
                             soroban_sdk::symbol_short!("pool").into_val(&t.env),
                             soroban_sdk::symbol_short!("unlocked").into_val(&t.env)
                         ],
-                        (t.user.clone(), last_part, EXPECTED_TOTAL_CREDITS).into_val(&t.env),
+                        (t.user.clone(), last_part, 0i128, EXPECTED_TOTAL_CREDITS).into_val(&t.env),
                     )
                 ],
                 "final cumulative total_credits must be identical across partitions {partition:?}",
@@ -1946,6 +2125,26 @@ fn test_get_user_position_none_after_full_unlock() {
     assert!(t.client.get_user_position(&t.user).is_none());
 }
 
+#[test]
+fn test_get_stakers_pages_distinct_flexible_and_locked_users() {
+    let t = setup(1, 1);
+    let locked_only_user = Address::generate(&t.env);
+    t.token_sac.mint(&locked_only_user, &1_000_000);
+
+    t.client.stake(&t.user, &1_000);
+    t.client.lock_assets(&t.user, &500);
+    t.client.lock_assets(&locked_only_user, &500);
+
+    let first_page = t.client.get_stakers(&0, &1);
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page.get(0), Some(t.user.clone()));
+
+    let second_page = t.client.get_stakers(&1, &1);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page.get(0), Some(locked_only_user));
+    assert!(t.client.get_stakers(&2, &10).is_empty());
+}
+
 // ── pause / unpause tests ─────────────────────────────────────────────────────
 
 #[test]
@@ -2128,7 +2327,7 @@ fn test_pause_staking_blocks_new_stakes_but_allows_withdrawals() {
 
     assert!(t.client.try_stake(&t.user, &100i128).is_err());
     assert!(t.client.try_lock_assets(&t.user, &100i128).is_err());
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
 }
 
 #[test]
@@ -2137,7 +2336,7 @@ fn test_pause_withdrawals_blocks_unstake_but_allows_new_stakes() {
     t.client.pause_withdrawals();
     t.client.stake(&t.user, &1_000);
 
-    assert!(t.client.try_unstake(&t.user).is_err());
+    assert!(t.client.try_unstake(&t.user, &1_000).is_err());
     assert!(t.client.try_unlock_assets(&t.user, &100i128).is_err());
 }
 
@@ -2166,7 +2365,7 @@ fn test_pause_blocks_unstake() {
     let t = setup(1, 1);
     t.client.stake(&t.user, &1_000);
     t.client.pause();
-    assert!(t.client.try_unstake(&t.user).is_err());
+    assert!(t.client.try_unstake(&t.user, &1_000).is_err());
 }
 
 #[test]
@@ -2175,7 +2374,7 @@ fn test_unpause_restores_unstake() {
     t.client.stake(&t.user, &1_000);
     t.client.pause();
     t.client.unpause();
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert!(t.client.get_stake(&t.user).is_none());
 }
 
@@ -2207,7 +2406,10 @@ fn test_set_global_multiplier_callable_while_paused() {
     t.client.set_boost(&t.user, &50u32);
     t.client.pause();
     t.client.set_global_multiplier(&3u32);
-    assert_eq!(t.client.get_boost_config(&t.user).unwrap().multiplier, 3);
+    // The pool-level multiplier takes effect immediately; an existing
+    // staker's own snapshot (`get_boost_config`) only refreshes on their next
+    // interaction (stake/set_boost/etc.), by the same design as `credit_rate`.
+    assert_eq!(t.client.get_pool_info().global_multiplier, 3);
 }
 
 // ── multi-user isolation ──────────────────────────────────────────────────────
@@ -2273,6 +2475,20 @@ fn test_emergency_withdraw_while_paused() {
     assert_eq!(t.client.get_banked_credits(&t.user), 8_000);
     // Individual histories must not be merged into a single figure (#145): the
     // lock/unlock position and boost stake credits remain separately retrievable.
+    let split = t.client.get_banked_credits_split(&t.user);
+    assert_eq!(split.position_credits, 5_000);
+    assert_eq!(split.stake_credits, 3_000);
+}
+
+#[test]
+fn test_emergency_withdraw_banks_unbanked_credits() {
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &500);
+    t.client.stake(&t.user, &300);
+    advance_ledgers(&t.env, 10);
+    t.client.pause();
+    t.client.emergency_withdraw(&t.user);
+    // No manual checkpoint: 500*1*10 and 300*1*10 must still be banked (#295).
     let split = t.client.get_banked_credits_split(&t.user);
     assert_eq!(split.position_credits, 5_000);
     assert_eq!(split.stake_credits, 3_000);
@@ -2471,14 +2687,16 @@ fn test_batch_add_to_whitelist() {
 }
 
 #[test]
-#[should_panic(expected = "max 50 addresses per call")]
 fn test_batch_add_to_whitelist_exceeds_limit() {
     let t = setup(2, 1);
     let mut users = soroban_sdk::Vec::new(&t.env);
     for _ in 0..51 {
         users.push_back(Address::generate(&t.env));
     }
-    t.client.batch_add_to_whitelist(&users);
+    assert_eq!(
+        t.client.try_batch_add_to_whitelist(&users),
+        Err(Ok(PoolError::BatchTooLarge))
+    );
 }
 
 #[test]
@@ -2512,14 +2730,16 @@ fn test_batch_remove_from_whitelist() {
 }
 
 #[test]
-#[should_panic(expected = "max 50 addresses per call")]
 fn test_batch_remove_from_whitelist_exceeds_limit() {
     let t = setup(2, 1);
     let mut users = soroban_sdk::Vec::new(&t.env);
     for _ in 0..51 {
         users.push_back(Address::generate(&t.env));
     }
-    t.client.batch_remove_from_whitelist(&users);
+    assert_eq!(
+        t.client.try_batch_remove_from_whitelist(&users),
+        Err(Ok(PoolError::BatchTooLarge))
+    );
 }
 
 #[test]
@@ -2811,13 +3031,13 @@ fn test_unstake_reentrant_transfer_is_rejected_and_final_state_is_correct() {
 
     client.initialize(&admin, &token_id, &2u32, &100i128, &0u32, &0i128);
 
-    seed_user_stake(&env, &farming_pool_id, &user, 500i128);
+    seed_user_stake(&env, &farming_pool_id, &user, 1_000i128);
 
     let reentrant_args: soroban_sdk::Vec<Val> =
         soroban_sdk::vec![&env, user.clone().into_val(&env)];
     token_client.configure_reentrant_call(&Symbol::new(&env, "unstake"), &reentrant_args);
 
-    client.unstake(&user);
+    client.unstake(&user, &1_000);
 
     assert!(token_client.reentry_was_rejected());
     assert!(client.get_stake(&user).is_none());
@@ -2843,7 +3063,7 @@ fn test_unstake_reverts_entirely_if_stake_token_naively_reenters() {
     seed_user_stake(&env, &farming_pool_id, &user, 500i128);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.unstake(&user);
+        client.unstake(&user, &500);
     }));
     assert!(
         result.is_err(),
@@ -3057,7 +3277,7 @@ fn test_staked_user_count_increments_and_decrements_correctly() {
     assert_eq!(t.client.staked_user_count(), 2);
 
     // User 1 unstakes completely: count becomes 1
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_500);
     assert_eq!(t.client.staked_user_count(), 1);
 
     // User 2 unlocks position completely: count becomes 0
@@ -3109,7 +3329,7 @@ fn test_lock_count_increments_on_every_lock_operation() {
     // Flexible staking does not affect lock_count
     t.client.stake(&t.user, &1_000);
     assert_eq!(t.client.lock_count(), 0);
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert_eq!(t.client.lock_count(), 0);
 
     // User 1 locks: lock_count becomes 1
@@ -3152,12 +3372,12 @@ fn test_unstake_count_increments_on_every_unstake_operation() {
     assert_eq!(t.client.unstake_count(), 0);
 
     // User 1 unstakes: unstake_count becomes 1
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_000);
     assert_eq!(t.client.unstake_count(), 1);
     assert_eq!(t.client.get_unstake_count(), 1);
 
     // User 2 unstakes: unstake_count becomes 2
-    t.client.unstake(&user2);
+    t.client.unstake(&user2, &1_000);
     assert_eq!(t.client.unstake_count(), 2);
     assert_eq!(t.client.get_unstake_count(), 2);
 
@@ -3165,6 +3385,109 @@ fn test_unstake_count_increments_on_every_unstake_operation() {
     advance_ledgers(&t.env, 10);
     t.client.unlock_assets(&user3, &1_000);
     assert_eq!(t.client.unstake_count(), 2);
+}
+
+#[test]
+fn test_get_all_positions_returns_empty_when_no_positions() {
+    let t = setup(1, 1);
+    let positions = t.client.get_all_positions(&0u32, &100u32);
+    assert_eq!(positions.len(), 0);
+}
+
+#[test]
+fn test_get_all_positions_returns_all_positions() {
+    let t = setup(1, 1);
+    let user2 = Address::generate(&t.env);
+    let user3 = Address::generate(&t.env);
+    t.token_sac.mint(&user2, &10_000);
+    t.token_sac.mint(&user3, &10_000);
+
+    t.client.lock_assets(&t.user, &1_000);
+    t.client.lock_assets(&user2, &2_000);
+    t.client.lock_assets(&user3, &3_000);
+
+    let positions = t.client.get_all_positions(&0u32, &100u32);
+    assert_eq!(positions.len(), 3);
+
+    // Verify each position has the correct amount
+    let mut found_1000 = false;
+    let mut found_2000 = false;
+    let mut found_3000 = false;
+    for (_, p) in positions.iter() {
+        if p.amount == 1_000 {
+            found_1000 = true;
+        }
+        if p.amount == 2_000 {
+            found_2000 = true;
+        }
+        if p.amount == 3_000 {
+            found_3000 = true;
+        }
+    }
+    assert!(found_1000, "should find position with amount 1000");
+    assert!(found_2000, "should find position with amount 2000");
+    assert!(found_3000, "should find position with amount 3000");
+}
+
+#[test]
+fn test_get_all_positions_paginates_with_limit() {
+    let t = setup(1, 1);
+    let user2 = Address::generate(&t.env);
+    let user3 = Address::generate(&t.env);
+    t.token_sac.mint(&user2, &10_000);
+    t.token_sac.mint(&user3, &10_000);
+
+    t.client.lock_assets(&t.user, &1_000);
+    t.client.lock_assets(&user2, &2_000);
+    t.client.lock_assets(&user3, &3_000);
+
+    // Request only 2 positions
+    let positions = t.client.get_all_positions(&0u32, &2u32);
+    assert_eq!(positions.len(), 2);
+}
+
+#[test]
+fn test_get_all_positions_with_start_offset() {
+    let t = setup(1, 1);
+    let user2 = Address::generate(&t.env);
+    let user3 = Address::generate(&t.env);
+    t.token_sac.mint(&user2, &10_000);
+    t.token_sac.mint(&user3, &10_000);
+
+    t.client.lock_assets(&t.user, &1_000);
+    t.client.lock_assets(&user2, &2_000);
+    t.client.lock_assets(&user3, &3_000);
+
+    // Skip first position, get remaining
+    let positions = t.client.get_all_positions(&1u32, &100u32);
+    assert_eq!(positions.len(), 2);
+}
+
+#[test]
+fn test_get_all_positions_start_beyond_total_returns_empty() {
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &1_000);
+
+    let positions = t.client.get_all_positions(&10u32, &100u32);
+    assert_eq!(positions.len(), 0);
+}
+
+#[test]
+fn test_get_all_positions_after_unlock_excludes_removed_position() {
+    let t = setup(1, 1);
+    let user2 = Address::generate(&t.env);
+    t.token_sac.mint(&user2, &10_000);
+
+    t.client.lock_assets(&t.user, &1_000);
+    t.client.lock_assets(&user2, &2_000);
+
+    // Advance past lock period and unlock user1
+    advance_ledgers(&t.env, 100);
+    t.client.unlock_assets(&t.user, &1_000);
+
+    let positions = t.client.get_all_positions(&0u32, &100u32);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions.get(0).unwrap().1.amount, 2_000);
 }
 
 #[test]
@@ -3207,7 +3530,7 @@ fn test_active_stake_count_lifecycle() {
     assert_eq!(t.client.active_stake_count(), 2);
 
     // User 1 unstakes: active_stake_count becomes 1
-    t.client.unstake(&t.user);
+    t.client.unstake(&t.user, &1_500);
     assert_eq!(t.client.active_stake_count(), 1);
 
     // Pool pauses, User 2 emergency withdraws: active_stake_count becomes 0
@@ -3244,4 +3567,635 @@ fn test_migrate_schema_version_framework() {
     let t = setup(1, 10);
     let prev = t.client.migrate();
     assert_eq!(prev, 1);
+}
+
+// ── #284: compute_total_stake must not truncate small boosts to zero ─────────
+
+#[test]
+fn test_compute_total_stake_preserves_small_boosts() {
+    // Single trailing division: amount * (100 - alloc + alloc * mult) / 100.
+    // Cases where the old split form (`amount * alloc / 100` first) truncated
+    // `boosted` to zero and silently disabled the boost.
+    assert_eq!(compute_total_stake(1, 1, 1000), 10); // 1 * 1099 / 100
+    assert_eq!(compute_total_stake(10, 1, 1000), 109); // 10 * 1099 / 100
+    assert_eq!(compute_total_stake(99, 1, 1000), 1088); // 99 * 1099 / 100
+    assert_eq!(compute_total_stake(1, 100, 2), 2);
+    assert_eq!(compute_total_stake(50, 50, 2), 75);
+}
+
+#[test]
+fn test_compute_total_stake_matches_split_form_for_large_amounts() {
+    // Refactor guard: for amounts divisible by 100 both formulations agree,
+    // so existing 1_000-based expectations are unaffected by the #284 fix.
+    let cases = [(1_000u32, 50u32, 2u32, 1_500i128), (1_000, 100, 2, 2_000)];
+    for (amount, alloc, mult, expected) in cases {
+        assert_eq!(compute_total_stake(amount as i128, alloc, mult), expected);
+    }
+}
+
+// ── #285: set_boost requires an active flexible stake ────────────────────────
+
+#[test]
+fn test_set_boost_rejects_position_only_user() {
+    // Boost accrues only via the UserStake path: a time-locked Position alone
+    // must not satisfy set_boost's active-stake check.
+    let t = setup(2, 1);
+    t.client.lock_assets(&t.user, &1_000);
+    let res = t.client.try_set_boost(&t.user, &50u32);
+    assert_eq!(res, Err(Ok(PoolError::NoActiveStake)));
+}
+
+// ── #286: set_global_multiplier has zero effect on the Position path ────────
+
+#[test]
+fn test_set_global_multiplier_has_zero_effect_on_position_accrual() {
+    // Position accrual is amount * credit_rate * elapsed with no multiplier
+    // term, so bumping the global multiplier must leave both the accrued view
+    // and future accrual unchanged.
+    let t = setup(2, 1);
+    t.client.lock_assets(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+    assert_eq!(t.client.calculate_credits(&t.user), 10_000);
+
+    t.client.set_global_multiplier(&100u32);
+    // Already-accrued credits are untouched by the change itself.
+    assert_eq!(t.client.calculate_credits(&t.user), 10_000);
+
+    advance_ledgers(&t.env, 10);
+    // Future position accrual still ignores the multiplier.
+    assert_eq!(t.client.calculate_credits(&t.user), 20_000);
+    assert_eq!(t.client.get_position_credits(&t.user), 20_000);
+}
+
+#[test]
+fn test_set_global_multiplier_does_not_rewrite_already_accrued_stake_credits() {
+    // Pin the already-accrued portion: changing the multiplier with no ledger
+    // advance must not move the read-only view; only later ledgers accrue at
+    // the new multiplier.
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &50u32);
+    advance_ledgers(&t.env, 10);
+    assert_eq!(t.client.get_credits(&t.user), 15_000);
+
+    t.client.set_global_multiplier(&3u32);
+    assert_eq!(t.client.get_credits(&t.user), 15_000);
+
+    advance_ledgers(&t.env, 10);
+    assert_eq!(t.client.get_credits(&t.user), 35_000);
+}
+
+// ── #287: i128 overflow boundaries for compute_total_stake/compute_credits ──
+
+#[test]
+fn test_compute_total_stake_i128_boundary_table() {
+    // Deterministic boundary sweep: every case is cross-checked against the
+    // checked-arithmetic oracle, so any silent wrapping in the implementation
+    // fails the test. Values approach i128::MAX quotients without exceeding
+    // them, plus tiny-amount boost cases from #284.
+    let cases: [(i128, u32, u32); 8] = [
+        (1, 1, 1000),
+        (99, 1, 1000),
+        (10_000_000_000_000_000_000, 100, 1000),
+        (i128::MAX / 200_000, 100, 1000),
+        (i128::MAX / 101, 1, 2),
+        (1_000_000_000_000_000_000, 50, 1000),
+        (i128::MAX / 100_100, 100, 1000),
+        (0, 100, 1000),
+    ];
+    for (amount, alloc, mult) in cases {
+        let alloc_i = alloc as i128;
+        let mult_i = mult as i128;
+        let factor = (100i128 - alloc_i)
+            .checked_add(alloc_i.checked_mul(mult_i).unwrap())
+            .unwrap();
+        let expected = amount
+            .checked_mul(factor)
+            .and_then(|v| v.checked_div(100))
+            .unwrap();
+        assert_eq!(compute_total_stake(amount, alloc, mult), expected);
+    }
+}
+
+#[test]
+fn test_compute_credits_i128_overflow_boundaries() {
+    // The #89 ceiling product must fit with the documented 16x headroom, and
+    // inputs beyond it must observably overflow checked arithmetic — proving
+    // the boundary is load-bearing rather than arbitrary.
+    const AMOUNT_MAX: i128 = 1_000_000_000_000_000_000;
+    const ELAPSED_MAX: i128 = 63_072_000;
+    let worst = AMOUNT_MAX
+        .checked_mul(MAX_GLOBAL_MULTIPLIER as i128)
+        .and_then(|v| v.checked_mul(MAX_CREDIT_RATE))
+        .and_then(|v| v.checked_mul(ELAPSED_MAX))
+        .expect("ceiling product must fit in i128");
+    assert!(worst <= i128::MAX / 16);
+    assert_eq!(
+        compute_credits(
+            AMOUNT_MAX,
+            100,
+            MAX_GLOBAL_MULTIPLIER,
+            MAX_CREDIT_RATE,
+            ELAPSED_MAX as u32
+        ),
+        worst
+    );
+
+    // Just beyond the boundary, checked arithmetic refuses — the ceilings exist
+    // to keep on-chain (unchecked) math away from this region.
+    assert!(i128::MAX.checked_mul(2).is_none());
+    assert!(worst.checked_mul(16).is_some());
+    assert!(worst.checked_mul(26).is_some());
+    assert!(worst.checked_mul(27).is_none());
+    assert!(worst.checked_mul(28).is_none());
+
+    // Small-value sanity across theCredits chain (allocation sweep).
+    for alloc in [0u32, 1, 25, 50, 99, 100] {
+        let total = compute_total_stake(99, alloc, 10);
+        let credits = compute_credits(99, alloc, 10, 7, 13);
+        assert_eq!(credits, total * 7 * 13);
+    }
+}
+
+// ── #289: persistent-storage TTL extension ────────────────────────────────────
+
+#[test]
+fn test_user_stake_ttl_extended_after_stake() {
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+
+    // Advance past the threshold; without the bump the entry would have expired.
+    advance_ledgers(&t.env, USER_TTL_THRESHOLD + 100);
+    assert!(t.client.get_stake(&t.user).is_some());
+}
+
+#[test]
+fn test_user_position_ttl_extended_after_lock() {
+    let t = setup(1, 1);
+    t.client.lock_assets(&t.user, &1_000);
+
+    advance_ledgers(&t.env, USER_TTL_THRESHOLD + 100);
+    let pos = t.client.get_user_position(&t.user);
+    assert_eq!(pos.unwrap().amount, 1_000);
+}
+
+#[test]
+fn test_banked_credits_ttl_extended() {
+    let t = setup(1, 1);
+    t.client.recover_banked_credits(&t.user, &40, &60);
+
+    advance_ledgers(&t.env, USER_TTL_THRESHOLD + 200);
+    assert_eq!(t.client.get_banked_credits(&t.user), 100);
+}
+
+#[test]
+fn test_user_boost_ttl_extended() {
+    let t = setup(1, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &50);
+
+    advance_ledgers(&t.env, USER_TTL_THRESHOLD + 100);
+    let config = t.client.get_boost_config(&t.user).unwrap();
+    assert_eq!(config.allocation_pct, 50);
+    assert_eq!(config.multiplier, 1);
+}
+
+// ── #288: credit independence from checkpoint frequency ───────────────────────
+
+#[test]
+fn test_total_credits_independent_of_checkpoint_frequency() {
+    let t = setup(1, 10);
+    let user_b = Address::generate(&t.env);
+    t.token_sac.mint(&user_b, &10_000);
+
+    t.client.stake(&t.user, &10_000);
+    t.client.stake(&user_b, &10_000);
+
+    // Neither user checkpoints; get_credits computes live accrual for both.
+    advance_ledgers(&t.env, 100);
+    assert_eq!(t.client.get_credits(&t.user), t.client.get_credits(&user_b));
+}
+
+#[test]
+fn test_credits_same_regardless_of_intermediate_checkpoints() {
+    let t = setup(1, 10);
+    let user_b = Address::generate(&t.env);
+    t.token_sac.mint(&user_b, &10_000);
+
+    t.client.stake(&t.user, &10_000);
+    t.client.stake(&user_b, &10_000);
+    t.client.set_boost(&t.user, &50);
+    t.client.set_boost(&user_b, &50);
+
+    // Re-applying the same boost checkpoints A without changing its rate.
+    advance_ledgers(&t.env, 30);
+    t.client.set_boost(&t.user, &50);
+    advance_ledgers(&t.env, 30);
+    t.client.set_boost(&t.user, &50);
+
+    // B never checkpoints; totals must still match.
+    advance_ledgers(&t.env, 40);
+    assert_eq!(t.client.get_credits(&t.user), t.client.get_credits(&user_b));
+}
+
+#[test]
+fn test_position_credits_independent_of_checkpoint_frequency() {
+    let t = setup(1, 10);
+    let user_b = Address::generate(&t.env);
+    t.token_sac.mint(&user_b, &5_000);
+
+    t.client.lock_assets(&t.user, &5_000);
+    t.client.lock_assets(&user_b, &5_000);
+
+    // A reads its position mid-way; B is untouched.
+    advance_ledgers(&t.env, 50);
+    let _ = t.client.get_user_position(&t.user);
+
+    advance_ledgers(&t.env, 50);
+    assert_eq!(
+        t.client.get_position_credits(&t.user),
+        t.client.get_position_credits(&user_b)
+    );
+}
+
+#[test]
+fn test_compute_credits_overflow_prevention() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1000);
+    t.client.set_boost(&t.user, &100);
+    t.env.as_contract(&t.contract_id, || {
+        let amt = crate::compute_credits(1000, 0, 1, 100, 10);
+        assert_eq!(amt, 1_000_000);
+    });
+}
+
+#[test]
+#[should_panic(expected = "credits arithmetic overflow")]
+fn test_compute_credits_overflow_panics() {
+    let t = setup(2, 1);
+    t.env.as_contract(&t.contract_id, || {
+        let _ = crate::compute_credits(10i128.pow(18), 100, 1_000, 100_000_000, u32::MAX);
+    });
+}
+
+#[test]
+fn test_checkpoint_formulas_produce_identical_results() {
+    let t = setup(2, 1);
+    let user_b = Address::generate(&t.env);
+    t.token_sac.mint(&user_b, &1_000);
+
+    t.client.stake(&t.user, &1000);
+    t.client.lock_assets(&user_b, &1000);
+
+    advance_ledgers(&t.env, 10);
+
+    let credits_a = t.client.get_stake_credits(&t.user);
+    let credits_b = t.client.get_position_credits(&user_b);
+
+    assert_eq!(credits_a, credits_b);
+    assert!(credits_a > 0);
+}
+
+#[test]
+fn test_set_min_lock_period_bounds() {
+    let t = setup(2, 1);
+    
+    assert!(t.client.try_set_min_lock_period(&63_072_000).is_ok());
+    assert_eq!(t.client.min_lock_period(), 63_072_000);
+    
+    assert_eq!(
+        t.client.try_set_min_lock_period(&63_072_001),
+        Err(Ok(PoolError::InvalidLockPeriod))
+    );
+}
+
+#[test]
+fn test_partial_unstake_works_and_leaves_correct_balance() {
+    let t = setup(2, 1);
+    let initial = t.token.balance(&t.user);
+    t.client.stake(&t.user, &1000);
+    t.client.set_boost(&t.user, &50);
+    advance_ledgers(&t.env, 10);
+
+    let credits_claimed = t.client.unstake(&t.user, &400);
+    assert!(credits_claimed > 0);
+    assert_eq!(t.token.balance(&t.user), initial - 600);
+
+    let stake = t.client.get_stake(&t.user).unwrap();
+    assert_eq!(stake.amount, 600);
+    assert_eq!(stake.credits_banked, credits_claimed);
+    assert_eq!(t.client.total_staked(), 600);
+    
+    advance_ledgers(&t.env, 10);
+    let final_credits = t.client.unstake(&t.user, &600);
+    assert!(final_credits > credits_claimed); 
+    
+    assert!(t.client.get_stake(&t.user).is_none());
+    assert_eq!(t.token.balance(&t.user), initial);
+}
+
+#[test]
+fn test_unstake_more_than_balance_fails() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1000);
+    assert_eq!(
+        t.client.try_unstake(&t.user, &1001),
+        Err(Ok(PoolError::InsufficientBalance))
+    );
+}
+
+// ── #310 — get_credit_rate_history ────────────────────────────────────────────
+
+#[test]
+fn test_credit_rate_history_empty_before_any_change() {
+    let t = setup(2, 1);
+    let page = t.client.get_credit_rate_history(&0, &10);
+    assert_eq!(page.total, 0);
+    assert_eq!(page.events.len(), 0);
+}
+
+#[test]
+fn test_credit_rate_history_records_single_change() {
+    let t = setup(2, 1);
+    let initial_rate: i128 = 1;
+    let new_rate: i128 = 5;
+
+    t.client.set_credit_rate(&new_rate);
+
+    let page = t.client.get_credit_rate_history(&0, &10);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.events.len(), 1);
+
+    let event = page.events.get(0).unwrap();
+    assert_eq!(event.old_rate, initial_rate);
+    assert_eq!(event.new_rate, new_rate);
+}
+
+#[test]
+fn test_credit_rate_history_records_multiple_changes_in_order() {
+    let t = setup(2, 1);
+
+    t.client.set_credit_rate(&2);
+    t.client.set_credit_rate(&3);
+    t.client.set_credit_rate(&4);
+
+    let page = t.client.get_credit_rate_history(&0, &10);
+    assert_eq!(page.total, 3);
+
+    assert_eq!(page.events.get(0).unwrap().old_rate, 1);
+    assert_eq!(page.events.get(0).unwrap().new_rate, 2);
+    assert_eq!(page.events.get(1).unwrap().old_rate, 2);
+    assert_eq!(page.events.get(1).unwrap().new_rate, 3);
+    assert_eq!(page.events.get(2).unwrap().old_rate, 3);
+    assert_eq!(page.events.get(2).unwrap().new_rate, 4);
+}
+
+#[test]
+fn test_credit_rate_history_pagination() {
+    let t = setup(2, 1);
+
+    for rate in [2i128, 3, 4, 5, 6] {
+        t.client.set_credit_rate(&rate);
+    }
+
+    let page1 = t.client.get_credit_rate_history(&0, &3);
+    assert_eq!(page1.total, 5);
+    assert_eq!(page1.events.len(), 3);
+
+    let page2 = t.client.get_credit_rate_history(&3, &10);
+    assert_eq!(page2.total, 5);
+    assert_eq!(page2.events.len(), 2);
+
+    // Contiguous: last event of page1 + first event of page2 must be consecutive.
+    assert_eq!(
+        page1.events.get(2).unwrap().new_rate,
+        page2.events.get(0).unwrap().old_rate
+    );
+}
+
+#[test]
+fn test_credit_rate_history_offset_past_end_returns_empty() {
+    let t = setup(2, 1);
+    t.client.set_credit_rate(&2);
+
+    let page = t.client.get_credit_rate_history(&999, &10);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.events.len(), 0);
+}
+
+// ── #311 — get_global_multiplier_history ─────────────────────────────────────
+
+#[test]
+fn test_global_multiplier_history_empty_before_any_change() {
+    let t = setup(2, 1);
+    let page = t.client.get_global_multiplier_history(&0, &10);
+    assert_eq!(page.total, 0);
+    assert_eq!(page.events.len(), 0);
+}
+
+#[test]
+fn test_global_multiplier_history_records_single_change() {
+    let t = setup(2, 1);
+
+    t.client.set_global_multiplier(&3);
+
+    let page = t.client.get_global_multiplier_history(&0, &10);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.events.len(), 1);
+
+    let event = page.events.get(0).unwrap();
+    assert_eq!(event.old_multiplier, 2); // setup initialises with multiplier=2
+    assert_eq!(event.new_multiplier, 3);
+}
+
+#[test]
+fn test_global_multiplier_history_records_multiple_changes_in_order() {
+    let t = setup(2, 1);
+
+    t.client.set_global_multiplier(&3);
+    t.client.set_global_multiplier(&5);
+    t.client.set_global_multiplier(&1);
+
+    let page = t.client.get_global_multiplier_history(&0, &10);
+    assert_eq!(page.total, 3);
+
+    assert_eq!(page.events.get(0).unwrap().old_multiplier, 2);
+    assert_eq!(page.events.get(0).unwrap().new_multiplier, 3);
+    assert_eq!(page.events.get(1).unwrap().old_multiplier, 3);
+    assert_eq!(page.events.get(1).unwrap().new_multiplier, 5);
+    assert_eq!(page.events.get(2).unwrap().old_multiplier, 5);
+    assert_eq!(page.events.get(2).unwrap().new_multiplier, 1);
+}
+
+#[test]
+fn test_global_multiplier_history_pagination() {
+    let t = setup(2, 1);
+
+    for m in [3u32, 4, 5, 1, 2] {
+        t.client.set_global_multiplier(&m);
+    }
+
+    let page1 = t.client.get_global_multiplier_history(&0, &3);
+    assert_eq!(page1.total, 5);
+    assert_eq!(page1.events.len(), 3);
+
+    let page2 = t.client.get_global_multiplier_history(&3, &10);
+    assert_eq!(page2.total, 5);
+    assert_eq!(page2.events.len(), 2);
+
+    assert_eq!(
+        page1.events.get(2).unwrap().new_multiplier,
+        page2.events.get(0).unwrap().old_multiplier
+    );
+}
+
+#[test]
+fn test_global_multiplier_history_offset_past_end_returns_empty() {
+    let t = setup(2, 1);
+    t.client.set_global_multiplier(&3);
+
+    let page = t.client.get_global_multiplier_history(&999, &10);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.events.len(), 0);
+}
+
+// ── Issue #364: Test checkpoint with changed multiplier ──────────────────────
+
+/// Test that checkpoint correctly uses the current global multiplier when it
+/// has changed since the user staked (regression test for issue #358/#364).
+#[test]
+fn test_checkpoint_uses_current_multiplier_after_change() {
+    // Setup pool with multiplier=1
+    let t = setup(1, 1);
+    
+    // User stakes
+    t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &50u32);
+    
+    // Advance time
+    advance_ledgers(&t.env, 10);
+    
+    // Admin changes multiplier to 2
+    t.client.set_global_multiplier(&2u32);
+    
+    // Advance more time
+    advance_ledgers(&t.env, 10);
+    
+    // Get credits (this internally calls checkpoint)
+    let credits = t.client.get_credits(&t.user);
+    
+    // Expected calculation:
+    // - First 10 ledgers: effective_stake = 1000 * (100 - 50 + 50*1) / 100 = 1000, credits = 1000 * 1 * 10 = 10,000
+    // - Next 10 ledgers: effective_stake = 1000 * (100 - 50 + 50*2) / 100 = 1500, credits = 1500 * 1 * 10 = 15,000
+    // Total: 25,000
+    assert_eq!(credits, 25_000);
+    
+    // Verify the stake record has been updated with new multiplier
+    let stake = t.client.get_stake(&t.user).unwrap();
+    assert_eq!(stake.multiplier, 2, "Checkpoint should update to current multiplier");
+}
+
+/// Test that get_credits and checkpoint use the same multiplier (issue #358).
+#[test]
+fn test_get_credits_consistent_with_checkpoint_after_multiplier_change() {
+    let t = setup(1, 1);
+    
+    t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &50u32);
+    advance_ledgers(&t.env, 10);
+    
+    // Change multiplier
+    t.client.set_global_multiplier(&3u32);
+    advance_ledgers(&t.env, 10);
+    
+    // Read credits without checkpointing
+    let credits_before = t.client.get_credits(&t.user);
+    
+    // Now trigger a checkpoint via set_boost
+    t.client.set_boost(&t.user, &50u32);
+    
+    // Credits after checkpoint should match what we read before
+    let credits_after = t.client.get_credits(&t.user);
+    assert_eq!(
+        credits_before, credits_after,
+        "get_credits should match checkpoint's calculation"
+    );
+}
+
+/// Test that position credits also use current multiplier after change.
+#[test]
+fn test_position_checkpoint_uses_current_multiplier() {
+    let t = setup_with_lock_period(1, 1, 10);
+    
+    // User locks assets
+    t.client.lock_assets(&t.user, &1_000);
+    
+    // Advance time
+    advance_ledgers(&t.env, 10);
+    
+    // Admin changes multiplier to 2
+    t.client.set_global_multiplier(&2u32);
+    
+    // Advance more time
+    advance_ledgers(&t.env, 10);
+    
+    // Get position credits
+    let credits = t.client.calculate_credits(&t.user);
+    
+    // Position accrual doesn't use boost, so multiplier shouldn't affect it
+    // Expected: 1000 * 1 * 20 = 20,000 (no boost for positions)
+    assert_eq!(credits, 20_000);
+}
+
+// ── #392: withdraw_credits tests ──────────────────────────────────────────────
+
+#[test]
+fn test_withdraw_credits_success() {
+    let t = setup(1, 10);
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 5);
+
+    let credits = t.client.withdraw_credits(&t.user);
+    assert_eq!(credits, 50_000); // 1000 * 10 * 5 = 50,000
+
+    let stake = t.client.get_stake(&t.user).unwrap();
+    assert_eq!(stake.amount, 1_000);
+    assert_eq!(stake.credits_banked, 0);
+
+    // Immediate second withdrawal returns 0 because 0 ledgers elapsed
+    let immediate = t.client.withdraw_credits(&t.user);
+    assert_eq!(immediate, 0);
+}
+
+#[test]
+fn test_withdraw_credits_requires_active_stake() {
+    let t = setup(1, 10);
+    let res = t.client.try_withdraw_credits(&t.user);
+    assert_eq!(res, Err(Ok(PoolError::NoActiveStake)));
+}
+
+#[test]
+fn test_withdraw_credits_blocked_when_withdrawals_paused() {
+    let t = setup(1, 10);
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 5);
+
+    t.client.pause_withdrawals();
+    let res = t.client.try_withdraw_credits(&t.user);
+    assert_eq!(res, Err(Ok(PoolError::Paused)));
+}
+
+// ── #390: migrate schema version upgrade tests ───────────────────────────────
+
+#[test]
+fn test_migrate_upgrades_schema_version_step_by_step() {
+    let t = setup(1, 10);
+    t.env.as_contract(&t.contract_id, || {
+        t.env.storage().instance().set(&DataKey::SchemaVersion, &0u32);
+    });
+    assert_eq!(t.client.schema_version(), 0);
+
+    let prev = t.client.migrate();
+    assert_eq!(prev, 0);
+    assert_eq!(t.client.schema_version(), 1);
 }

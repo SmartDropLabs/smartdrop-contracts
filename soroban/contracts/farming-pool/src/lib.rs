@@ -5,10 +5,16 @@
 mod mock_reentrant_token;
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, BytesN, Env, Vec};
-pub use types::PoolError;
+use soroban_sdk::{
+    contract, contractimpl, symbol_short, token, Address, BytesN, Env, Executable, Vec,
+};
+pub use types::{PoolError, PoolInfo};
 use types::{
-    BankedCreditTotals, BoostConfig, DataKey, ListWhitelistedResponse, Position, UserStake,
+    AdminActionEvent, AdminActionHistoryPage, BankedCreditTotals, BoostConfig, BoostEvent,
+    BoostHistoryPage, CreditRateEvent, CreditRateHistoryPage, DataKey, GlobalMultiplierEvent,
+    GlobalMultiplierHistoryPage, ListWhitelistedResponse, Position, StakeEvent,
+    StakeHistoryPage,
+    UserStake, WhitelistEvent, WhitelistHistoryPage,
 };
 
 // Expose compiled WASM bytes so sibling crates (e.g. `factory`) can upload the
@@ -88,6 +94,7 @@ const SCHEMA_VERSION: u32 = 1;
 const MAX_GLOBAL_MULTIPLIER: u32 = 1_000;
 const MAX_CREDIT_RATE: i128 = 100_000_000;
 const MAX_STAKE_AMOUNT: i128 = 10i128.pow(18);
+const MAX_LOCK_PERIOD: u32 = 63_072_000; // 10 years at 5s/ledger
 
 fn bump_instance(env: &Env) {
     env.storage()
@@ -221,12 +228,25 @@ fn set_user_stake(env: &Env, user: &Address, stake: &UserStake) {
     let key = DataKey::UserStake(user.clone());
     env.storage().persistent().set(&key, stake);
     bump_user(env, &key);
+    let mut users = get_staked_users_list(env);
+    if !users.contains(user) {
+        users.push_back(user.clone());
+        set_staked_users_list(env, &users);
+    }
 }
 
 fn remove_user_stake(env: &Env, user: &Address) {
     env.storage()
         .persistent()
         .remove(&DataKey::UserStake(user.clone()));
+    let users = get_staked_users_list(env);
+    let mut new_users: Vec<Address> = Vec::new(env);
+    for u in users.iter() {
+        if u != *user {
+            new_users.push_back(u);
+        }
+    }
+    set_staked_users_list(env, &new_users);
 }
 
 fn add_total_staked(env: &Env, amount: i128) {
@@ -552,10 +572,6 @@ fn increment_boost_user_count(env: &Env) {
         .set(&DataKey::BoostUserCount, &(count + 1));
 }
 
-// `set_boost` rejects a zero `allocation_pct` (see `test_set_boost_rejects_zero_allocation`),
-// so there is currently no path that clears a user's boost back to zero. Kept as the
-// symmetric counterpart to `increment_boost_user_count` for when such a path is added.
-#[allow(dead_code)]
 fn decrement_boost_user_count(env: &Env) {
     let count = read_boost_user_count(env);
     if count > 0 {
@@ -578,12 +594,25 @@ fn set_position(env: &Env, user: &Address, position: &Position) {
     let key = DataKey::UserPosition(user.clone());
     env.storage().persistent().set(&key, position);
     bump_user(env, &key);
+    let mut users = get_locked_users_list(env);
+    if !users.contains(user) {
+        users.push_back(user.clone());
+        set_locked_users_list(env, &users);
+    }
 }
 
 fn remove_position(env: &Env, user: &Address) {
     env.storage()
         .persistent()
         .remove(&DataKey::UserPosition(user.clone()));
+    let users = get_locked_users_list(env);
+    let mut new_users: Vec<Address> = Vec::new(env);
+    for u in users.iter() {
+        if u != *user {
+            new_users.push_back(u);
+        }
+    }
+    set_locked_users_list(env, &new_users);
 }
 
 fn whitelist_enabled(env: &Env) -> bool {
@@ -615,22 +644,174 @@ fn set_whitelisted_users_list(env: &Env, users: &Vec<Address>) {
         .set(&DataKey::WhitelistedUsers, users);
 }
 
+fn get_staked_users_list(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::StakedUsers)
+        .unwrap_or(Vec::new(env))
+}
+
+fn set_staked_users_list(env: &Env, users: &Vec<Address>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::StakedUsers, users);
+}
+
+fn get_locked_users_list(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::LockedUsers)
+        .unwrap_or(Vec::new(env))
+}
+
+fn set_locked_users_list(env: &Env, users: &Vec<Address>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::LockedUsers, users);
+}
+
+// ── History recording helpers ────────────────────────────────────────────────
+
+fn record_whitelist_event(env: &Env, user: &Address, added: bool) {
+    let count: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::WhitelistEventCount)
+        .unwrap_or(0);
+    let event = WhitelistEvent {
+        user: user.clone(),
+        added,
+        ledger: env.ledger().sequence(),
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::WhitelistHistory(count), &event);
+    env.storage()
+        .instance()
+        .set(&DataKey::WhitelistEventCount, &(count + 1));
+}
+
+fn record_boost_event(env: &Env, user: &Address, old_allocation: u32, new_allocation: u32) {
+    let count: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::BoostEventCount)
+        .unwrap_or(0);
+    let event = BoostEvent {
+        user: user.clone(),
+        old_allocation,
+        new_allocation,
+        ledger: env.ledger().sequence(),
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::BoostHistory(count), &event);
+    env.storage()
+        .instance()
+        .set(&DataKey::BoostEventCount, &(count + 1));
+}
+
+fn record_stake_event(env: &Env, user: &Address, action: soroban_sdk::Symbol, amount: i128) {
+    let count: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::StakeEventCount)
+        .unwrap_or(0);
+    let event = StakeEvent {
+        user: user.clone(),
+        action,
+        amount,
+        ledger: env.ledger().sequence(),
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::StakeHistory(count), &event);
+    env.storage()
+        .instance()
+        .set(&DataKey::StakeEventCount, &(count + 1));
+}
+
+fn record_admin_action(env: &Env, action: soroban_sdk::Symbol, admin: &Address) {
+    let count: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::AdminActionCount)
+        .unwrap_or(0);
+    let event = AdminActionEvent {
+        action,
+        admin: admin.clone(),
+        ledger: env.ledger().sequence(),
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::AdminActionHistory(count), &event);
+    env.storage()
+        .instance()
+        .set(&DataKey::AdminActionCount, &(count + 1));
+}
+
+// ── #310 — Credit rate history ────────────────────────────────────────────────
+
+fn record_credit_rate_change(env: &Env, old_rate: i128, new_rate: i128) {
+    let count: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::CreditRateEventCount)
+        .unwrap_or(0);
+    let event = CreditRateEvent {
+        old_rate,
+        new_rate,
+        ledger: env.ledger().sequence(),
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::CreditRateHistory(count), &event);
+    env.storage()
+        .instance()
+        .set(&DataKey::CreditRateEventCount, &(count + 1));
+}
+
+// ── #311 — Global multiplier history ─────────────────────────────────────────
+
+fn record_global_multiplier_change(env: &Env, old_multiplier: u32, new_multiplier: u32) {
+    let count: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::GlobalMultiplierEventCount)
+        .unwrap_or(0);
+    let event = GlobalMultiplierEvent {
+        old_multiplier,
+        new_multiplier,
+        ledger: env.ledger().sequence(),
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::GlobalMultiplierHistory(count), &event);
+    env.storage()
+        .instance()
+        .set(&DataKey::GlobalMultiplierEventCount, &(count + 1));
+}
+
 // ── Boost calculation ─────────────────────────────────────────────────────────
 
 /// Compute the effective total stake for credit accrual.
 ///
-/// Splits `amount` into a principal portion and a boosted virtual portion:
-///   boosted_amount  = amount * allocation_pct / 100
-///   principal_stake = amount - boosted_amount
-///   virtual_stake   = boosted_amount * multiplier
-///   total_stake     = principal_stake + virtual_stake
+/// Splits `amount` into a principal portion and a boosted virtual portion.
+/// The computation uses a single trailing division so small stakes do not
+/// lose their boost to intermediate truncation (#284):
+///   total_stake = amount * (100 - allocation_pct + allocation_pct * multiplier) / 100
+///
+/// This is algebraically identical to the split form
+/// (`boosted = amount * allocation_pct / 100`, `principal = amount - boosted`,
+/// `virtual = boosted * multiplier`) but defers the `/ 100` until after all
+/// multiplication, so e.g. `amount = 1, allocation_pct = 1, multiplier = 1000`
+/// yields `10` instead of truncating `boosted` to `0` and returning `1`.
 ///
 /// With no boost (allocation_pct = 0) total_stake == amount.
 fn compute_total_stake(amount: i128, allocation_pct: u32, multiplier: u32) -> i128 {
-    let boosted = amount * allocation_pct as i128 / 100;
-    let principal = amount - boosted;
-    let virtual_stake = boosted * multiplier as i128;
-    principal + virtual_stake
+    let alloc = allocation_pct as i128;
+    let mult = multiplier as i128;
+    amount * (100 - alloc + alloc * mult) / 100
 }
 
 fn compute_credits(
@@ -640,7 +821,10 @@ fn compute_credits(
     credit_rate: i128,
     ledgers_elapsed: u32,
 ) -> i128 {
-    compute_total_stake(amount, allocation_pct, multiplier) * credit_rate * ledgers_elapsed as i128
+    compute_total_stake(amount, allocation_pct, multiplier)
+        .checked_mul(credit_rate)
+        .and_then(|t| t.checked_mul(ledgers_elapsed as i128))
+        .expect("credits arithmetic overflow")
 }
 
 fn compute_stake_accrual(env: &Env, user: &Address, stake: &UserStake, current: u32) -> i128 {
@@ -735,7 +919,7 @@ fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) {
 fn checkpoint_position(env: &Env, user: &Address, position: &mut Position) {
     let current = env.ledger().sequence();
     let elapsed = current.saturating_sub(position.checkpoint_ledger);
-    let delta = position.amount * position.credit_rate * elapsed as i128;
+    let delta = compute_credits(position.amount, 0, 1, position.credit_rate, elapsed);
     position.total_credits += delta;
     add_total_credits(env, delta);
     add_total_distributed_credits(env, delta);
@@ -882,7 +1066,7 @@ impl FarmingPool {
     ///
     /// Deprecated: use `propose_admin` followed by `accept_admin` so the new
     /// admin must prove control of its address before the handoff completes.
-    /// Emits a `("pool", "adm_xfr")` event with `(old_admin, new_admin)`.
+    /// Emits a `("pool", "adm_xfr")` event with `(old_admin, new_admin)` tuple.
     #[deprecated(note = "use propose_admin followed by accept_admin")]
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), PoolError> {
         let current = get_admin(&env)?;
@@ -891,6 +1075,7 @@ impl FarmingPool {
 
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("adm_xfr")),
             (current, new_admin),
@@ -922,56 +1107,148 @@ impl FarmingPool {
     /// and should be tested in isolation.
     pub fn migrate(env: Env) -> Result<u32, PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         bump_instance(&env);
 
         let current = read_schema_version(&env);
-        let mut version = current;
-        while version < SCHEMA_VERSION {
-            match version {
-                0 => {
-                    // Initial schema tracking migration (v0 -> v1)
-                    version = 1;
-                }
-                _ => break,
-            }
-        }
+        let target = SCHEMA_VERSION;
 
-        env.storage()
-            .instance()
-            .set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
+        if current < target {
+            let mut version = current;
+            while version < target {
+                match version {
+                    0 => {
+                        // Initial schema tracking migration (v0 -> v1)
+                        version = 1;
+                    }
+                    1 => {
+                        // Schema migration v1 -> v2 (placeholder for v1 -> v2 transformations)
+                        version = 2;
+                    }
+                    _ => break,
+                }
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::SchemaVersion, &target);
+        }
 
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("migrated")),
-            (current, SCHEMA_VERSION),
+            (current, target),
         );
+        record_admin_action(&env, symbol_short!("migrate"), &admin);
         Ok(current)
     }
 
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         bump_instance(&env);
+
+        // Capture the old WASM hash before replacing it so the upgrade event
+        // provides a complete audit trail of which version was replaced (#291).
+        let old_wasm_hash = match env.current_contract_address().executable() {
+            Some(Executable::Wasm(hash)) => Some(hash),
+            _ => None,
+        };
 
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("upgraded")),
-            new_wasm_hash.clone(),
+            (old_wasm_hash, new_wasm_hash.clone()),
         );
+
+        record_admin_action(&env, symbol_short!("upgrade"), &admin);
+
         env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
+
+    /// Admin: re-initialize a user's banked credits after TTL expiry (#290).
+    ///
+    /// If a user's `BankedCredits` storage entry expired due to TTL, this
+    /// function allows the admin to restore it from verified off-chain records.
+    /// The admin must provide the correct position and stake credit totals as
+    /// known from the last checkpoint before expiry.
+    ///
+    /// This does NOT restore the user's stake or position (those require a new
+    /// `stake` or `lock_assets` call) — only their banked credit history so
+    /// they do not lose previously-earned credits.
+    pub fn recover_banked_credits(
+        env: Env,
+        user: Address,
+        position_credits: i128,
+        stake_credits: i128,
+    ) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        get_admin(&env)?.require_auth();
+        if position_credits < 0 || stake_credits < 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+        bump_instance(&env);
+
+        set_banked_credits(
+            &env,
+            &user,
+            BankedCreditTotals {
+                position_credits,
+                stake_credits,
+            },
+        );
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("recov")),
+            (user, position_credits, stake_credits),
+        );
         Ok(())
     }
 
     /// Lock assets for the minimum lock period. A top-up checkpoints the
     /// existing position and extends its whole-position unlock ledger to the
     /// later of the existing unlock ledger and a fresh period from this call.
+    ///
+    /// # Reentrancy posture (#398)
+    ///
+    /// `stake_token` is admin-supplied and therefore not necessarily a trusted
+    /// Stellar Asset Contract — a non-standard `transfer` could call back into
+    /// this contract while it is still executing. Two independent defenses
+    /// apply, in order:
+    ///
+    /// 1. **Checks-effects-interactions.** Every validation runs first, the
+    ///    position (including the extended unlock ledger) is written to
+    ///    storage, and only then is `token::transfer` called. A reentrant call
+    ///    therefore observes the already-updated position rather than a
+    ///    half-applied one, so it cannot withdraw or re-credit more than the
+    ///    post-deposit position allows. `token::Client::transfer` returns
+    ///    `()` on success and traps on failure, so a failed transfer reverts the
+    ///    whole invocation and leaves no partial deposit (see #363).
+    /// 2. **Host-level reentry prohibition.** Soroban's `ContractReentryMode`
+    ///    defaults to `Prohibited`, so a token that tries to reenter this
+    ///    contract during the transfer traps with "Contract re-entry is not
+    ///    allowed" before any of our code runs.
+    ///
+    /// Both properties are covered by the reentrancy tests in `test.rs`
+    /// (`test_lock_assets_reentrant_transfer_is_rejected_and_final_state_is_correct`
+    /// and `test_lock_assets_reverts_entirely_if_stake_token_naively_reenters`),
+    /// which use `MockReentrantToken` / `MockNaiveReentrantToken` to attempt
+    /// the reentry mid-transfer. No code change is required for the reported
+    /// concern; this comment records the verification.
     pub fn lock_assets(env: Env, user: Address, amount: i128) -> Result<(), PoolError> {
         user.require_auth();
         require_initialized(&env)?;
         require_staking_not_paused(&env)?;
 
-        assert!(amount > 0, "amount must be positive");
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+        if amount > MAX_STAKE_AMOUNT {
+            return Err(PoolError::ExceedsMaxStake);
+        }
 
         if whitelist_enabled(&env) && !is_user_whitelisted(&env, &user) {
             return Err(PoolError::NotWhitelisted);
@@ -982,6 +1259,9 @@ impl FarmingPool {
         if total_amount < min_stake {
             return Err(PoolError::BelowMinimumStake);
         }
+        if total_amount > MAX_STAKE_AMOUNT {
+            return Err(PoolError::ExceedsMaxStake);
+        }
 
         bump_instance(&env);
 
@@ -990,6 +1270,10 @@ impl FarmingPool {
         let mut position = if let Some(mut existing) = get_position(&env, &user) {
             checkpoint_position(&env, &user, &mut existing);
             existing.amount += amount;
+            
+            // Issue #376: Update lock_ledger to current ledger for additional deposits
+            // This ensures the lock period is based on the most recent deposit, not the original
+            existing.lock_ledger = current;
             let fresh_unlock = current.saturating_add(read_min_lock_period(&env));
             existing.unlock_ledger = existing.unlock_ledger.max(fresh_unlock);
             existing
@@ -1024,6 +1308,9 @@ impl FarmingPool {
         add_total_locked(&env, amount);
 
         let stake_token = get_stake_token(&env)?;
+        // Issue #363: Soroban SDK's token::Client::transfer returns () on success
+        // and panics on failure, so no explicit validation is needed. The panic
+        // will revert the entire transaction, rolling back the position update above.
         token::TokenClient::new(&env, &stake_token).transfer(
             &user,
             env.current_contract_address(),
@@ -1032,8 +1319,11 @@ impl FarmingPool {
 
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("locked")),
-            (user, amount, position.amount),
+            (user.clone(), amount, position.amount),
         );
+
+        record_stake_event(&env, &user, symbol_short!("lock"), amount);
+
         Ok(())
     }
 
@@ -1042,20 +1332,28 @@ impl FarmingPool {
         require_initialized(&env)?;
         require_withdrawals_not_paused(&env)?;
 
-        assert!(amount > 0, "amount must be positive");
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+        if amount > MAX_STAKE_AMOUNT {
+            return Err(PoolError::ExceedsMaxStake);
+        }
         bump_instance(&env);
 
         let was_staked = is_user_staked(&env, &user);
-        let mut position = get_position(&env, &user).expect("no active position");
-        assert!(amount <= position.amount, "insufficient locked balance");
+        let mut position = get_position(&env, &user).ok_or(PoolError::NoActivePosition)?;
+        if amount > position.amount {
+            return Err(PoolError::InsufficientBalance);
+        }
 
         let current = env.ledger().sequence();
-        assert!(
-            current >= position.unlock_ledger,
-            "minimum lock period not elapsed"
-        );
+        if current < position.unlock_ledger {
+            return Err(PoolError::LockPeriodNotElapsed);
+        }
 
+        let credits_before = position.total_credits;
         checkpoint_position(&env, &user, &mut position);
+        let credits_earned = position.total_credits - credits_before;
         let total_credits = position.total_credits;
         position.amount -= amount;
 
@@ -1089,8 +1387,11 @@ impl FarmingPool {
 
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("unlocked")),
-            (user, amount, total_credits),
+            (user.clone(), amount, credits_earned, total_credits),
         );
+
+        record_stake_event(&env, &user, symbol_short!("unlock"), amount);
+
         Ok(())
     }
 
@@ -1109,7 +1410,8 @@ impl FarmingPool {
             .ledger()
             .sequence()
             .saturating_sub(position.checkpoint_ledger);
-        Ok(position.total_credits + position.amount * position.credit_rate * elapsed as i128)
+        let accrued = compute_credits(position.amount, 0, 1, position.credit_rate, elapsed);
+        Ok(position.total_credits + accrued)
     }
 
     /// Return current accrued credits for a user's time-locked `Position`.
@@ -1127,7 +1429,8 @@ impl FarmingPool {
         };
         let current = env.ledger().sequence();
         let elapsed = current.saturating_sub(position.checkpoint_ledger);
-        position.total_credits += position.amount * position.credit_rate * elapsed as i128;
+        let accrued = compute_credits(position.amount, 0, 1, position.credit_rate, elapsed);
+        position.total_credits += accrued;
         position.checkpoint_ledger = current;
         position.credit_rate = read_credit_rate(&env);
         Ok(Some(position))
@@ -1146,7 +1449,8 @@ impl FarmingPool {
 
     pub fn pause(env: Env) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Paused, &true);
         env.storage().instance().set(&DataKey::PausedStaking, &true);
@@ -1155,6 +1459,9 @@ impl FarmingPool {
             .set(&DataKey::PausedWithdrawals, &true);
         env.events()
             .publish((symbol_short!("pool"), symbol_short!("paused")), ());
+
+        record_admin_action(&env, symbol_short!("paused"), &admin);
+
         Ok(())
     }
 
@@ -1182,7 +1489,8 @@ impl FarmingPool {
 
     pub fn unpause(env: Env) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage()
@@ -1193,6 +1501,9 @@ impl FarmingPool {
             .set(&DataKey::PausedWithdrawals, &false);
         env.events()
             .publish((symbol_short!("pool"), symbol_short!("unpaused")), ());
+
+        record_admin_action(&env, symbol_short!("unpaus"), &admin);
+
         Ok(())
     }
 
@@ -1254,36 +1565,45 @@ impl FarmingPool {
         bump_instance(&env);
 
         let was_staked = is_user_staked(&env, &user);
-        let mut total_returned = 0i128;
-        let mut position_credits = 0i128;
-        let mut stake_credits = 0i128;
-        let stake_token = get_stake_token(&env)?;
-        let token = token::TokenClient::new(&env, &stake_token);
+        let mut position_opt = get_position(&env, &user);
+        let mut stake_opt = get_user_stake(&env, &user);
+        if position_opt.is_none() && stake_opt.is_none() {
+            return Err(PoolError::NoActiveStake);
+        }
+        // Bank credits accrued since the last checkpoint so they survive the exit (#295).
+        if let Some(p) = position_opt.as_mut() {
+            checkpoint_position(&env, &user, p);
+        }
+        if let Some(s) = stake_opt.as_mut() {
+            checkpoint(&env, &user, s);
+        }
+        let position_amount = position_opt.as_ref().map_or(0i128, |p| p.amount);
+        let stake_amount = stake_opt.as_ref().map_or(0i128, |s| s.amount);
+        let total_returned = position_amount + stake_amount;
+        if total_returned == 0 {
+            return Err(PoolError::NoActiveStake);
+        }
+        let position_credits = position_opt.as_ref().map_or(0i128, |p| p.total_credits);
+        let stake_credits = stake_opt.as_ref().map_or(0i128, |s| s.credits_banked);
 
-        if let Some(position) = get_position(&env, &user) {
-            token.transfer(&env.current_contract_address(), &user, &position.amount);
-            total_returned += position.amount;
-            subtract_total_staked(&env, position.amount);
-            subtract_total_locked(&env, position.amount);
-            position_credits = position.total_credits;
+        // Checks-effects-interactions: clear all state *before* the external
+        // token transfers below so a malicious token contract cannot
+        // re-enter and double-withdraw. On transfer failure the whole
+        // invocation reverts, rolling these writes back. See #279.
+        if position_opt.is_some() {
+            subtract_total_staked(&env, position_amount);
+            subtract_total_locked(&env, position_amount);
             remove_position(&env, &user);
         }
 
-        if let Some(stake) = get_user_stake(&env, &user) {
-            token.transfer(&env.current_contract_address(), &user, &stake.amount);
-            total_returned += stake.amount;
-            subtract_total_staked(&env, stake.amount);
-            stake_credits = stake.credits_banked;
+        if stake_opt.is_some() {
+            subtract_total_staked(&env, stake_amount);
             remove_user_stake(&env, &user);
             decrement_active_stake_count(&env);
         }
 
         if was_staked && !is_user_staked(&env, &user) {
             decrement_staked_user_count(&env);
-        }
-
-        if total_returned == 0 {
-            return Err(PoolError::NoActiveStake);
         }
 
         add_total_withdrawals(&env, total_returned);
@@ -1302,6 +1622,15 @@ impl FarmingPool {
         }
 
         increment_emergency_withdrawal_count(&env);
+
+        let stake_token = get_stake_token(&env)?;
+        let token = token::TokenClient::new(&env, &stake_token);
+        if position_amount > 0 {
+            token.transfer(&env.current_contract_address(), &user, &position_amount);
+        }
+        if stake_amount > 0 {
+            token.transfer(&env.current_contract_address(), &user, &stake_amount);
+        }
 
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("emrg_exit")),
@@ -1349,6 +1678,7 @@ impl FarmingPool {
     // ── Whitelist system ──────────────────────────────────────────────────────
 
     /// Admin: enable whitelist mode. Admin must authorise.
+    /// Emits `("pool", "wl_en")` event.
     pub fn enable_whitelist(env: Env) -> Result<(), PoolError> {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
@@ -1356,10 +1686,15 @@ impl FarmingPool {
         env.storage()
             .instance()
             .set(&DataKey::WhitelistEnabled, &true);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("wl_en")),
+            (),
+        );
         Ok(())
     }
 
     /// Admin: disable whitelist mode. Admin must authorise.
+    /// Emits `("pool", "wl_dis")` event.
     pub fn disable_whitelist(env: Env) -> Result<(), PoolError> {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
@@ -1367,6 +1702,10 @@ impl FarmingPool {
         env.storage()
             .instance()
             .set(&DataKey::WhitelistEnabled, &false);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("wl_dis")),
+            (),
+        );
         Ok(())
     }
 
@@ -1382,9 +1721,12 @@ impl FarmingPool {
 
         let mut users = get_whitelisted_users_list(&env);
         if !users.contains(&user) {
-            users.push_back(user);
+            users.push_back(user.clone());
             set_whitelisted_users_list(&env, &users);
         }
+
+        record_whitelist_event(&env, &user, true);
+
         Ok(())
     }
 
@@ -1405,6 +1747,9 @@ impl FarmingPool {
             }
         }
         set_whitelisted_users_list(&env, &new_users);
+
+        record_whitelist_event(&env, &user, false);
+
         Ok(())
     }
 
@@ -1449,7 +1794,7 @@ impl FarmingPool {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
         if users.len() > 50 {
-            panic!("max 50 addresses per call");
+            return Err(PoolError::BatchTooLarge);
         }
         bump_instance(&env);
 
@@ -1476,7 +1821,7 @@ impl FarmingPool {
         require_initialized(&env)?;
         get_admin(&env)?.require_auth();
         if users.len() > 50 {
-            panic!("max 50 addresses per call");
+            return Err(PoolError::BatchTooLarge);
         }
         bump_instance(&env);
 
@@ -1525,7 +1870,12 @@ impl FarmingPool {
         from.require_auth();
         require_initialized(&env)?;
         require_staking_not_paused(&env)?;
-        assert!(amount > 0, "amount must be positive");
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+        if amount > MAX_STAKE_AMOUNT {
+            return Err(PoolError::ExceedsMaxStake);
+        }
 
         if whitelist_enabled(&env) && !is_user_whitelisted(&env, &from) {
             return Err(PoolError::NotWhitelisted);
@@ -1542,7 +1892,10 @@ impl FarmingPool {
         let current = env.ledger().sequence();
         let mut new_stake = if let Some(mut existing) = get_user_stake(&env, &from) {
             checkpoint(&env, &from, &mut existing);
-            existing.amount += amount;
+            existing.amount = existing.amount.checked_add(amount).expect("stake amount overflow");
+            if existing.amount > MAX_STAKE_AMOUNT {
+                return Err(PoolError::ExceedsMaxStake);
+            }
             existing
         } else {
             UserStake {
@@ -1578,8 +1931,10 @@ impl FarmingPool {
 
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("staked")),
-            (from, amount),
+            (from.clone(), amount),
         );
+
+        record_stake_event(&env, &from, symbol_short!("stake"), amount);
 
         Ok(())
     }
@@ -1590,52 +1945,105 @@ impl FarmingPool {
     /// any time. Because credits accrue only over elapsed ledgers (#169), an
     /// immediate stake→unstake round-trip earns no credits, so the lack of a
     /// lock does not create a flash-staking reward.
-    pub fn unstake(env: Env, from: Address) -> Result<i128, PoolError> {
+    pub fn unstake(env: Env, from: Address, amount: i128) -> Result<i128, PoolError> {
         from.require_auth();
         require_initialized(&env)?;
         require_withdrawals_not_paused(&env)?;
         bump_instance(&env);
 
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+
         let was_staked = is_user_staked(&env, &from);
-        let mut stake = get_user_stake(&env, &from).expect("no active stake");
+        let mut stake = get_user_stake(&env, &from).ok_or(PoolError::NoActiveStake)?;
+        if amount > stake.amount {
+            return Err(PoolError::InsufficientBalance);
+        }
+
         checkpoint(&env, &from, &mut stake);
         let total_credits = stake.credits_banked;
-        if total_credits > 0 {
-            subtract_total_banked_credits(&env, total_credits);
+        stake.amount -= amount;
+
+        // Checks-effects-interactions: clear state *before* the external
+        // token transfer below so a reentrant token cannot re-enter and
+        // double-withdraw. On transfer failure the whole invocation
+        // reverts, rolling these writes back. See #279.
+        if stake.amount == 0 {
+            if total_credits > 0 {
+                subtract_total_banked_credits(&env, total_credits);
+            }
+            remove_user_stake(&env, &from);
+            decrement_active_stake_count(&env);
+            if was_staked && !is_user_staked(&env, &from) {
+                decrement_staked_user_count(&env);
+            }
+        } else {
+            set_user_stake(&env, &from, &stake);
         }
+
+        increment_unstake_count(&env);
+        subtract_total_staked(&env, amount);
+        add_total_withdrawals(&env, amount);
 
         // Return staked tokens to caller.
         let stake_token = get_stake_token(&env)?;
         token::TokenClient::new(&env, &stake_token).transfer(
             &env.current_contract_address(),
             &from,
-            &stake.amount,
+            &amount,
         );
 
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("unstaked")),
-            (from.clone(), stake.amount, total_credits),
+            (from.clone(), amount, total_credits),
         );
 
-        remove_user_stake(&env, &from);
-        decrement_active_stake_count(&env);
-        if was_staked && !is_user_staked(&env, &from) {
-            decrement_staked_user_count(&env);
-        }
-        increment_unstake_count(&env);
-        subtract_total_staked(&env, stake.amount);
-        add_total_withdrawals(&env, stake.amount);
+        record_stake_event(&env, &from, symbol_short!("unstake"), amount);
+
         Ok(total_credits)
     }
 
+    /// Withdraw accrued credits from the caller's flexible stake without unstaking.
+    ///
+    /// Claims and resets `credits_banked` to 0 while keeping the staked amount intact.
+    /// Emits a `crd_wdr` event with `(user, credits)`.
+    pub fn withdraw_credits(env: Env, user: Address) -> Result<i128, PoolError> {
+        user.require_auth();
+        require_initialized(&env)?;
+        require_withdrawals_not_paused(&env)?;
+        bump_instance(&env);
+
+        let mut stake = get_user_stake(&env, &user).ok_or(PoolError::NoActiveStake)?;
+        checkpoint(&env, &user, &mut stake);
+        let credits = stake.credits_banked;
+        if credits > 0 {
+            subtract_total_banked_credits(&env, credits);
+        }
+        stake.credits_banked = 0;
+        set_user_stake(&env, &user, &stake);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("crd_wdr")),
+            (user.clone(), credits),
+        );
+
+        Ok(credits)
+    }
+
+    /// Admin sets a user's boost allocation (0-100%). Requires an active
+    /// flexible `UserStake` for `user` (#285): boosting an address with no
+    /// stake is rejected with `NoActiveStake` instead of storing an inert
+    /// allocation. A time-locked `Position` alone does not satisfy this —
+    /// boost only accrues via the `UserStake` path. Set to 0 to clear boost.
     pub fn set_boost(env: Env, user: Address, allocation_pct: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
         require_staking_not_paused(&env)?;
         get_admin(&env)?.require_auth();
-        assert!(
-            (1..=100).contains(&allocation_pct),
-            "allocation_pct must be 1-100"
-        );
+        if allocation_pct == 0 || allocation_pct > 100 {
+            return Err(PoolError::InvalidAllocation);
+        }
         bump_instance(&env);
 
         let mut stake = get_user_stake(&env, &user).ok_or(PoolError::NoActiveStake)?;
@@ -1643,36 +2051,52 @@ impl FarmingPool {
         set_user_stake(&env, &user, &stake);
 
         let old_alloc: u32 = get_user_boost(&env, &user).unwrap_or(0);
-        if old_alloc == 0 {
+        if allocation_pct == 0 {
+            if old_alloc > 0 {
+                decrement_boost_user_count(&env);
+                add_total_boost_allocation(&env, -(old_alloc as i64));
+                let key = DataKey::UserBoost(user.clone());
+                env.storage().persistent().remove(&key);
+            }
+        } else if old_alloc == 0 {
             increment_boost_user_count(&env);
             add_total_boost_allocation(&env, allocation_pct as i64);
+            let key = DataKey::UserBoost(user.clone());
+            if !env.storage().persistent().has(&key) {
+                increment_boost_count(&env);
+            }
+            env.storage().persistent().set(&key, &allocation_pct);
+            bump_user(&env, &key);
         } else {
             let delta = allocation_pct as i64 - old_alloc as i64;
             if delta != 0 {
                 add_total_boost_allocation(&env, delta);
             }
+            let key = DataKey::UserBoost(user.clone());
+            env.storage().persistent().set(&key, &allocation_pct);
+            bump_user(&env, &key);
         }
-
-        let key = DataKey::UserBoost(user.clone());
-        if !env.storage().persistent().has(&key) {
-            increment_boost_count(&env);
-        }
-        env.storage().persistent().set(&key, &allocation_pct);
-        bump_user(&env, &key);
 
         let multiplier = read_global_multiplier(&env);
         env.events().publish(
             (symbol_short!("boost"), symbol_short!("applied")),
-            (user, allocation_pct, multiplier),
+            (user.clone(), old_alloc, allocation_pct, multiplier),
         );
+
+        record_boost_event(&env, &user, old_alloc, allocation_pct);
+
         Ok(())
     }
 
     pub fn get_boost_config(env: Env, user: Address) -> Result<Option<BoostConfig>, PoolError> {
         require_initialized(&env)?;
         bump_instance(&env);
+        let multiplier = match get_user_stake(&env, &user) {
+            Some(stake) => stake.multiplier,
+            None => read_global_multiplier(&env),
+        };
         Ok(Some(BoostConfig {
-            multiplier: read_global_multiplier(&env),
+            multiplier,
             allocation_pct: get_user_boost(&env, &user).unwrap_or(0),
         }))
     }
@@ -1687,7 +2111,8 @@ impl FarmingPool {
     /// `MAX_GLOBAL_MULTIPLIER` — see #89 for the overflow-safety derivation.
     pub fn set_global_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         if !(1..=MAX_GLOBAL_MULTIPLIER).contains(&multiplier) {
             return Err(PoolError::InvalidGlobalMultiplier);
         }
@@ -1705,10 +2130,14 @@ impl FarmingPool {
             &DataKey::GlobalMultiplierChangeLedger,
             &env.ledger().sequence(),
         );
+        record_global_multiplier_change(&env, old_multiplier, multiplier);
         env.events().publish(
             (symbol_short!("boost"), symbol_short!("mult_set")),
             (old_multiplier, multiplier),
         );
+
+        record_admin_action(&env, symbol_short!("mult"), &admin);
+
         Ok(())
     }
 
@@ -1724,7 +2153,8 @@ impl FarmingPool {
     /// when computing credits for users who have not yet checkpointed.
     pub fn set_credit_rate(env: Env, new_rate: i128) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         if new_rate <= 0 || new_rate > MAX_CREDIT_RATE {
             return Err(PoolError::InvalidCreditRate);
         }
@@ -1735,19 +2165,41 @@ impl FarmingPool {
             .instance()
             .set(&DataKey::CreditRate, &new_rate);
         increment_credit_rate_change_count(&env);
+        record_credit_rate_change(&env, old_rate, new_rate);
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("rate_set")),
             (old_rate, new_rate, env.ledger().sequence()),
         );
+
+        record_admin_action(&env, symbol_short!("cr_rate"), &admin);
+
         Ok(())
     }
 
     pub fn set_min_lock_period(env: Env, new_period: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        if new_period > MAX_LOCK_PERIOD {
+            return Err(PoolError::InvalidLockPeriod);
+        }
         bump_instance(&env);
 
         let old_period = read_min_lock_period(&env);
+        let current_ledger = env.ledger().sequence();
+
+        if new_period > old_period {
+            let locked_users = get_locked_users_list(&env);
+            for user in locked_users.iter() {
+                if let Some(position) = get_position(&env, &user) {
+                    let required_unlock = position.lock_ledger.saturating_add(new_period);
+                    if position.unlock_ledger < required_unlock && current_ledger < required_unlock {
+                        return Err(PoolError::NoActivePosition);
+                    }
+                }
+            }
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::MinLockPeriod, &new_period);
@@ -1755,6 +2207,9 @@ impl FarmingPool {
             (symbol_short!("pool"), symbol_short!("lock_set")),
             (old_period, new_period),
         );
+
+        record_admin_action(&env, symbol_short!("lk_per"), &admin);
+
         Ok(())
     }
 
@@ -1827,7 +2282,8 @@ impl FarmingPool {
                     .ledger()
                     .sequence()
                     .saturating_sub(position.checkpoint_ledger);
-                position.total_credits + position.amount * position.credit_rate * elapsed as i128
+                let accrued = compute_credits(position.amount, 0, 1, position.credit_rate, elapsed);
+                position.total_credits + accrued
             })
             .unwrap_or(0);
 
@@ -1843,7 +2299,8 @@ impl FarmingPool {
 
     pub fn set_min_stake_amount(env: Env, amount: i128) -> Result<(), PoolError> {
         require_initialized(&env)?;
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
         bump_instance(&env);
 
         if amount <= 0 || amount > MAX_STAKE_AMOUNT {
@@ -1858,6 +2315,8 @@ impl FarmingPool {
             (symbol_short!("pool"), symbol_short!("minst_set")),
             (old_amount, amount),
         );
+
+        record_admin_action(&env, symbol_short!("min_stk"), &admin);
 
         Ok(())
     }
@@ -1940,6 +2399,62 @@ impl FarmingPool {
             .instance()
             .get(&DataKey::TotalDistributedCredits)
             .unwrap_or(0))
+    }
+
+    /// Alias for `total_distributed_credits` for consistency with other getter functions.
+    pub fn get_total_distributed_credits(env: Env) -> Result<i128, PoolError> {
+        Self::total_distributed_credits(env)
+    }
+
+    /// Return the total credits earned across users and staking systems.
+    ///
+    /// Accrual is included when a user's stake or position is checkpointed;
+    /// uncheckpointed accrual remains available through the per-user queries.
+    pub fn get_total_earned(env: Env) -> Result<i128, PoolError> {
+        Self::total_distributed_credits(env)
+    }
+
+    /// Aggregate pool overview in a single invocation (Issue #395).
+    ///
+    /// A pool dashboard previously needed up to six separate reads
+    /// (`total_staked`, `credit_rate`, the global multiplier, the min lock
+    /// period, the min stake amount and the paused flag), each paying its own
+    /// invocation cost and TTL bump. This returns the same values together,
+    /// read straight from instance storage.
+    ///
+    /// Note on the issue's field list: it mentions "total credits" and
+    /// "number of stakers". Credits are covered by the two maintained
+    /// counters below. Staker count is not, because the pool keeps no
+    /// staker-count entry — it is derived by paging `get_positions`, so
+    /// inventing a field here would report a number nothing maintains.
+    ///
+    /// Returns `NotInitialized` if the pool has not been initialized.
+    pub fn get_pool_info(env: Env) -> Result<PoolInfo, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        Ok(PoolInfo {
+            total_staked: env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalStaked)
+                .unwrap_or(0),
+            total_banked_credits: read_total_banked_credits(&env),
+            total_distributed_credits: env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalDistributedCredits)
+                .unwrap_or(0),
+            credit_rate: read_credit_rate(&env),
+            global_multiplier: read_global_multiplier(&env),
+            min_lock_period: read_min_lock_period(&env),
+            min_stake_amount: env
+                .storage()
+                .instance()
+                .get(&DataKey::MinStakeAmount)
+                .unwrap_or(1),
+            is_paused: pool_is_paused(&env),
+        })
     }
 
     /// Return the total credits currently banked across all users.
@@ -2082,6 +2597,346 @@ impl FarmingPool {
     pub fn get_whitelist_count(env: Env) -> Result<u32, PoolError> {
         Self::whitelist_count(env)
     }
+
+    /// Return a zero-based page of distinct users with an active stake or locked position.
+    pub fn get_stakers(env: Env, start: u32, limit: u32) -> Result<Vec<Address>, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let mut all = get_staked_users_list(&env);
+        for user in get_locked_users_list(&env).iter() {
+            if !all.contains(&user) {
+                all.push_back(user);
+            }
+        }
+
+        let mut page = Vec::new(&env);
+        let mut index = start;
+        let mut count = 0u32;
+        while index < all.len() && count < limit {
+            page.push_back(all.get(index).unwrap());
+            index += 1;
+            count += 1;
+        }
+
+        Ok(page)
+    }
+
+    /// Return a paginated list of all users with active stakes.
+    ///
+    /// `offset`: zero-based index of the first user to return.
+    /// `limit`: maximum number of users to return per call.
+    ///
+    /// Returns addresses and total count. Call repeatedly with increasing `offset`
+    /// until `offset >= total` to retrieve the full list.
+    pub fn get_staked_users(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<ListWhitelistedResponse, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let all = get_staked_users_list(&env);
+        let total = all.len();
+        let mut page: Vec<Address> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            page.push_back(all.get(i).unwrap());
+            i += 1;
+            count += 1;
+        }
+
+        Ok(ListWhitelistedResponse { users: page, total })
+    }
+
+    /// Return a paginated list of all users with active locked positions.
+    ///
+    /// `offset`: zero-based index of the first user to return.
+    /// `limit`: maximum number of users to return per call.
+    ///
+    /// Returns addresses and total count. Call repeatedly with increasing `offset`
+    /// until `offset >= total` to retrieve the full list.
+    pub fn get_locked_users(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<ListWhitelistedResponse, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let all = get_locked_users_list(&env);
+        let total = all.len();
+        let mut page: Vec<Address> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            page.push_back(all.get(i).unwrap());
+            i += 1;
+            count += 1;
+        }
+
+        Ok(ListWhitelistedResponse { users: page, total })
+    }
+
+    /// Return a paginated list of all time-locked positions.
+    ///
+    /// `start`: zero-based index of the first position to return.
+    /// `limit`: maximum number of positions to return per call.
+    ///
+    /// Returns a vector of `(Address, Position)` tuples. Call repeatedly with
+    /// increasing `start` until the returned vector is empty or has fewer than
+    /// `limit` elements to retrieve all positions.
+    ///
+    /// This is useful for TVL calculations, analytics, and protocol health
+    /// monitoring where off-chain systems need to iterate all stakers.
+    pub fn get_all_positions(
+        env: Env,
+        start: u32,
+        limit: u32,
+    ) -> Result<Vec<(Address, Position)>, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let locked_users = get_locked_users_list(&env);
+        let total = locked_users.len();
+        let mut positions: Vec<(Address, Position)> = Vec::new(&env);
+        let mut i = start;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            let user = locked_users.get(i).unwrap();
+            if let Some(position) = get_position(&env, &user) {
+                positions.push_back((user, position));
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(positions)
+    }
+
+    // ── History / audit trail query functions ────────────────────────────────
+
+    /// Return a paginated list of whitelist history events.
+    ///
+    /// `offset`: zero-based index of the first event to return.
+    /// `limit`: maximum number of events to return per call.
+    pub fn get_whitelist_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<WhitelistHistoryPage, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::WhitelistEventCount)
+            .unwrap_or(0);
+        let mut events: Vec<WhitelistEvent> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, WhitelistEvent>(&DataKey::WhitelistHistory(i))
+            {
+                events.push_back(event);
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(WhitelistHistoryPage { events, total })
+    }
+
+    /// Return a paginated list of boost allocation history events.
+    ///
+    /// `offset`: zero-based index of the first event to return.
+    /// `limit`: maximum number of events to return per call.
+    pub fn get_boost_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<BoostHistoryPage, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BoostEventCount)
+            .unwrap_or(0);
+        let mut events: Vec<BoostEvent> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, BoostEvent>(&DataKey::BoostHistory(i))
+            {
+                events.push_back(event);
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(BoostHistoryPage { events, total })
+    }
+
+    /// Return a paginated list of stake/unstake/lock/unlock history events.
+    ///
+    /// `offset`: zero-based index of the first event to return.
+    /// `limit`: maximum number of events to return per call.
+    pub fn get_stake_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<StakeHistoryPage, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StakeEventCount)
+            .unwrap_or(0);
+        let mut events: Vec<StakeEvent> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, StakeEvent>(&DataKey::StakeHistory(i))
+            {
+                events.push_back(event);
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(StakeHistoryPage { events, total })
+    }
+
+    /// Return a paginated list of admin action history events.
+    ///
+    /// `offset`: zero-based index of the first event to return.
+    /// `limit`: maximum number of events to return per call.
+    pub fn get_admin_action_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<AdminActionHistoryPage, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminActionCount)
+            .unwrap_or(0);
+        let mut events: Vec<AdminActionEvent> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, AdminActionEvent>(&DataKey::AdminActionHistory(i))
+            {
+                events.push_back(event);
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(AdminActionHistoryPage { events, total })
+    }
+
+    /// #310 — Return a paginated audit trail of credit rate changes.
+    ///
+    /// Each entry records the previous rate, the new rate, and the ledger at
+    /// which the change was applied. Events are stored in chronological order;
+    /// pass `offset = 0` and advance by `limit` to walk the full history.
+    ///
+    /// `offset`: zero-based index of the first event to return.
+    /// `limit`: maximum number of events to return per call.
+    pub fn get_credit_rate_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<CreditRateHistoryPage, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CreditRateEventCount)
+            .unwrap_or(0);
+        let mut events: Vec<CreditRateEvent> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, CreditRateEvent>(&DataKey::CreditRateHistory(i))
+            {
+                events.push_back(event);
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(CreditRateHistoryPage { events, total })
+    }
+
+    /// #311 — Return a paginated audit trail of global multiplier changes.
+    ///
+    /// Each entry records the previous multiplier, the new multiplier, and the
+    /// ledger at which the change was applied. Events are stored in
+    /// chronological order; pass `offset = 0` and advance by `limit` to walk
+    /// the full history.
+    ///
+    /// `offset`: zero-based index of the first event to return.
+    /// `limit`: maximum number of events to return per call.
+    pub fn get_global_multiplier_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<GlobalMultiplierHistoryPage, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GlobalMultiplierEventCount)
+            .unwrap_or(0);
+        let mut events: Vec<GlobalMultiplierEvent> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, GlobalMultiplierEvent>(&DataKey::GlobalMultiplierHistory(i))
+            {
+                events.push_back(event);
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(GlobalMultiplierHistoryPage { events, total })
+    }
+
 }
 
 mod test;

@@ -18,10 +18,14 @@ Emitted by `create_pool` immediately after the new pool is deployed and initiali
 | :--- | :--- | :--- |
 | `pool_id` | `u32` | Monotonically assigned ID of the new pool. |
 | `pool_address` | `Address` | The deployed contract address of the new pool. |
+| `admin` | `Address` | The factory admin at creation time (fixed as the pool's admin). |
 | `asset` | `Address` | The token asset address being staked in the pool. |
 | `credit_rate` | `i128` | Per-ledger credit accrual rate, as passed to the pool's `initialize` (converted from `create_pool`'s caller-facing `daily_rate`). |
 | `global_multiplier` | `u32` | Boost multiplier applied to allocated stake, as passed to `initialize`. |
 | `min_lock_period` | `u32` | The minimum number of ledgers tokens must remain locked. |
+| `daily_rate` | `u128` | The originally requested daily rate, preserved before ledger conversion. |
+| `wasm_hash` | `BytesN<32>` | The WASM hash the pool was deployed from. |
+| `min_stake_amount` | `i128` | Resolved minimum stake actually passed to the pool's `initialize` (caller input after the dust-threshold default is applied). |
 
 ### `adm_xfr`
 Emitted by `transfer_admin` when the factory admin is rotated.
@@ -57,6 +61,17 @@ Emitted by `set_pool_wasm_hash` when the WASM hash used for *future* `create_poo
 | `old_hash` | `BytesN<32>` | The previous pool WASM hash. |
 | `new_hash` | `BytesN<32>` | The newly configured pool WASM hash. |
 
+### `ttl_ref`
+Emitted by `refresh_pool_ttls` after extending pool-record TTLs, so off-chain monitoring can track when each pool range was last refreshed.
+
+* **Topics:** `(Symbol, Symbol)` -> `(symbol_short!("factory"), symbol_short!("ttl_ref"))`
+* **Payload Structure (tuple order):**
+
+| Field | Rust Type | Description |
+| :--- | :--- | :--- |
+| `start_id` | `u32` | First pool ID in the refreshed range (inclusive). |
+| `end` | `u32` | One past the last pool ID in the refreshed range (exclusive). |
+
 ---
 
 ## 2. FarmingPool Contract (`soroban/contracts/farming-pool`)
@@ -85,6 +100,7 @@ Emitted by `unlock_assets` when a user withdraws assets from the pool.
 | :--- | :--- | :--- |
 | `user` | `Address` | The wallet address that unlocked assets. |
 | `amount` | `i128` | The quantity of assets withdrawn in this call. |
+| `credits_earned` | `i128` | The credits accrued and checkpointed during this unlock call (i.e. the delta since the previous checkpoint). |
 | `total_credits` | `i128` | The user's checkpointed total credit balance at the time of withdrawal. |
 
 ### `paused`
@@ -160,7 +176,8 @@ Emitted by `set_boost` when a user sets their allocation percentage.
 | Field | Rust Type | Description |
 | :--- | :--- | :--- |
 | `user` | `Address` | The user who set their boost allocation. |
-| `allocation_pct` | `u32` | The allocation percentage (1-100) applied. |
+| `old_allocation_pct` | `u32` | The previous allocation percentage (0 if user had no boost). |
+| `allocation_pct` | `u32` | The new allocation percentage (1-100) applied. |
 | `multiplier` | `u32` | The global multiplier in effect at the time of the call. |
 
 ### `mult_set` (boost)
@@ -173,8 +190,22 @@ Emitted by `set_global_multiplier`.
 
 ## 3. VestingWallet Contract (`soroban/contracts/vesting-wallet`)
 
+### `init`
+Emitted by `initialize` when the vesting schedule is created.
+
+* **Topics:** `(Symbol, Symbol)` -> `(symbol_short!("vest"), symbol_short!("init"))`
+* **Payload Structure (tuple order):**
+
+| Field | Rust Type | Description |
+| :--- | :--- | :--- |
+| `beneficiary` | `Address` | The beneficiary the schedule was created for. |
+| `token` | `Address` | The token being vested. |
+| `total_amount` | `i128` | Total amount pulled from `admin`. |
+| `start_ledger` | `u32` | Ledger at which linear vesting begins. |
+| `end_ledger` | `u32` | Ledger at which the full amount is vested. |
+
 ### `released`
-Emitted by `release` whenever a nonzero amount is transferred to the beneficiary.
+Emitted by `release` (and by `release_all`) whenever a nonzero amount is transferred to the beneficiary. A call with nothing to release emits nothing.
 
 * **Topics:** `(Symbol, Symbol)` -> `(symbol_short!("vest"), symbol_short!("released"))`
 * **Payload Structure (tuple order):**
@@ -183,6 +214,9 @@ Emitted by `release` whenever a nonzero amount is transferred to the beneficiary
 | :--- | :--- | :--- |
 | `beneficiary` | `Address` | The address that received the released tokens. |
 | `releasable` | `i128` | The amount transferred in this call. |
+| `released_total` | `i128` | The cumulative released total **after** this call. |
+
+See [`vesting-api.md`](vesting-api.md) for the full VestingWallet entry-point reference.
 
 ### `revoked`
 Emitted by `revoke` (admin-only, requires `revocable = true` and not already revoked).

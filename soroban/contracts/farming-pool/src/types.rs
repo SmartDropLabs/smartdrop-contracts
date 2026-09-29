@@ -22,6 +22,19 @@ pub enum PoolError {
     NoPendingAdmin = 11,
     /// Returned by `batch_add_to_whitelist` or `batch_remove_from_whitelist` when batch exceeds 50 users.
     BatchTooLarge = 12,
+    /// Returned when a supplied amount is zero or negative.
+    InvalidAmount = 13,
+    /// Returned when the user has no active locked position.
+    NoActivePosition = 14,
+    /// Returned when withdrawing more than the locked/staked balance.
+    InsufficientBalance = 15,
+    /// Returned when the minimum lock period has not elapsed yet.
+    LockPeriodNotElapsed = 16,
+    /// Returned when `set_boost` receives an `allocation_pct` outside 1-100.
+    InvalidAllocation = 17,
+    ExceedsMaxStake = 18,
+    /// Returned when `set_min_lock_period` exceeds `MAX_LOCK_PERIOD`.
+    InvalidLockPeriod = 19,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.
@@ -139,6 +152,35 @@ pub enum DataKey {
     TotalBankedCredits,
     /// Cumulative credits earned by a user across their entire lifetime.
     TotalCreditsEarned(Address),
+    /// Ordered list of all users with active stakes (persistent storage).
+    StakedUsers,
+    /// Ordered list of all users with active locked positions (persistent storage).
+    LockedUsers,
+    // ── History storage keys ────────────────────────────────────────────────
+    /// Global counter for whitelist events.
+    WhitelistEventCount,
+    /// Whitelist event by index (u32 -> WhitelistEvent).
+    WhitelistHistory(u32),
+    /// Global counter for boost events.
+    BoostEventCount,
+    /// Boost event by index (u32 -> BoostEvent).
+    BoostHistory(u32),
+    /// Global counter for stake/unstake/lock/unlock events.
+    StakeEventCount,
+    /// Stake event by index (u32 -> StakeEvent).
+    StakeHistory(u32),
+    /// Global counter for admin action events.
+    AdminActionCount,
+    /// Admin action event by index (u32 -> AdminActionEvent).
+    AdminActionHistory(u32),
+    /// Global counter for credit rate change events (#310).
+    CreditRateEventCount,
+    /// Credit rate change event by index (#310).
+    CreditRateHistory(u32),
+    /// Global counter for global multiplier change events (#311).
+    GlobalMultiplierEventCount,
+    /// Global multiplier change event by index (#311).
+    GlobalMultiplierHistory(u32),
 }
 
 /// Paginated response for `get_whitelisted_users`.
@@ -148,5 +190,149 @@ pub struct ListWhitelistedResponse {
     /// Whitelisted addresses in the requested page.
     pub users: Vec<Address>,
     /// Total number of whitelisted addresses.
+    pub total: u32,
+}
+
+/// Aggregate pool parameters returned by `get_pool_info` (Issue #395).
+///
+/// A pool overview previously needed several separate contract calls
+/// (`total_staked`, `credit_rate`, the global multiplier, the min lock
+/// period, the min stake amount and the paused flag), each paying its own
+/// invocation and TTL bump. This bundles the read-only pool configuration
+/// into one call for dashboards and analytics.
+///
+/// The issue text also names "total credits" and "number of stakers"; those
+/// are the maintained `total_distributed_credits` / `total_banked_credits`
+/// counters, included here so a full overview is a single round trip. There
+/// is no per-staker count kept in storage — staker counts are derived by
+/// paging `get_positions`, so no field for it is invented here.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolInfo {
+    /// Total value staked across all positions, in stroops.
+    pub total_staked: i128,
+    /// Credits earned banked by users but not yet withdrawn, in stroops.
+    pub total_banked_credits: i128,
+    /// Credits distributed to all users since initialization, in stroops.
+    pub total_distributed_credits: i128,
+    /// Current global credit rate.
+    pub credit_rate: i128,
+    /// Current global reward multiplier.
+    pub global_multiplier: u32,
+    /// Minimum lock period in ledgers.
+    pub min_lock_period: u32,
+    /// Minimum amount accepted by `stake`, in stroops.
+    pub min_stake_amount: i128,
+    /// Whether the pool is currently paused.
+    pub is_paused: bool,
+}
+
+// ─── History / audit trail types ─────────────────────────────────────────────
+
+/// A single whitelist change event (add or remove).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct WhitelistEvent {
+    pub user: Address,
+    pub added: bool,
+    pub ledger: u32,
+}
+
+/// A single boost allocation change event.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoostEvent {
+    pub user: Address,
+    pub old_allocation: u32,
+    pub new_allocation: u32,
+    pub ledger: u32,
+}
+
+/// A single stake/unstake/lock/unlock transaction event.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StakeEvent {
+    pub user: Address,
+    /// "stake", "unstake", "lock", "unlock", or "emergency"
+    pub action: soroban_sdk::Symbol,
+    pub amount: i128,
+    pub ledger: u32,
+}
+
+/// A single admin action event (parameter change, upgrade, pause, etc.).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminActionEvent {
+    /// What was changed: "credit_rate", "multiplier", "pause", "unpause",
+    /// "min_lock", "min_stake", "upgrade", "admin_transfer", "migrate",
+    /// "whitelist_enable", "whitelist_disable", "recover_credits"
+    pub action: soroban_sdk::Symbol,
+    pub admin: Address,
+    pub ledger: u32,
+}
+
+/// Paginated response for whitelist history queries.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct WhitelistHistoryPage {
+    pub events: Vec<WhitelistEvent>,
+    pub total: u32,
+}
+
+/// Paginated response for boost history queries.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoostHistoryPage {
+    pub events: Vec<BoostEvent>,
+    pub total: u32,
+}
+
+/// Paginated response for stake history queries.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StakeHistoryPage {
+    pub events: Vec<StakeEvent>,
+    pub total: u32,
+}
+
+/// Paginated response for admin action history queries.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminActionHistoryPage {
+    pub events: Vec<AdminActionEvent>,
+    pub total: u32,
+}
+
+/// A single credit rate change event (#310).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreditRateEvent {
+    pub old_rate: i128,
+    pub new_rate: i128,
+    pub ledger: u32,
+}
+
+/// Paginated response for credit rate history queries (#310).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreditRateHistoryPage {
+    pub events: Vec<CreditRateEvent>,
+    pub total: u32,
+}
+
+/// A single global multiplier change event (#311).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalMultiplierEvent {
+    pub old_multiplier: u32,
+    pub new_multiplier: u32,
+    pub ledger: u32,
+}
+
+/// Paginated response for global multiplier history queries (#311).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalMultiplierHistoryPage {
+    pub events: Vec<GlobalMultiplierEvent>,
     pub total: u32,
 }

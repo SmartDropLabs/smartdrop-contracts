@@ -1,5 +1,16 @@
 use soroban_sdk::{contracterror, contracttype, Address, BytesN, Vec};
 
+/// Parameters for creating one farming pool through `create_pools_batch`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolParams {
+    pub asset: Address,
+    pub daily_rate: u128,
+    pub global_multiplier: u32,
+    pub min_lock_period: u64,
+    pub min_stake_amount: i128,
+}
+
 /// Storage keys used by the factory contract.
 #[contracttype]
 pub enum DataKey {
@@ -15,6 +26,8 @@ pub enum DataKey {
     PoolCreationPaused,
     /// Pool IDs matching a specific asset address.
     AssetPools(Address),
+    /// Number of pools registered for a specific asset address.
+    AssetPoolCount(Address),
     /// Running count of admin transfers performed.
     AdminTransferCount,
     /// Running total of successful `upgrade_pool` calls, for version tracking (#258).
@@ -23,6 +36,8 @@ pub enum DataKey {
     PoolsByAdmin(Address),
     /// List of pool IDs currently running a specific WASM hash.
     PoolsByWasmHash(BytesN<32>),
+    /// Hashes explicitly approved by the factory admin for pool upgrades.
+    ApprovedWasmHash(BytesN<32>),
     /// Aggregate value locked across every pool, maintained incrementally by
     /// `sync_pool_tvl` so `total_tvl` is an O(1) read (#249).
     TotalTvl,
@@ -85,6 +100,30 @@ pub struct ListPoolsResponse {
     pub has_more: bool,
 }
 
+/// Result of a `refresh_pool_ttls` sweep (#393).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RefreshPoolTtlsResponse {
+    /// Pool IDs in the scanned range that had a record and were refreshed.
+    pub refreshed: Vec<u32>,
+    /// The scanned range's end (exclusive); pass as the next `start_id`.
+    pub end_id: u32,
+    /// Count of pool IDs in the scanned range with no record (gaps).
+    pub missing: u32,
+}
+
+/// Pool health status returned by `pool_status` (Issue #375).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolStatus {
+    /// Address of the pool contract.
+    pub address: Address,
+    /// Whether staking is currently paused in the pool.
+    pub is_paused: bool,
+    /// Current total amount staked in the pool.
+    pub total_staked: i128,
+}
+
 /// Typed errors returned by the factory contract.
 ///
 /// Using `#[contracterror]` exposes these as a stable on-chain error code so
@@ -136,10 +175,13 @@ pub enum FactoryError {
     InvalidWasmHash = 14,
     /// `create_pool`'s minimum lock period is below the minimum allowed threshold.
     MinLockPeriodTooShort = 15,
-    /// `initialize` was called with a zero-address admin, which would permanently lock the factory.
+    /// `initialize` was called with a zero-address admin, or `transfer_admin`
+    /// was called with a zero-address `new_admin`, which would permanently
+    /// lock the factory.
     InvalidAdmin = 16,
     /// A pool's TVL could not be read during `total_tvl` maintenance because the
     /// deployed pool did not answer the `total_staked` getter (e.g. a pool
     /// deployed from an older WASM that predates it).
     PoolQueryFailed = 17,
+    SameWasmHash = 18,
 }
