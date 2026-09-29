@@ -210,15 +210,18 @@ fn pool_salt(env: &Env, pool_id: u32) -> BytesN<32> {
 }
 
 fn validate_asset(env: &Env, asset: &Address) -> Result<(), FactoryError> {
-    let args: Vec<Val> = vec![&env, env.current_contract_address().into_val(env)];
-    match env.try_invoke_contract::<i128, soroban_sdk::Error>(
+    // Probe a read-only SEP-41 entry point (`symbol`) and require the address to
+    // answer it. An address that is not a deployed token contract never answers,
+    // so accepting that case (the previous `Err(_) => Ok(())` fallback) let a
+    // plain account or unrelated contract be registered as a pool's staking
+    // asset (#430).
+    match env.try_invoke_contract::<Val, soroban_sdk::Error>(
         asset,
-        &Symbol::new(env, "balance"),
-        args,
+        &Symbol::new(env, "symbol"),
+        vec![env],
     ) {
-        Ok(Ok(balance)) if balance >= 0 => Ok(()),
-        Ok(_) => Err(FactoryError::InvalidAsset),
-        Err(_) => Ok(()),
+        Ok(Ok(_)) => Ok(()),
+        _ => Err(FactoryError::InvalidAsset),
     }
 }
 
