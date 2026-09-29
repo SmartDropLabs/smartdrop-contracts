@@ -2406,6 +2406,14 @@ impl FarmingPool {
         Self::total_distributed_credits(env)
     }
 
+    /// Return the total credits earned across users and staking systems.
+    ///
+    /// Accrual is included when a user's stake or position is checkpointed;
+    /// uncheckpointed accrual remains available through the per-user queries.
+    pub fn get_total_earned(env: Env) -> Result<i128, PoolError> {
+        Self::total_distributed_credits(env)
+    }
+
     /// Aggregate pool overview in a single invocation (Issue #395).
     ///
     /// A pool dashboard previously needed up to six separate reads
@@ -2588,6 +2596,30 @@ impl FarmingPool {
 
     pub fn get_whitelist_count(env: Env) -> Result<u32, PoolError> {
         Self::whitelist_count(env)
+    }
+
+    /// Return a zero-based page of distinct users with an active stake or locked position.
+    pub fn get_stakers(env: Env, start: u32, limit: u32) -> Result<Vec<Address>, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let mut all = get_staked_users_list(&env);
+        for user in get_locked_users_list(&env).iter() {
+            if !all.contains(&user) {
+                all.push_back(user);
+            }
+        }
+
+        let mut page = Vec::new(&env);
+        let mut index = start;
+        let mut count = 0u32;
+        while index < all.len() && count < limit {
+            page.push_back(all.get(index).unwrap());
+            index += 1;
+            count += 1;
+        }
+
+        Ok(page)
     }
 
     /// Return a paginated list of all users with active stakes.

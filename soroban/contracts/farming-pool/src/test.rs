@@ -247,6 +247,19 @@ fn test_total_distributed_credits_starts_at_zero() {
 }
 
 #[test]
+fn test_get_total_earned_counts_credits_when_checkpointed() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+
+    assert_eq!(t.client.get_credits(&t.user), 10_000);
+    assert_eq!(t.client.get_total_earned(), 0);
+
+    t.client.unstake(&t.user, &1_000);
+    assert_eq!(t.client.get_total_earned(), 10_000);
+}
+
+#[test]
 fn test_total_distributed_credits_counts_banked_stake_accrual_on_checkpoint() {
     let t = setup(2, 1);
     t.client.stake(&t.user, &1_000);
@@ -1923,6 +1936,26 @@ fn test_get_user_position_none_after_full_unlock() {
     advance_ledgers(&t.env, 5);
     t.client.unlock_assets(&t.user, &1_000);
     assert!(t.client.get_user_position(&t.user).is_none());
+}
+
+#[test]
+fn test_get_stakers_pages_distinct_flexible_and_locked_users() {
+    let t = setup(1, 1);
+    let locked_only_user = Address::generate(&t.env);
+    t.token_sac.mint(&locked_only_user, &1_000_000);
+
+    t.client.stake(&t.user, &1_000);
+    t.client.lock_assets(&t.user, &500);
+    t.client.lock_assets(&locked_only_user, &500);
+
+    let first_page = t.client.get_stakers(&0, &1);
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page.get(0), Some(t.user.clone()));
+
+    let second_page = t.client.get_stakers(&1, &1);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page.get(0), Some(locked_only_user));
+    assert!(t.client.get_stakers(&2, &10).is_empty());
 }
 
 // ── pause / unpause tests ─────────────────────────────────────────────────────
