@@ -483,6 +483,20 @@ fn test_effective_stake_full_allocation_2x() {
 }
 
 #[test]
+fn test_effective_stake_full_allocation_3x() {
+    // 100% allocation at 3× multiplier: all principal is boosted.
+    let stake = compute_total_stake(1_000, 100, 3);
+    assert_eq!(stake, 3_000);
+}
+
+#[test]
+fn test_effective_stake_full_allocation_1x_has_no_gain() {
+    // 100% allocation at 1× multiplier should behave like no boost.
+    let stake = compute_total_stake(1_000, 100, 1);
+    assert_eq!(stake, 1_000);
+}
+
+#[test]
 fn test_effective_stake_half_allocation_2x() {
     // 50% allocation at 2×: principal = 500, virtual = 500*2 = 1000. total = 1500.
     let stake = compute_total_stake(1_000, 50, 2);
@@ -589,6 +603,25 @@ fn test_boost_update_preserves_previously_earned_credits() {
 }
 
 #[test]
+fn test_boost_change_checkpoints_old_rate_across_long_window() {
+    // This mirrors the bounty invariant: 500 ledgers unboosted, then 500 ledgers
+    // at 50% allocation with a 2× multiplier. Credits from the first window must
+    // not be retroactively recalculated after the boost is applied.
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+    advance_ledgers(&t.env, 500);
+    t.client.set_boost(&t.user, &50u32);
+    advance_ledgers(&t.env, 500);
+
+    let unboosted_window = 1_000 * 500;
+    let boosted_window = 1_500 * 500;
+    assert_eq!(
+        t.client.get_credits(&t.user),
+        unboosted_window + boosted_window
+    );
+}
+
+#[test]
 fn test_boost_can_be_updated_repeatedly_without_losing_credits() {
     // 10 ledgers at 50% boost (effective 1500), then 10 at 100% (effective 2000).
     let t = setup(2, 1);
@@ -629,6 +662,29 @@ fn test_set_boost_rejects_over_100_allocation() {
 }
 
 #[test]
+fn test_set_boost_emits_boost_applied_event() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &50u32);
+
+    assert_eq!(
+        t.env.events().all(),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("boost").into_val(&t.env),
+                    soroban_sdk::symbol_short!("applied").into_val(&t.env)
+                ],
+                (t.user.clone(), 0u32, 50u32, 2u32).into_val(&t.env),
+            )
+        ]
+    );
+}
+
+#[test]
 fn test_admin_sets_global_multiplier() {
     let t = setup(2, 1);
     t.client.set_global_multiplier(&3u32);
@@ -638,6 +694,51 @@ fn test_admin_sets_global_multiplier() {
     let cfg = t.client.get_boost_config(&t.user).unwrap();
     assert_eq!(cfg.multiplier, 3);
 }
+
+#[test]
+fn test_set_global_multiplier_emits_mult_set_event() {
+    let t = setup(2, 1);
+    t.client.set_global_multiplier(&3u32);
+
+    assert_eq!(
+        t.env.events().all(),
+        soroban_sdk::vec![
+            &t.env,
+            (
+                t.contract_id.clone(),
+                soroban_sdk::vec![
+                    &t.env,
+                    soroban_sdk::symbol_short!("boost").into_val(&t.env),
+                    soroban_sdk::symbol_short!("mult_set").into_val(&t.env)
+                ],
+                (2u32, 3u32).into_val(&t.env),
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_set_global_multiplier_requires_admin_auth() {
+    let (env, contract_id, client, _admin, user) = setup_without_mocked_auth();
+
+    let result = client
+        .mock_auths(&[MockAuth {
+            address: &user,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_global_multiplier",
+                args: (&3u32,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_set_global_multiplier(&3u32);
+
+    assert!(
+        result.is_err(),
+        "non-admin set_global_multiplier must be rejected"
+    );
+}
+
 
 #[test]
 fn test_get_pool_info_aggregates_pool_parameters() {
@@ -901,6 +1002,24 @@ fn test_admin_multiplier_change_applies_to_existing_stake_without_manual_checkpo
 }
 
 #[test]
+fn test_global_multiplier_change_does_not_retroactively_alter_banked_credits() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+    t.client.set_boost(&t.user, &50u32);
+    advance_ledgers(&t.env, 20);
+
+    t.client.set_boost(&t.user, &50u32); // checkpoints 30_000 at 2×
+    t.client.set_global_multiplier(&3u32);
+    // Explicitly adopt the new multiplier at the same-ledger checkpoint,
+    // as required by the per-stake snapshot contract.
+    t.client.set_boost(&t.user, &50u32);
+    assert_eq!(t.client.get_credits(&t.user), 30_000);
+
+    advance_ledgers(&t.env, 1);
+    assert_eq!(t.client.get_credits(&t.user), 32_000);
+}
+
+#[test]
 fn test_get_credits_matches_checkpoint_accrual_after_multiplier_change() {
     // Regression for #223: get_credits and checkpoint must use the same
     // multiplier source, so an un-checkpointed read equals exactly what the
@@ -1137,6 +1256,74 @@ fn test_get_position_credits_and_get_stake_credits_distinguish_systems() {
 
     // Combined get_credits = 5_000 + 15_000 = 20_000
     assert_eq!(t.client.get_credits(&t.user), 20_000);
+}
+
+#[test]
+fn test_get_credits_increases_monotonically_with_ledger_advancement() {
+    let t = setup(2, 1);
+    t.client.stake(&t.user, &1_000);
+
+    advance_ledgers(&t.env, 3);
+    let first = t.client.get_credits(&t.user);
+    advance_ledgers(&t.env, 7);
+    let second = t.client.get_credits(&t.user);
+
+    assert_eq!(first, 3_000);
+    assert_eq!(second, 10_000);
+    assert!(second > first);
+}
+
+#[test]
+fn test_boosted_stake_earns_more_than_unboosted_same_amount() {
+    let t = setup(2, 1);
+    let boosted = t.user.clone();
+    let unboosted = Address::generate(&t.env);
+    t.token_sac.mint(&unboosted, &1_000_000i128);
+
+    t.client.stake(&boosted, &1_000);
+    t.client.set_boost(&boosted, &50u32);
+    t.client.stake(&unboosted, &1_000);
+    advance_ledgers(&t.env, 10);
+
+    assert_eq!(t.client.get_credits(&unboosted), 10_000);
+    assert_eq!(t.client.get_credits(&boosted), 15_000);
+    assert!(t.client.get_credits(&boosted) > t.client.get_credits(&unboosted));
+}
+
+#[test]
+fn test_combined_credits_equal_stake_and_position_credits() {
+    // The aggregate view includes both position types; the dedicated views
+    // expose each component independently without double-counting it.
+    let t = setup(2, 1);
+
+    t.client.lock_assets(&t.user, &1_000);
+    advance_ledgers(&t.env, 10);
+    assert_eq!(t.client.calculate_credits(&t.user), 10_000);
+    assert_eq!(t.client.get_position_credits(&t.user), 10_000);
+    assert_eq!(t.client.get_stake_credits(&t.user), 0);
+    assert_eq!(t.client.get_credits(&t.user), 10_000);
+
+    t.client.stake(&t.user, &500);
+    advance_ledgers(&t.env, 10);
+    assert_eq!(t.client.calculate_credits(&t.user), 20_000);
+    assert_eq!(t.client.get_position_credits(&t.user), 20_000);
+    assert_eq!(t.client.get_stake_credits(&t.user), 5_000);
+    assert_eq!(t.client.get_credits(&t.user), 25_000);
+}
+
+#[test]
+fn test_stake_unstake_round_trip_restores_balance_and_clears_stake() {
+    let t = setup(2, 1);
+    let initial_balance = t.token.balance(&t.user);
+
+    t.client.stake(&t.user, &2_500);
+    assert_eq!(t.token.balance(&t.user), initial_balance - 2_500);
+    advance_ledgers(&t.env, 4);
+
+    let credits = t.client.unstake(&t.user, &2_500);
+    assert_eq!(credits, 10_000);
+    assert_eq!(t.token.balance(&t.user), initial_balance);
+    assert!(t.client.get_stake(&t.user).is_none());
 }
 
 // ── lock_assets tests ─────────────────────────────────────────────────────────
