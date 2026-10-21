@@ -4733,3 +4733,143 @@ fn test_get_multiplier_change_ledger_tracks_last_change() {
     t.client.set_global_multiplier(&3u32);
     assert_eq!(t.client.get_multiplier_change_ledger(), second_change);
 }
+
+// ── Feature improvements: #574, #575, #576, #577 ──────────────────────────────
+
+#[test]
+fn test_get_global_multiplier_tracks_current_value() {
+    let t = setup(1, 10);
+    assert_eq!(t.client.get_global_multiplier(), 1);
+    assert_eq!(t.client.global_multiplier(), 1);
+
+    t.client.set_global_multiplier(&5u32);
+    assert_eq!(t.client.get_global_multiplier(), 5);
+    assert_eq!(t.client.global_multiplier(), 5);
+
+    t.client.set_global_multiplier(&2u32);
+    assert_eq!(t.client.get_global_multiplier(), 2);
+    assert_eq!(t.client.global_multiplier(), 2);
+}
+
+#[test]
+fn test_global_multiplier_uninitialized() {
+    let (_env, client, _user) = setup_uninitialized();
+    assert!(matches!(
+        client.try_get_global_multiplier(),
+        Err(Ok(PoolError::NotInitialized))
+    ));
+    assert!(matches!(
+        client.try_global_multiplier(),
+        Err(Ok(PoolError::NotInitialized))
+    ));
+}
+
+#[test]
+fn test_get_multiplier_change_count_increments_per_change() {
+    let t = setup(1, 10);
+    assert_eq!(t.client.get_multiplier_change_count(), 0);
+    assert_eq!(t.client.multiplier_change_count(), 0);
+
+    t.client.set_global_multiplier(&2u32);
+    assert_eq!(t.client.get_multiplier_change_count(), 1);
+    assert_eq!(t.client.multiplier_change_count(), 1);
+
+    t.client.set_global_multiplier(&3u32);
+    assert_eq!(t.client.get_multiplier_change_count(), 2);
+    assert_eq!(t.client.multiplier_change_count(), 2);
+
+    t.client.set_global_multiplier(&5u32);
+    assert_eq!(t.client.get_multiplier_change_count(), 3);
+    assert_eq!(t.client.multiplier_change_count(), 3);
+}
+
+#[test]
+fn test_multiplier_change_count_uninitialized() {
+    let (_env, client, _user) = setup_uninitialized();
+    assert!(matches!(
+        client.try_get_multiplier_change_count(),
+        Err(Ok(PoolError::NotInitialized))
+    ));
+    assert!(matches!(
+        client.try_multiplier_change_count(),
+        Err(Ok(PoolError::NotInitialized))
+    ));
+}
+
+#[test]
+fn test_is_position_unlocked_lifecycle() {
+    let t = setup(1, 1);
+    // User with no position is not unlocked
+    assert!(!t.client.is_position_unlocked(&t.user));
+
+    // Lock assets with min lock period = 10 ledgers
+    t.client.set_min_lock_period(&10u32);
+    t.client.lock_assets(&t.user, &500i128);
+
+    // Immediately after lock, position is locked
+    assert!(!t.client.is_position_unlocked(&t.user));
+
+    // Advance 9 ledgers (still locked)
+    advance_ledgers(&t.env, 9);
+    assert!(!t.client.is_position_unlocked(&t.user));
+
+    // Advance 1 more ledger (now reaches unlock_ledger)
+    advance_ledgers(&t.env, 1);
+    assert!(t.client.is_position_unlocked(&t.user));
+
+    // Advance further past unlock_ledger
+    advance_ledgers(&t.env, 5);
+    assert!(t.client.is_position_unlocked(&t.user));
+
+    // Unlock assets completely -> position removed
+    t.client.unlock_assets(&t.user, &500i128);
+    assert!(!t.client.is_position_unlocked(&t.user));
+}
+
+#[test]
+fn test_is_position_unlocked_uninitialized() {
+    let (_env, client, user) = setup_uninitialized();
+    assert!(matches!(
+        client.try_is_position_unlocked(&user),
+        Err(Ok(PoolError::NotInitialized))
+    ));
+}
+
+#[test]
+fn test_get_position_remaining_lock_countdown() {
+    let t = setup(1, 1);
+    // User with no position has 0 remaining lock
+    assert_eq!(t.client.get_position_remaining_lock(&t.user), 0);
+
+    // Lock assets with min lock period = 20 ledgers
+    t.client.set_min_lock_period(&20u32);
+    t.client.lock_assets(&t.user, &500i128);
+
+    // Immediately after lock, 20 ledgers remain
+    assert_eq!(t.client.get_position_remaining_lock(&t.user), 20);
+
+    // Advance 5 ledgers -> 15 remain
+    advance_ledgers(&t.env, 5);
+    assert_eq!(t.client.get_position_remaining_lock(&t.user), 15);
+
+    // Advance 15 ledgers -> 0 remain
+    advance_ledgers(&t.env, 15);
+    assert_eq!(t.client.get_position_remaining_lock(&t.user), 0);
+
+    // Advance 10 more ledgers -> still 0 (saturating at 0, no underflow)
+    advance_ledgers(&t.env, 10);
+    assert_eq!(t.client.get_position_remaining_lock(&t.user), 0);
+
+    // Unlock assets completely -> 0 remaining
+    t.client.unlock_assets(&t.user, &500i128);
+    assert_eq!(t.client.get_position_remaining_lock(&t.user), 0);
+}
+
+#[test]
+fn test_get_position_remaining_lock_uninitialized() {
+    let (_env, client, user) = setup_uninitialized();
+    assert!(matches!(
+        client.try_get_position_remaining_lock(&user),
+        Err(Ok(PoolError::NotInitialized))
+    ));
+}

@@ -201,6 +201,13 @@ fn read_global_multiplier_change_ledger(env: &Env) -> u32 {
         .unwrap_or(0)
 }
 
+fn read_global_multiplier_change_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::GlobalMultiplierEventCount)
+        .unwrap_or(0)
+}
+
 fn read_schema_version(env: &Env) -> u32 {
     env.storage()
         .instance()
@@ -1468,6 +1475,9 @@ impl FarmingPool {
             .checked_add(amount)
             .ok_or(PoolError::ExceedsMaxStake)?;
         read_total_locked(&env)
+            .checked_add(amount)
+            .ok_or(PoolError::ExceedsMaxStake)?;
+        read_total_deposits(&env)
             .checked_add(amount)
             .ok_or(PoolError::ExceedsMaxStake)?;
 
@@ -3588,6 +3598,60 @@ impl FarmingPool {
         bump_instance(&env);
 
         Ok(read_global_multiplier_change_ledger(&env))
+    }
+
+    // ── Feature improvements: #574, #575, #576, #577 ───────────────────────
+
+    /// Return the current global reward multiplier (Feature 21 improvement, Issue #574).
+    pub fn global_multiplier(env: Env) -> Result<u32, PoolError> {
+        Self::get_global_multiplier(env)
+    }
+
+    /// Return the current global reward multiplier (Feature 21 improvement, Issue #574).
+    pub fn get_global_multiplier(env: Env) -> Result<u32, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        Ok(read_global_multiplier(&env))
+    }
+
+    /// Return the total number of global multiplier changes recorded (Feature 22 improvement, Issue #575).
+    pub fn multiplier_change_count(env: Env) -> Result<u32, PoolError> {
+        Self::get_multiplier_change_count(env)
+    }
+
+    /// Return the total number of global multiplier changes recorded (Feature 22 improvement, Issue #575).
+    pub fn get_multiplier_change_count(env: Env) -> Result<u32, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        Ok(read_global_multiplier_change_count(&env))
+    }
+
+    /// Return whether `user` has an active locked position that has reached or passed its unlock ledger (Feature 23 improvement, Issue #576).
+    pub fn is_position_unlocked(env: Env, user: Address) -> Result<bool, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        if let Some(pos) = get_position(&env, &user) {
+            let current = env.ledger().sequence();
+            Ok(current >= pos.unlock_ledger)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Return the number of ledgers remaining until `user`'s locked position matures (Feature 24 improvement, Issue #577).
+    pub fn get_position_remaining_lock(env: Env, user: Address) -> Result<u32, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        if let Some(pos) = get_position(&env, &user) {
+            let current = env.ledger().sequence();
+            Ok(pos.unlock_ledger.saturating_sub(current))
+        } else {
+            Ok(0)
+        }
     }
 }
 

@@ -506,6 +506,18 @@
                       "val": {
                         "i128": "0"
                       }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "UniqueUserCount"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 2
+                      }
                     }
                   ]
                 }
