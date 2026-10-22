@@ -100,8 +100,7 @@ fn test_release_rejects_when_wallet_balance_is_insufficient() {
 
     // Simulate an underfunded wallet (for example, tokens recovered by an
     // administrator). The release must fail before updating ReleasedAmount.
-    t.token
-        .transfer(&t.contract_id, &t.admin, &600i128);
+    t.token.transfer(&t.contract_id, &t.admin, &600i128);
 
     assert_eq!(
         t.client.try_release(),
@@ -1104,9 +1103,7 @@ fn test_transfer_beneficiary_rejects_the_zero_address() {
     let t = setup(0, 200, 1_000);
     let good = Address::generate(&t.env);
 
-    let rejected = t
-        .client
-        .try_transfer_beneficiary(&zero_address(&t.env));
+    let rejected = t.client.try_transfer_beneficiary(&zero_address(&t.env));
     assert!(
         matches!(rejected, Err(Ok(VestingError::InvalidInput))),
         "transfer_beneficiary must reject the zero address, which could strand the funds"

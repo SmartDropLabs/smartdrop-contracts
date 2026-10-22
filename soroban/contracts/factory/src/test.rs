@@ -13,6 +13,20 @@ use soroban_sdk::{
 
 use farming_pool::FarmingPoolClient;
 
+/// A test-only contract that answers SEP-41 `symbol` but has no `balance`
+/// entry point. Used to prove `validate_asset` rejects half-implemented token
+/// interfaces rather than treating any `symbol` responder as a stake asset
+/// (#542).
+#[contract]
+pub struct SymbolOnlyToken;
+
+#[contractimpl]
+impl SymbolOnlyToken {
+    pub fn symbol(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "FAKE")
+    }
+}
+
 // The contract crate is `#![no_std]`; these tests assert on `std` collection
 // types, so the shim is declared here (same as farming-pool's tests).
 extern crate std;
@@ -1464,6 +1478,73 @@ fn test_create_pool_rejects_factory_address_as_asset() {
         .client
         .try_create_pool(&t.factory_addr, &1_728_000u128, &2u32, &25u64, &0i128);
     assert_eq!(result, Err(Ok(FactoryError::InvalidAsset)));
+    assert_eq!(t.client.pool_count(), 0);
+}
+
+#[test]
+fn test_create_pool_rejects_min_stake_amount_below_negative_max() {
+    let t = setup();
+    let asset = test_asset(&t.env);
+
+    let result = t.client.try_create_pool(
+        &asset,
+        &1_728_000u128,
+        &2u32,
+        &25u64,
+        &(0i128 - MAX_STAKE_AMOUNT - 1),
+    );
+    assert_eq!(result, Err(Ok(FactoryError::InvalidMinStakeAmount)));
+    assert_eq!(t.client.pool_count(), 0);
+}
+
+#[test]
+fn test_create_pool_rejects_i128_min_min_stake_amount() {
+    let t = setup();
+    let asset = test_asset(&t.env);
+
+    let result = t
+        .client
+        .try_create_pool(&asset, &1_728_000u128, &2u32, &25u64, &i128::MIN);
+    assert_eq!(result, Err(Ok(FactoryError::InvalidMinStakeAmount)));
+    assert_eq!(t.client.pool_count(), 0);
+}
+
+#[test]
+fn test_create_pool_rejects_asset_equal_to_admin() {
+    let t = setup();
+    let asset = test_asset(&t.env);
+
+    // Point the factory admin at the token contract so `asset == admin`, then
+    // confirm the pool is refused rather than deployed with a token-controlled
+    // admin (#541).
+    t.client.transfer_admin(&asset);
+    t.env.mock_all_auths();
+
+    let result = t
+        .client
+        .try_create_pool(&asset, &1_728_000u128, &2u32, &25u64, &0i128);
+    assert_eq!(result, Err(Ok(FactoryError::InvalidAsset)));
+    assert_eq!(t.client.pool_count(), 0);
+}
+
+#[test]
+fn test_create_pool_rejects_asset_without_balance_entry_point() {
+    let t = setup();
+    let asset = t.env.register(SymbolOnlyToken, ());
+
+    let result = t
+        .client
+        .try_create_pool(&asset, &1_728_000u128, &2u32, &25u64, &0i128);
+    assert_eq!(result, Err(Ok(FactoryError::InvalidAsset)));
+    assert_eq!(t.client.pool_count(), 0);
+}
+
+#[test]
+fn test_create_pools_batch_rejects_empty_batch() {
+    let t = setup();
+
+    let result = t.client.try_create_pools_batch(&vec![&t.env]);
+    assert_eq!(result, Err(Ok(FactoryError::EmptyBatch)));
     assert_eq!(t.client.pool_count(), 0);
 }
 

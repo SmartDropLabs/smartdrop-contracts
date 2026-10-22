@@ -188,6 +188,10 @@ pub enum FactoryError {
     /// threshold, which would trap staked funds for an effectively permanent
     /// window.
     MinLockPeriodAboveCeiling = 19,
+    /// `create_pools_batch` was called with an empty `pools` vector, which
+    /// would consume admin authorization and bump instance TTL while creating
+    /// nothing.
+    EmptyBatch = 20,
     /// `create_pools_batch` was called with more entries than `MAX_BATCH_SIZE`.
     BatchTooLarge = 20,
 }

@@ -248,6 +248,18 @@ fn validate_asset(env: &Env, asset: &Address) -> Result<(), FactoryError> {
         &Symbol::new(env, "symbol"),
         vec![env],
     ) {
+        Ok(Ok(_)) => {}
+        _ => return Err(FactoryError::InvalidAsset),
+    }
+    // Validation 49: Also require the SEP-41 `balance` entry point. A contract
+    // that answers `symbol` but not `balance` cannot support staking, because
+    // `stake`/`lock_assets` read the caller's token balance before transferring
+    // (#542).
+    match env.try_invoke_contract::<i128, soroban_sdk::Error>(
+        asset,
+        &Symbol::new(env, "balance"),
+        (env.current_contract_address(),).into_val(env),
+    ) {
         Ok(Ok(_)) => Ok(()),
         _ => Err(FactoryError::InvalidAsset),
     }
@@ -351,6 +363,14 @@ fn create_pool_inner(
         return Err(FactoryError::InvalidAsset);
     }
 
+    // Validation 48: Ensure the staking asset is not also the pool admin. A
+    // pool administered by its own staking token cannot authorize admin
+    // actions (pause, upgrade, multiplier changes), leaving the pool
+    // unmanageable (#541).
+    if asset == admin {
+        return Err(FactoryError::InvalidAsset);
+    }
+
     // Validation 24: Ensure global_multiplier is strictly within bounds
     // Must be at least 1 and at most MAX_GLOBAL_MULTIPLIER (1000)
     if global_multiplier < 1 {
@@ -393,6 +413,13 @@ fn create_pool_inner(
     // non-positive defaulting logic, so a clearly out-of-range request is
     // refused at the boundary (#536-#539).
     if min_stake_amount > MAX_STAKE_AMOUNT {
+        return Err(FactoryError::InvalidMinStakeAmount);
+    }
+    // Validation 47: Reject an undersized raw min_stake_amount (magnitude
+    // beyond MAX_STAKE_AMOUNT on the negative side) before the non-positive
+    // defaulting logic. A value like `i128::MIN` is corrupt input, not a
+    // request to use the dust default (#540).
+    if min_stake_amount < -MAX_STAKE_AMOUNT {
         return Err(FactoryError::InvalidMinStakeAmount);
     }
     let effective_min_stake = if min_stake_amount <= 0 {
@@ -1572,6 +1599,11 @@ impl Factory {
         validate_factory_admin(&env, &admin)?;
         admin.require_auth();
 
+        // Validation 50: Reject an empty batch before any work is done. A
+        // zero-length request consumes admin authorization and bumps instance
+        // TTL while creating nothing (#543).
+        if pools.is_empty() {
+            return Err(FactoryError::EmptyBatch);
         // Validation 35: Cap the batch size before any pool is deployed. Each
         // entry triggers a WASM deploy inside `create_pool_inner`, so an
         // unbounded batch can exhaust the transaction's resource budget and

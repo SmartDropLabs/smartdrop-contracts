@@ -277,11 +277,7 @@ impl VestingWallet {
             .instance()
             .set(&DataKey::ReleasedAmount, &(released + releasable));
 
-        token_client.transfer(
-            &env.current_contract_address(),
-            &beneficiary,
-            &releasable,
-        );
+        token_client.transfer(&env.current_contract_address(), &beneficiary, &releasable);
 
         #[allow(deprecated)]
         env.events().publish(
