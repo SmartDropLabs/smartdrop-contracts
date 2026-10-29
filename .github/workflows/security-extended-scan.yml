@@ -1,0 +1,237 @@
+name: Extended Security Scan
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  security-scan:
+    name: Scan for malware, secrets & supply-chain abuse
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run extended security scan
+        shell: bash
+        run: |
+          set +e
+          FAIL=0
+
+          flag() { echo "::error file=$1::$2"; FAIL=1; }
+          warn() { echo "::warning file=$1::$2"; }
+
+          # ── 1. Hardcoded private keys & certificates ─────────────────────────
+          echo "--- Check 1: hardcoded private keys ---"
+          while IFS= read -r match; do
+            [ -z "$match" ] && continue
+            file=$(echo "$match" | cut -d: -f1)
+            flag "$file" "Hardcoded private key or certificate found — never commit private keys to source control"
+          done < <(
+            grep -rn \
+              -e '-----BEGIN RSA PRIVATE KEY-----' \
+              -e '-----BEGIN EC PRIVATE KEY-----' \
+              -e '-----BEGIN OPENSSH PRIVATE KEY-----' \
+              -e '-----BEGIN PGP PRIVATE KEY BLOCK-----' \
+              -e '-----BEGIN PRIVATE KEY-----' \
+              -e '-----BEGIN DSA PRIVATE KEY-----' \
+              . 2>/dev/null | grep -v '^\./.git/' | grep -v '\.pub$'
+          )
+
+          # ── 2. Hardcoded secrets & tokens ────────────────────────────────────
+          echo "--- Check 2: hardcoded secrets and tokens ---"
+          while IFS= read -r match; do
+            [ -z "$match" ] && continue
+            file=$(echo "$match" | cut -d: -f1)
+            flag "$file" "Potential hardcoded secret or token: $match"
+          done < <(
+            grep -rniE \
+              -e '(aws_access_key_id|aws_secret_access_key)\s*=\s*[A-Za-z0-9/+]{16,}' \
+              -e 'ghp_[A-Za-z0-9]{36}' \
+              -e 'github_pat_[A-Za-z0-9_]{82}' \
+              -e 'ghs_[A-Za-z0-9]{36}' \
+              -e 'sk-[A-Za-z0-9]{48}' \
+              -e 'npm_[A-Za-z0-9]{36}' \
+              -e 'PRIVATE_KEY\s*=\s*["\x27]S[A-Z0-9]{55}["\x27]' \
+              --include='*.js' --include='*.ts' --include='*.mjs' --include='*.cjs' \
+              --include='*.env' --include='*.json' --include='*.yaml' --include='*.yml' \
+              --include='*.sh' --include='*.toml' \
+              . 2>/dev/null | grep -v '^\./.git/'
+          )
+
+          # ── 3. Committed .env files ──────────────────────────────────────────
+          echo "--- Check 3: committed .env files with real values ---"
+          find . -name '.env' ! -name '.env.example' ! -name '.env.sample' \
+            ! -name '.env.template' ! -path '*/.git/*' 2>/dev/null | while read -r f; do
+            if grep -qvE '^\s*(#|$)' "$f" 2>/dev/null; then
+              flag "$f" ".env file with non-comment content committed — rotate any secrets in this file"
+            fi
+          done
+
+          # ── 4. Obfuscated / eval-based code execution ────────────────────────
+          echo "--- Check 4: obfuscated code patterns ---"
+          while IFS= read -r match; do
+            [ -z "$match" ] && continue
+            file=$(echo "$match" | cut -d: -f1)
+            flag "$file" "Obfuscated code execution pattern: $match"
+          done < <(
+            grep -rnE \
+              -e 'eval\s*\(\s*(atob|Buffer\.from|unescape)\s*\(' \
+              -e '\bFunction\s*\(\s*["\x27][^\)]{0,20}["\x27]\s*\)\s*\(' \
+              -e 'String\.fromCharCode\s*\([0-9, ]{40,}\)' \
+              -e '\\x[0-9a-fA-F]{2}(\\x[0-9a-fA-F]{2}){15,}' \
+              --include='*.js' --include='*.ts' --include='*.mjs' --include='*.cjs' \
+              . 2>/dev/null | grep -v '^\./.git/' | grep -v '/node_modules/'
+          )
+
+          # ── 5. Network exfiltration to raw IP addresses ──────────────────────
+          echo "--- Check 5: fetch/request to hardcoded IP addresses ---"
+          while IFS= read -r match; do
+            [ -z "$match" ] && continue
+            file=$(echo "$match" | cut -d: -f1)
+            flag "$file" "Network call to a raw IP address — likely exfiltration or C2: $match"
+          done < <(
+            grep -rnE \
+              '(fetch|axios|http\.get|http\.request|https\.get|https\.request|WebSocket|new\s+WebSocket)\s*\(\s*["\x27]https?://[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' \
+              --include='*.js' --include='*.ts' --include='*.mjs' --include='*.cjs' \
+              . 2>/dev/null | grep -v '^\./.git/' | grep -v '/node_modules/'
+          )
+
+          # ── 6. Crypto miner indicators ────────────────────────────────────────
+          echo "--- Check 6: crypto miner patterns ---"
+          while IFS= read -r match; do
+            [ -z "$match" ] && continue
+            file=$(echo "$match" | cut -d: -f1)
+            flag "$file" "Crypto miner indicator found: $match"
+          done < <(
+            grep -rnEi \
+              -e 'stratum\+tcp://' \
+              -e '(coinhive|cryptonight|xmrig|minero|monero\.pool|nanopool\.org|f2pool|antpool|nicehash)' \
+              -e 'CoinHive\.Anonymous' \
+              --include='*.js' --include='*.ts' --include='*.mjs' --include='*.cjs' --include='*.json' \
+              . 2>/dev/null | grep -v '^\./.git/' | grep -v '/node_modules/'
+          )
+
+          # ── 7. Reverse shell / backdoor patterns ─────────────────────────────
+          echo "--- Check 7: reverse shell and backdoor patterns ---"
+          while IFS= read -r match; do
+            [ -z "$match" ] && continue
+            file=$(echo "$match" | cut -d: -f1)
+            flag "$file" "Reverse shell or backdoor pattern: $match"
+          done < <(
+            grep -rnE \
+              -e "require\s*\(\s*['\"]child_process['\"]\s*\).*\b(exec|execSync|spawn|spawnSync)\b.*(/bin/sh|/bin/bash|cmd\.exe|powershell)" \
+              -e 'net\.connect\s*\(\s*[0-9]+\s*,\s*["\x27][0-9]{1,3}\.' \
+              -e '(nc|ncat|netcat)\s+-[el].*[0-9]+\s+[0-9]{1,3}\.' \
+              --include='*.js' --include='*.ts' --include='*.mjs' --include='*.cjs' --include='*.sh' \
+              . 2>/dev/null | grep -v '^\./.git/' | grep -v '/node_modules/'
+          )
+
+          # ── 8. Supply-chain: lifecycle scripts downloading from internet ───────
+          echo "--- Check 8: lifecycle scripts downloading from the internet ---"
+          find . -name 'package.json' ! -path '*/.git/*' ! -path '*/node_modules/*' 2>/dev/null | while read -r f; do
+            python3 -c "
+import json, sys, re
+try:
+    d = json.load(open('$f'))
+    scripts = d.get('scripts', {})
+    lifecycle = ['preinstall','postinstall','prepare','prepack','prepublish']
+    download_re = re.compile(r'\b(curl|wget|fetch|axios|http\.get)\b')
+    for key in lifecycle:
+        val = scripts.get(key, '')
+        if download_re.search(val):
+            print(f'FLAGGED {key}: {val}')
+            sys.exit(0)
+    sys.exit(1)
+except:
+    sys.exit(1)
+" 2>/dev/null && flag "$f" "Lifecycle script (postinstall/prepare/etc) downloads from internet — common supply-chain attack vector"
+          done
+
+          # ── 9. Suspicious postinstall / prepare scripts ───────────────────────
+          echo "--- Check 9: postinstall running arbitrary node scripts ---"
+          find . -name 'package.json' ! -path '*/.git/*' ! -path '*/node_modules/*' 2>/dev/null | while read -r f; do
+            python3 -c "
+import json, sys, re
+try:
+    d = json.load(open('$f'))
+    scripts = d.get('scripts', {})
+    suspicious = re.compile(r'node\s+(?!scripts/|src/|test/)[\w./\\-]+\.(?:js|mjs|cjs)')
+    for key in ('postinstall', 'prepare'):
+        val = scripts.get(key, '')
+        if suspicious.search(val) and 'node_modules' not in val:
+            print(f'{key}: {val}')
+            sys.exit(0)
+    sys.exit(1)
+except:
+    sys.exit(1)
+" 2>/dev/null && flag "$f" "postinstall/prepare runs a node script from an unexpected path — verify this is intentional"
+          done
+
+          # ── 10. Executable shell scripts with suspicious content ──────────────
+          echo "--- Check 10: suspicious shell scripts ---"
+          find . -name '*.sh' ! -path '*/.git/*' ! -path '*/node_modules/*' 2>/dev/null | while read -r f; do
+            if grep -qE '(curl|wget)\s+.*(pipe|bash|sh|\|)|(bash|sh)\s*<\s*\(curl|wget' "$f" 2>/dev/null; then
+              flag "$f" "Shell script pipes curl/wget output into a shell — common malware dropper pattern"
+            fi
+          done
+
+          # ── 11. Base64-encoded blobs in source files ──────────────────────────
+          echo "--- Check 11: large base64 blobs in source files ---"
+          while IFS= read -r match; do
+            [ -z "$match" ] && continue
+            file=$(echo "$match" | cut -d: -f1)
+            flag "$file" "Large base64-encoded blob in source — may be an encoded payload"
+          done < <(
+            grep -rnE \
+              '[A-Za-z0-9+/]{200,}={0,2}' \
+              --include='*.js' --include='*.ts' --include='*.mjs' \
+              . 2>/dev/null | grep -v '^\./.git/' | grep -v '/node_modules/' \
+              | grep -v 'data:image/' | grep -v '\.min\.' | grep -v 'sourceMappingURL'
+          )
+
+          # ── 12. Typosquatted / shadow package names in package.json ───────────
+          echo "--- Check 12: known typosquatted package names ---"
+          TYPOSQUATS="lodash3 expres moment2 reacts axois cros chalk2 requestify nod-fetch node-featch"
+          find . -name 'package.json' ! -path '*/.git/*' ! -path '*/node_modules/*' 2>/dev/null | while read -r f; do
+            for pkg in $TYPOSQUATS; do
+              if grep -q "\"$pkg\"" "$f" 2>/dev/null; then
+                flag "$f" "Possible typosquatted package '$pkg' in dependencies — verify this is the intended package"
+              fi
+            done
+          done
+
+          # ── 13. Unexpected binary executables in source tree ─────────────────
+          echo "--- Check 13: unexpected binary executables in source ---"
+          find . ! -path '*/.git/*' ! -path '*/node_modules/*' ! -path '*/target/*' \
+            ! -path '*/.next/*' ! -path '*/dist/*' ! -path '*/build/*' \
+            -type f \( -name '*.exe' -o -name '*.dll' -o -name '*.so' -o -name '*.dylib' \) \
+            2>/dev/null | while read -r f; do
+            flag "$f" "Unexpected compiled binary in source tree — binaries should not be committed"
+          done
+
+          # ── 14. Environment variable exfiltration patterns ────────────────────
+          echo "--- Check 14: env-var exfiltration patterns ---"
+          while IFS= read -r match; do
+            [ -z "$match" ] && continue
+            file=$(echo "$match" | cut -d: -f1)
+            flag "$file" "Possible env-var exfiltration: process.env sent over network: $match"
+          done < <(
+            grep -rnE \
+              '(fetch|axios|http\.post|request)\s*\(.*process\.env' \
+              --include='*.js' --include='*.ts' --include='*.mjs' --include='*.cjs' \
+              . 2>/dev/null | grep -v '^\./.git/' | grep -v '/node_modules/'
+          )
+
+          # ── Summary ──────────────────────────────────────────────────────────
+          echo ""
+          if [ "$FAIL" -eq 0 ]; then
+            echo "✅ No security issues found."
+          else
+            echo "🚨 One or more security issues were detected. See annotations above."
+            exit 1
+          fi
