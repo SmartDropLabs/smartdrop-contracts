@@ -17,7 +17,11 @@ pub use types::PoolParams;
 const TTL_THRESHOLD: u32 = 518_400;
 const TTL_EXTEND_TO: u32 = 1_036_800;
 // Bound the number of pool IDs examined per call to stay within Soroban's 100 footprint entries limit.
-const MAX_POOL_SCAN_PER_CALL: u32 = 50;
+// Increased from 50 to 200 to support large registries with many pools, reducing the number of
+// paginated calls needed for asset-based lookups in `get_pools_by_asset`. The indexed path
+// (DataKey::AssetPools) makes this safe — it only reads matching pool IDs from the index rather
+// than scanning all pool IDs linearly. See #601.
+const MAX_POOL_SCAN_PER_CALL: u32 = 200;
 
 /// Ledgers per day at the network's ~5s/ledger target, used to convert
 /// `create_pool`'s caller-facing `daily_rate` into the pool's native
@@ -790,7 +794,7 @@ impl Factory {
 
     /// Return a page of pool records whose staking asset matches `asset`, scanning up to `scan_limit` pool IDs.
     ///
-    /// Scans at most `scan_limit` (capped at `MAX_POOL_SCAN_PER_CALL` = 50) pool IDs starting from
+    /// Scans at most `scan_limit` (capped at `MAX_POOL_SCAN_PER_CALL` = 200) pool IDs starting from
     /// `start_id` and collects matching records from that bounded window. `limit` is capped at 20
     /// records so callers can page through large registries without unbounded contract work.
     ///
@@ -798,11 +802,11 @@ impl Factory {
     /// Without a scan bound, asset-matching queries perform an unbounded O(n) walk across the registry,
     /// inspecting every pool ID until `limit` matches are found or the registry is exhausted. As
     /// `pool_count` scales to thousands of pools, sparse queries would exceed Soroban's per-transaction
-    /// footprint limits (100 entries) and CPU instruction budget. Bounding each call to at most 50 IDs
+    /// footprint limits (100 entries) and CPU instruction budget. Bounding each call to at most 200 IDs
     /// guarantees bounded predictable gas and CPU consumption per call.
     ///
     /// # Caller Range Scanning & Pagination
-    /// Callers can specify `scan_limit` (up to 50) to tune the scan window. Callers resume pagination
+    /// Callers can specify `scan_limit` (up to 200) to tune the scan window. Callers resume pagination
     /// using `next_start_id` until `next_start_id == total`.
     ///
     /// # Asset Index
@@ -912,7 +916,7 @@ impl Factory {
 
     /// Return a page of pool records whose staking asset matches `asset`.
     ///
-    /// Scans at most `MAX_POOL_SCAN_PER_CALL` (50) pool IDs starting from `start_id`
+    /// Scans at most `MAX_POOL_SCAN_PER_CALL` (200) pool IDs starting from `start_id`
     /// and collects matching records from that bounded window. Equivalent to calling
     /// `get_pools_by_asset_range(env, asset, start_id, MAX_POOL_SCAN_PER_CALL, limit)`.
     ///
