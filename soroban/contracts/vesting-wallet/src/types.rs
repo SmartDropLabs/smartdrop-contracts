@@ -16,6 +16,10 @@ pub enum VestingError {
     InvalidInput = 8,
     /// The wallet does not hold enough tokens to satisfy a release.
     InsufficientBalance = 9,
+    /// `withdraw_early` was called but no treasury address was configured. See #605.
+    TreasuryNotConfigured = 10,
+    /// `withdraw_early` was called with a zero or negative amount. See #605.
+    InvalidAmount = 11,
 }
 
 /// Storage keys for all instance data in the vesting wallet.
@@ -45,6 +49,8 @@ pub enum DataKey {
     RevokedVested,
     /// Running count of release operations performed.
     ReleaseCount,
+    /// Address that receives early-withdrawal penalties. See #605.
+    Treasury,
 }
 
 /// Emitted when admin rights are transferred.

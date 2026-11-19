@@ -162,6 +162,7 @@ fn setup_with_pool_records(count: u32) -> TestEnv {
                 min_lock_period: 10 + pool_id,
                 daily_rate: (100 + pool_id as u128) * 17280,
                 wasm_hash: soroban_sdk::BytesN::from_array(&t.env, &[0; 32]),
+                deprecated: false,
             };
             t.env
                 .storage()
@@ -772,6 +773,7 @@ fn test_upgrade_pool_non_upgradable_pool_returns_pool_upgrade_failed() {
         min_lock_period: 10,
         daily_rate: 100 * 17280,
         wasm_hash: soroban_sdk::BytesN::from_array(&t.env, &[0; 32]),
+        deprecated: false,
     };
     t.env.as_contract(&t.factory_addr, || {
         t.env
@@ -1310,22 +1312,18 @@ fn test_create_pool_rejects_dust_minimum_stake() {
 }
 
 #[test]
-fn test_create_pool_accepts_daily_rate_below_ledgers_per_day_with_ceiling_rounding() {
+fn test_create_pool_rejects_daily_rate_below_ledgers_per_day() {
     let t = setup();
     let asset = test_asset(&t.env);
 
-    // Before #148 the daily_rate -> credit_rate conversion truncated, so a
-    // sub-LEDGERS_PER_DAY daily_rate (17_279) became 0 and was rejected. Now it
-    // uses ceiling division, so it rounds up to credit_rate = 1 and the pool is
-    // created successfully.
-    let pool_id = t
+    // Any daily_rate below LEDGERS_PER_DAY (17_280) is rejected to prevent
+    // over-accrual: ceiling division would map it to credit_rate = 1 (identical
+    // to LEDGERS_PER_DAY), rewarding more than the caller intended. See #600.
+    let result = t
         .client
-        .create_pool(&asset, &17_279u128, &2u32, &25u64, &0i128);
-    assert_eq!(pool_id, 0);
-
-    let pool_addr = t.client.get_pool(&pool_id).address;
-    let pool = FarmingPoolClient::new(&t.env, &pool_addr);
-    assert_eq!(pool.credit_rate(), 1);
+        .try_create_pool(&asset, &17_279u128, &2u32, &25u64, &0i128);
+    assert_eq!(result, Err(Ok(FactoryError::InvalidCreditRate)));
+    assert_eq!(t.client.pool_count(), 0);
 }
 
 #[test]

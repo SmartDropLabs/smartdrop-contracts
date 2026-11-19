@@ -34,9 +34,10 @@ mod tests {
 
         factory.initialize(&admin, &BytesN::from_array(&env, &[1u8; 32]));
 
-        // Minimum valid daily_rate (converts to credit_rate >= 1)
+        // Minimum valid daily_rate is LEDGERS_PER_DAY (17_280); anything below
+        // is rejected to prevent over-accrual. See #600.
         let result = factory.create_pool(
-            &token, 1, // daily_rate = 1 (ceiling division gives credit_rate = 1)
+            &token, LEDGERS_PER_DAY, // smallest accepted rate
             100, 1000, 1_000_000,
         );
         assert!(result.is_ok());
@@ -72,7 +73,7 @@ mod tests {
     }
 
     #[test]
-    fn test_daily_rate_ceiling_division_rounding() {
+    fn test_daily_rate_below_ledgers_per_day_rejected() {
         let env = Env::default();
         let factory = create_factory(&env);
         let admin = env.accounts().generate_with_default_trustline();
@@ -80,9 +81,11 @@ mod tests {
 
         factory.initialize(&admin, &BytesN::from_array(&env, &[1u8; 32]));
 
-        // daily_rate just below LEDGERS_PER_DAY should round up to credit_rate = 1
+        // daily_rate just below LEDGERS_PER_DAY must be rejected. Ceiling
+        // division would map it to credit_rate = 1 (same as LEDGERS_PER_DAY),
+        // over-accruing relative to the requested rate. See #600.
         let result = factory.create_pool(&token, LEDGERS_PER_DAY - 1, 100, 1000, 1_000_000);
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 
     #[test]
