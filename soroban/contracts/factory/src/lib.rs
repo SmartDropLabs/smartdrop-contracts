@@ -63,23 +63,26 @@ const MAX_BATCH_SIZE: u32 = 10;
 /// figure is what off-chain/product code already reasons about; ledger-level
 /// rates are an implementation detail of `FarmingPool`.
 ///
-/// Conversion uses **ceiling** division (`(daily_rate + LEDGERS_PER_DAY - 1) /
-/// LEDGERS_PER_DAY`) rather than truncation. Truncation silently dropped valid
-/// small daily rates: e.g. `daily_rate = 17_279` divided by `LEDGERS_PER_DAY =
-/// 17_280` truncated to `0`, which `FarmingPool::initialize` then rejects with
-/// `InvalidCreditRate` (see #148). Ceiling division guarantees that *any*
-/// non-zero `daily_rate` yields a positive `credit_rate` of at least `1`
-/// (≈ `LEDGERS_PER_DAY` credits/day). The smallest `daily_rate` that converts
-/// to exactly `1` ledger credit is `LEDGERS_PER_DAY` itself; smaller values
-/// still round up to `1` and therefore over-accrue slightly, so callers
-/// wanting an exact daily rate should pass a multiple of `LEDGERS_PER_DAY`.
-/// Returns `InvalidCreditRate` only if `daily_rate == 0` or the rounded
-/// `credit_rate` does not fit in `i128`.
+/// Any `daily_rate` smaller than `LEDGERS_PER_DAY` (17,280) would round up
+/// to 1 credit per ledger under ceiling division, over-accruing significantly
+/// relative to the requested rate. To prevent this economic distortion, rates
+/// below `LEDGERS_PER_DAY` are rejected with `InvalidCreditRate`. Callers must
+/// supply at least `LEDGERS_PER_DAY` credits per day. See #600.
+///
+/// Returns `InvalidCreditRate` if `daily_rate == 0`, if `daily_rate <
+/// LEDGERS_PER_DAY`, or if the converted `credit_rate` exceeds `MAX_CREDIT_RATE`
+/// or does not fit in `i128`.
 fn daily_rate_to_credit_rate(daily_rate: u128) -> Result<i128, FactoryError> {
     if daily_rate == 0 {
         return Err(FactoryError::InvalidCreditRate);
     }
-    let per_ledger = daily_rate.div_ceil(LEDGERS_PER_DAY);
+    // Reject rates that cannot be represented as a whole number of credits per
+    // ledger without rounding: any daily_rate < LEDGERS_PER_DAY maps to
+    // 1 credit/ledger via ceiling division, which over-accrues. See #600.
+    if daily_rate < LEDGERS_PER_DAY {
+        return Err(FactoryError::InvalidCreditRate);
+    }
+    let per_ledger = daily_rate / LEDGERS_PER_DAY;
     let credit_rate = i128::try_from(per_ledger).map_err(|_| FactoryError::InvalidCreditRate)?;
     if credit_rate > MAX_CREDIT_RATE {
         return Err(FactoryError::InvalidCreditRate);
@@ -479,6 +482,7 @@ fn create_pool_inner(
         min_lock_period,
         daily_rate,
         wasm_hash: wasm_hash.clone(),
+        deprecated: false,
     };
     env.storage()
         .persistent()
@@ -1608,6 +1612,7 @@ impl Factory {
         // TTL while creating nothing (#543).
         if pools.is_empty() {
             return Err(FactoryError::EmptyBatch);
+        }
         // Validation 35: Cap the batch size before any pool is deployed. Each
         // entry triggers a WASM deploy inside `create_pool_inner`, so an
         // unbounded batch can exhaust the transaction's resource budget and
@@ -1629,6 +1634,66 @@ impl Factory {
             )?);
         }
         Ok(pool_ids)
+    }
+
+    /// Mark a pool as deprecated. Admin-only.
+    ///
+    /// Deprecated pools remain in the registry and are still readable, but the
+    /// flag signals that the pool is decommissioned — frontends should warn
+    /// users, and keepers can stop refreshing its TTLs. This provides an
+    /// operational control path for compromised or migrated pools without
+    /// destroying on-chain history. See #602.
+    ///
+    /// Returns `PoolNotFound` for an unknown pool, `AlreadyDeprecated` if the
+    /// pool was already marked, or `NotInitialized` if the factory has not been
+    /// initialized.
+    pub fn deprecate_pool(env: Env, pool_id: u32) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        let key = DataKey::Pool(pool_id);
+        let mut record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&key)
+            .ok_or(FactoryError::PoolNotFound)?;
+
+        if record.deprecated {
+            return Err(FactoryError::AlreadyDeprecated);
+        }
+
+        record.deprecated = true;
+        env.storage().persistent().set(&key, &record);
+        bump_pool(&env, pool_id);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("pool_dep")),
+            pool_id,
+        );
+
+        Ok(())
+    }
+
+    /// Return whether a pool has been deprecated by the admin.
+    ///
+    /// Returns `PoolNotFound` for an unknown pool, or `NotInitialized` if the
+    /// factory has not been initialized.
+    pub fn is_pool_deprecated(env: Env, pool_id: u32) -> Result<bool, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let key = DataKey::Pool(pool_id);
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&key)
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        Ok(record.deprecated)
     }
 }
 

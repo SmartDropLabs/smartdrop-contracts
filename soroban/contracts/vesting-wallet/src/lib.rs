@@ -18,6 +18,9 @@ const TTL_EXTEND_TO: u32 = 1_036_800;
 // valid schedule: i128::MAX / u32::MAX.
 const MAX_TOTAL_AMOUNT: i128 = i128::MAX / 4_294_967_295i128;
 
+/// Early-withdrawal penalty in basis points (10% = 1_000 bps). See #605.
+const EARLY_WITHDRAWAL_PENALTY_BPS: i128 = 1_000;
+
 // ── Storage helpers ───────────────────────────────────────────────────────────
 
 fn bump_instance(env: &Env) {
@@ -75,6 +78,10 @@ fn get_released(env: &Env) -> i128 {
 
 fn get_admin(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::Admin).unwrap()
+}
+
+fn get_treasury(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::Treasury)
 }
 
 fn is_revocable(env: &Env) -> bool {
@@ -574,6 +581,88 @@ impl VestingWallet {
 
     pub fn get_release_count(env: Env) -> Result<u32, VestingError> {
         Self::release_count(env)
+    }
+
+    /// Set the treasury address that receives early-withdrawal penalties.
+    /// Admin-only. Must be called before `withdraw_early` is usable. See #605.
+    pub fn set_treasury(env: Env, treasury: Address) -> Result<(), VestingError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("vest"), symbol_short!("trs_set")),
+            treasury,
+        );
+        Ok(())
+    }
+
+    /// Return the configured treasury address, or `None` if not yet set.
+    pub fn treasury(env: Env) -> Result<Option<Address>, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(get_treasury(&env))
+    }
+
+    /// Withdraw vested tokens before the schedule completes, subject to a
+    /// 10% penalty (1_000 bps). The penalty goes to the treasury; the net
+    /// amount goes to the beneficiary. Requires beneficiary auth. See #605.
+    ///
+    /// Returns `TreasuryNotConfigured` if no treasury is set, `InvalidAmount`
+    /// for zero/negative amounts, or `InsufficientBalance` if the releasable
+    /// balance is below `amount`.
+    pub fn withdraw_early(env: Env, amount: i128) -> Result<i128, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        if amount <= 0 {
+            return Err(VestingError::InvalidAmount);
+        }
+
+        let treasury = get_treasury(&env).ok_or(VestingError::TreasuryNotConfigured)?;
+        let beneficiary = get_beneficiary(&env);
+        beneficiary.require_auth();
+
+        let vested = compute_vested(&env)?;
+        let released = get_released(&env);
+        let releasable = vested.saturating_sub(released).max(0);
+
+        if amount > releasable {
+            return Err(VestingError::InsufficientBalance);
+        }
+
+        let penalty = amount * EARLY_WITHDRAWAL_PENALTY_BPS / 10_000;
+        let net_amount = amount - penalty;
+
+        let token_address = get_token(&env);
+        let token_client = token::TokenClient::new(&env, &token_address);
+
+        if token_client.balance(&env.current_contract_address()) < amount {
+            return Err(VestingError::InsufficientBalance);
+        }
+
+        // Record the full amount as released (penalty leaves the contract too).
+        env.storage()
+            .instance()
+            .set(&DataKey::ReleasedAmount, &(released + amount));
+        increment_release_count(&env);
+
+        if net_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &beneficiary, &net_amount);
+        }
+        if penalty > 0 {
+            token_client.transfer(&env.current_contract_address(), &treasury, &penalty);
+        }
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("vest"), symbol_short!("early_wd")),
+            (beneficiary, amount, penalty, net_amount),
+        );
+
+        Ok(net_amount)
     }
 }
 

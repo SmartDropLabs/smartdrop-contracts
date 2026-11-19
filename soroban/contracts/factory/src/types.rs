@@ -70,6 +70,10 @@ pub struct PoolRecord {
     pub daily_rate: u128,
     /// The WASM hash used to deploy or upgrade the pool.
     pub wasm_hash: soroban_sdk::BytesN<32>,
+    /// Whether this pool has been deprecated by the admin. Deprecated pools
+    /// are still readable but callers should treat them as decommissioned.
+    /// See #602.
+    pub deprecated: bool,
 }
 
 /// Sort keys supported by `list_pools_sorted`.
@@ -193,5 +197,8 @@ pub enum FactoryError {
     /// nothing.
     EmptyBatch = 20,
     /// `create_pools_batch` was called with more entries than `MAX_BATCH_SIZE`.
-    BatchTooLarge = 20,
+    BatchTooLarge = 21,
+    /// `deprecate_pool` was called on a pool that is already deprecated.
+    /// See #602.
+    AlreadyDeprecated = 22,
 }
