@@ -3602,6 +3602,39 @@ impl FarmingPool {
 
         Ok(read_global_multiplier_change_ledger(&env))
     }
+
+    // ── Feature improvements: #578, #579 ───────────────────────────────────
+
+    /// Return the net token flow into the pool: total deposits minus total withdrawals (Issue #578).
+    ///
+    /// A positive value means more tokens have entered the pool than left it.
+    /// A negative value (returned as a signed i128) indicates net outflow.
+    /// Useful for dashboards tracking whether the pool is growing or shrinking
+    /// over its lifetime without requiring two separate calls.
+    pub fn get_net_pool_flow(env: Env) -> Result<i128, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let deposits = read_total_deposits(&env);
+        let withdrawals = read_total_withdrawals(&env);
+        Ok(deposits.saturating_sub(withdrawals))
+    }
+
+    /// Return the total number of state-changing user operations performed on this pool (Issue #579).
+    ///
+    /// Combines lock operations (`lock_count`), unstake operations (`unstake_count`),
+    /// and boost configuration changes (`boost_count`) into a single activity counter.
+    /// This gives a quick measure of overall pool engagement without enumerating
+    /// each operation type separately.
+    pub fn get_total_operations(env: Env) -> Result<u32, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let locks = read_lock_count(&env);
+        let unstakes = read_unstake_count(&env);
+        let boosts = read_boost_count(&env);
+        Ok(locks.saturating_add(unstakes).saturating_add(boosts))
+    }
 }
 
 mod test;
