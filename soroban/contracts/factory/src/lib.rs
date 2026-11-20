@@ -1263,6 +1263,90 @@ impl Factory {
         Self::upgrade_pool_inner(&env, &admin, pool_id, &new_wasm_hash)
     }
 
+    /// Record one authenticated, immutable ballot per wallet for a registered pool.
+    ///
+    /// Voting is advisory: it never directly changes pool parameters or grants
+    /// administrator privileges. One-wallet-one-vote is not stake-weighted and
+    /// must not be treated as Sybil-resistant governance.
+    pub fn vote_on_pool(
+        env: Env,
+        pool_id: u32,
+        voter: Address,
+        approve: bool,
+    ) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        voter.require_auth();
+        let pool_key = DataKey::Pool(pool_id);
+        if !env.storage().persistent().has(&pool_key) {
+            return Err(FactoryError::PoolNotFound);
+        }
+        bump_instance(&env);
+        bump_pool(&env, pool_id);
+        let ballot_key = DataKey::PoolVote(pool_id, voter.clone());
+        if env.storage().persistent().has(&ballot_key) {
+            return Err(FactoryError::AlreadyVoted);
+        }
+        let count_key = if approve {
+            DataKey::PoolYesVotes(pool_id)
+        } else {
+            DataKey::PoolNoVotes(pool_id)
+        };
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let next = count.checked_add(1).ok_or(FactoryError::PoolCountOverflow)?;
+        env.storage().persistent().set(&ballot_key, &approve);
+        env.storage().persistent().extend_ttl(&ballot_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage().persistent().set(&count_key, &next);
+        env.storage().persistent().extend_ttl(&count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        #[allow(deprecated)]
+        env.events().publish((symbol_short!("factory"), symbol_short!("pool_vote")), (pool_id, voter, approve));
+        Ok(())
+    }
+
+    /// Read approval and rejection totals for a registered pool.
+    pub fn pool_vote_totals(env: Env, pool_id: u32) -> Result<(u32, u32), FactoryError> {
+        require_initialized(&env)?;
+        let pool_key = DataKey::Pool(pool_id);
+        if !env.storage().persistent().has(&pool_key) {
+            return Err(FactoryError::PoolNotFound);
+        }
+        bump_instance(&env);
+        bump_pool(&env, pool_id);
+        let yes_key = DataKey::PoolYesVotes(pool_id);
+        let no_key = DataKey::PoolNoVotes(pool_id);
+        let yes = env.storage().persistent().get(&yes_key).unwrap_or(0);
+        let no = env.storage().persistent().get(&no_key).unwrap_or(0);
+        if env.storage().persistent().has(&yes_key) {
+            env.storage().persistent().extend_ttl(&yes_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        if env.storage().persistent().has(&no_key) {
+            env.storage().persistent().extend_ttl(&no_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        Ok((yes, no))
+    }
+
+    /// Read a wallet's ballot, or None if no ballot exists.
+    pub fn pool_vote_of(env: Env, pool_id: u32, voter: Address) -> Result<Option<bool>, FactoryError> {
+        require_initialized(&env)?;
+        if !env.storage().persistent().has(&DataKey::Pool(pool_id)) {
+            return Err(FactoryError::PoolNotFound);
+        }
+        bump_instance(&env);
+        bump_pool(&env, pool_id);
+        let key = DataKey::PoolVote(pool_id, voter);
+        let vote = env.storage().persistent().get(&key);
+        if vote.is_some() {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        Ok(vote)
+    }
+
+    /// In-place WASM migration: preserves the pool's address and persistent
+    /// storage. This is not a transfer of assets to a new contract address.
+    /// Uses the existing audited admin authorization and upgrade checks.
+    pub fn migrate_pool(env: Env, pool_id: u32, new_wasm_hash: BytesN<32>) -> Result<(), FactoryError> {
+        Self::upgrade_pool(env, pool_id, new_wasm_hash)
+    }
+
     /// Upgrade multiple registered farming pools in batch. Admin-only.
     ///
     /// Atomically upgrades all specified `pool_ids` to `new_wasm_hash`. If any upgrade fails,
