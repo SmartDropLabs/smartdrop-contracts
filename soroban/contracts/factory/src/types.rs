@@ -1,5 +1,17 @@
 use soroban_sdk::{contracterror, contracttype, Address, BytesN, Vec};
 
+/// Health status returned by `check_pool_health` (issue #653).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HealthStatus {
+    /// Pool is operating normally.
+    Healthy,
+    /// Pool's TVL could not be read; it may be running an older WASM.
+    Degraded,
+    /// Pool is deprecated and no longer accepting new stakes.
+    Deprecated,
+}
+
 /// Parameters for creating one farming pool through `create_pools_batch`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
