@@ -3649,24 +3649,13 @@ impl FarmingPool {
         let staked_users = get_staked_users_list(&env);
 
         for user in staked_users.iter() {
-            if let Some(stake) = get_user_stake(&env, &user) {
-                if stake.balance > 0 {
-                    let pending_credits = stake
-                        .credits_outstanding
-                        .saturating_sub(stake.credits_claimed);
-
-                    if pending_credits > 0 {
-                        set_user_stake(
-                            &env,
-                            &user,
-                            &UserStake {
-                                balance: stake.balance,
-                                credits_claimed: stake.credits_outstanding,
-                                credits_outstanding: stake.credits_outstanding,
-                            },
-                        );
-                        total_distributed = total_distributed.saturating_add(pending_credits);
-                    }
+            if let Some(mut stake) = get_user_stake(&env, &user) {
+                let banked_before = stake.credits_banked;
+                checkpoint(&env, &user, &mut stake);
+                let newly_banked = stake.credits_banked.saturating_sub(banked_before);
+                if newly_banked > 0 {
+                    set_user_stake(&env, &user, &stake);
+                    total_distributed = total_distributed.saturating_add(newly_banked);
                 }
             }
         }
@@ -3695,13 +3684,18 @@ impl FarmingPool {
 
         for user in staked_users.iter() {
             if let Some(stake) = get_user_stake(&env, &user) {
-                if stake.balance > 0 {
-                    leaderboard.push_back((user, stake.balance));
+                if stake.amount > 0 {
+                    let mut insert_at = leaderboard.len();
+                    for (index, (_, amount)) in leaderboard.iter().enumerate() {
+                        if stake.amount > amount {
+                            insert_at = index as u32;
+                            break;
+                        }
+                    }
+                    leaderboard.insert(insert_at, (user, stake.amount));
                 }
             }
         }
-
-        leaderboard.sort_by(|a, b| b.1.cmp(&a.1));
 
         let mut result: Vec<LeaderboardEntry> = Vec::new(&env);
         for (index, (staker, balance)) in leaderboard.iter().enumerate() {

@@ -1711,7 +1711,7 @@ impl Factory {
             return Err(FactoryError::InvalidCreditRate);
         }
 
-        let record = env
+        let _record = env
             .storage()
             .persistent()
             .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))

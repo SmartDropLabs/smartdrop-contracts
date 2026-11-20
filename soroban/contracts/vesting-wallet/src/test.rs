@@ -106,7 +106,7 @@ fn test_release_rejects_when_wallet_balance_is_insufficient() {
         t.client.try_release(),
         Err(Ok(VestingError::InsufficientBalance))
     );
-    assert_eq!(t.client.released_amount().unwrap(), 0);
+    assert_eq!(t.client.released_amount(), 0);
 }
 
 // ── Initialisation tests ──────────────────────────────────────────────────────
