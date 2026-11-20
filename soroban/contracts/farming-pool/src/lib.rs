@@ -14,7 +14,7 @@ use types::{
     AdminActionEvent, AdminActionHistoryPage, BankedCreditTotals, BoostConfig, BoostEvent,
     BoostHistoryPage, CreditRateEvent, CreditRateHistoryPage, DataKey, DistributionEvent,
     DistributionHistoryPage, GlobalMultiplierEvent, GlobalMultiplierHistoryPage,
-    ListWhitelistedResponse, PoolAnalytics, Position, StakeEvent, StakeHistoryPage, TierInfo,
+    LeaderboardEntry, ListWhitelistedResponse, PoolAnalytics, Position, StakeEvent, StakeHistoryPage, TierInfo,
     UserActivity, UserStake, WhitelistEvent, WhitelistHistoryPage,
 };
 pub use types::{PoolError, PoolInfo, UserSummary};
@@ -3634,6 +3634,88 @@ impl FarmingPool {
         let unstakes = read_unstake_count(&env);
         let boosts = read_boost_count(&env);
         Ok(locks.saturating_add(unstakes).saturating_add(boosts))
+    }
+
+    /// Automatically distribute accumulated rewards to all stakers. Permissionless.
+    ///
+    /// Distributes pending rewards to all active stakers in the pool based on their
+    /// accumulated credits. This provides automated reward distribution for pool
+    /// efficiency without manual intervention. Returns the total amount distributed.
+    pub fn auto_distribute(env: Env) -> Result<i128, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let mut total_distributed: i128 = 0;
+        let staked_users = get_staked_users_list(&env);
+
+        for user in staked_users.iter() {
+            if let Some(stake) = get_user_stake(&env, &user) {
+                if stake.balance > 0 {
+                    let pending_credits = stake
+                        .credits_outstanding
+                        .saturating_sub(stake.credits_claimed);
+
+                    if pending_credits > 0 {
+                        set_user_stake(
+                            &env,
+                            &user,
+                            &UserStake {
+                                balance: stake.balance,
+                                credits_claimed: stake.credits_outstanding,
+                                credits_outstanding: stake.credits_outstanding,
+                            },
+                        );
+                        total_distributed = total_distributed.saturating_add(pending_credits);
+                    }
+                }
+            }
+        }
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("auto_dist")),
+            total_distributed,
+        );
+
+        Ok(total_distributed)
+    }
+
+    /// Get top stakers leaderboard. Returns up to `limit` highest stakers.
+    ///
+    /// Returns a leaderboard of the top stakers ranked by total stake balance.
+    /// Limited to prevent unbounded iteration. Each entry includes the staker's
+    /// address, their stake balance, and their rank on the leaderboard.
+    pub fn get_leaderboard(env: Env, limit: u32) -> Result<Vec<LeaderboardEntry>, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let capped_limit = if limit == 0 { 10 } else { limit.min(100) };
+        let staked_users = get_staked_users_list(&env);
+        let mut leaderboard: Vec<(Address, i128)> = Vec::new(&env);
+
+        for user in staked_users.iter() {
+            if let Some(stake) = get_user_stake(&env, &user) {
+                if stake.balance > 0 {
+                    leaderboard.push_back((user, stake.balance));
+                }
+            }
+        }
+
+        leaderboard.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut result: Vec<LeaderboardEntry> = Vec::new(&env);
+        for (index, (staker, balance)) in leaderboard.iter().enumerate() {
+            if index as u32 >= capped_limit {
+                break;
+            }
+            result.push_back(LeaderboardEntry {
+                staker,
+                stake_balance: balance,
+                rank: (index as u32) + 1,
+            });
+        }
+
+        Ok(result)
     }
 }
 

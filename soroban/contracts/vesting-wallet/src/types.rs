@@ -51,6 +51,8 @@ pub enum DataKey {
     ReleaseCount,
     /// Address that receives early-withdrawal penalties. See #605.
     Treasury,
+    /// Delegated address that can claim vesting rights on behalf of beneficiary.
+    Delegate,
 }
 
 /// Emitted when admin rights are transferred.

@@ -1695,6 +1695,69 @@ impl Factory {
 
         Ok(record.deprecated)
     }
+
+    /// Claim from the insurance fund for pool losses. Admin-only.
+    ///
+    /// Provides a loss protection mechanism where pool insurance claims
+    /// can be processed to protect against unexpected losses or pool failures.
+    /// Returns `NotInitialized` if the factory has not been initialized.
+    pub fn claim_insurance(env: Env, pool_id: u32, amount: i128) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        if amount <= 0 {
+            return Err(FactoryError::InvalidCreditRate);
+        }
+
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        let current_insurance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceFund(pool_id))
+            .unwrap_or(0);
+
+        if current_insurance < amount {
+            return Err(FactoryError::InsufficientFunds);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsuranceFund(pool_id), &(current_insurance - amount));
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("ins_claim")),
+            (pool_id, amount),
+        );
+
+        Ok(())
+    }
+
+    /// Get the insurance fund balance for a specific pool.
+    pub fn get_insurance_balance(env: Env, pool_id: u32) -> Result<i128, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let _record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceFund(pool_id))
+            .unwrap_or(0))
+    }
 }
 
 mod test;
