@@ -431,6 +431,7 @@ fn read_user_activity_count(env: &Env, user: &Address) -> u32 {
 
 // ── Feature 2: Performance Tier System ───────────────────────────────────────
 
+#[allow(dead_code)]
 fn get_user_tier(env: &Env, user: &Address) -> u32 {
     let key = DataKey::UserTier(user.clone());
     let tier: u32 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -538,6 +539,7 @@ fn increment_unique_user_count(env: &Env) {
         .set(&DataKey::UniqueUserCount, &(count + 1));
 }
 
+#[allow(dead_code)]
 fn decrement_unique_user_count(env: &Env) {
     let count: u32 = env
         .storage()
@@ -998,6 +1000,22 @@ fn compute_total_stake(amount: i128, allocation_pct: u32, multiplier: u32) -> i1
     amount * (100 - alloc + alloc * mult) / 100
 }
 
+/// Stake-size reward multiplier in percent, as specified by #616.
+///
+/// This is deliberately separate from the point-based `TierInfo.reward_multiplier`
+/// (basis points, #555): large stakes earn 1.5x/2x credits here regardless of
+/// the user's performance tier. Thresholds are strictly greater-than so the
+/// boundary amounts themselves stay in the lower band.
+fn get_tier_multiplier(stake_amount: i128) -> u32 {
+    if stake_amount > 1_000_000 {
+        200
+    } else if stake_amount > 100_000 {
+        150
+    } else {
+        100
+    }
+}
+
 fn compute_credits(
     amount: i128,
     allocation_pct: u32,
@@ -1005,10 +1023,13 @@ fn compute_credits(
     credit_rate: i128,
     ledgers_elapsed: u32,
 ) -> i128 {
-    compute_total_stake(amount, allocation_pct, multiplier)
+    let base = compute_total_stake(amount, allocation_pct, multiplier)
         .checked_mul(credit_rate)
         .and_then(|t| t.checked_mul(ledgers_elapsed as i128))
+        .expect("credits arithmetic overflow");
+    base.checked_mul(get_tier_multiplier(amount) as i128)
         .expect("credits arithmetic overflow")
+        / 100
 }
 
 fn compute_stake_accrual(env: &Env, user: &Address, stake: &UserStake, current: u32) -> i128 {
@@ -3343,6 +3364,22 @@ impl FarmingPool {
         })
     }
 
+    /// Return the stake-size reward multiplier in percent for `stake_amount` (#616).
+    ///
+    /// `100` (1.0x) at or below 100_000, `150` (1.5x) above 100_000 up to
+    /// 1_000_000, and `200` (2.0x) above 1_000_000. This multiplier is applied
+    /// to all credit accrual. It is distinct from the basis-point
+    /// `TierInfo.reward_multiplier` reported by `get_user_tier_info`, which is
+    /// driven by earned tier points rather than stake size.
+    pub fn get_tier_multiplier(env: Env, stake_amount: i128) -> Result<u32, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        if stake_amount < 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+        Ok(get_tier_multiplier(stake_amount))
+    }
+
     /// Award tier points to a user (admin-only).
     ///
     /// Admin can award tier points to users for special achievements or milestones.
@@ -3421,12 +3458,12 @@ impl FarmingPool {
         }
 
         add_total_distributed_rewards(&env, total_distributed);
-        record_distribution_event(&env, users.len() as u32, total_distributed, &admin);
+        record_distribution_event(&env, users.len(), total_distributed, &admin);
 
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("bulk_rwd")),
-            (users.len() as u32, total_distributed),
+            (users.len(), total_distributed),
         );
 
         Ok(())
