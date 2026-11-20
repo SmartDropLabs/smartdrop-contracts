@@ -44,6 +44,13 @@ pub enum PoolError {
     /// crediting `amount` would leave the pool short of its own liabilities.
     /// See #458.
     TransferAmountMismatch = 21,
+    /// `rollback_multiplier` was called but there is no history entry to roll
+    /// back to (#664).
+    NoMultiplierHistory = 22,
+    /// `rollback_multiplier` was called but the current multiplier does not
+    /// match the last recorded `new_multiplier` — a concurrent change occurred
+    /// (#664).
+    MultiplierRollbackConflict = 23,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.

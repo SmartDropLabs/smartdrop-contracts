@@ -2434,6 +2434,47 @@ impl FarmingPool {
 
     /// Set the global credit multiplier. Rejects 0 and anything above
     /// `MAX_GLOBAL_MULTIPLIER` — see #89 for the overflow-safety derivation.
+    /// Revert the global multiplier to its previous value (#664).
+    ///
+    /// Reads the last entry in `GlobalMultiplierHistory`, validates that the
+    /// stored `new_multiplier` is what is currently live, and re-applies the
+    /// stored `old_multiplier` via the same code path as `set_global_multiplier`.
+    ///
+    /// Returns `PoolError::NoMultiplierHistory` if there is no history entry to
+    /// roll back to, or `PoolError::MultiplierRollbackConflict` if the current
+    /// multiplier differs from the last recorded `new_multiplier` (which would
+    /// indicate a concurrent change that must be resolved manually).
+    pub fn rollback_multiplier(env: Env) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GlobalMultiplierEventCount)
+            .unwrap_or(0);
+        if count == 0 {
+            return Err(PoolError::NoMultiplierHistory);
+        }
+        let last_idx = count - 1;
+        let event: GlobalMultiplierEvent = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GlobalMultiplierHistory(last_idx))
+            .ok_or(PoolError::NoMultiplierHistory)?;
+
+        let current = read_global_multiplier(&env);
+        if current != event.new_multiplier {
+            return Err(PoolError::MultiplierRollbackConflict);
+        }
+
+        // Apply the rollback through the standard setter to keep history
+        // consistent and re-emit the multiplier change event.
+        Self::set_global_multiplier(env, event.old_multiplier)
+    }
+
     pub fn set_global_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
         let admin = get_admin(&env)?;
@@ -3256,6 +3297,17 @@ impl FarmingPool {
     ///
     /// `offset`: zero-based index of the first event to return.
     /// `limit`: maximum number of events to return per call.
+    /// Return the enforced multiplier range as (min, max) (#646).
+    ///
+    /// `set_global_multiplier` already validates against `MAX_GLOBAL_MULTIPLIER`
+    /// (= 1 000) with a minimum of 1.  Exposing the limits here lets dashboards
+    /// and SDK clients display the bounds to users without hard-coding them.
+    pub fn get_multiplier_limits(env: Env) -> Result<(u32, u32), PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok((1u32, MAX_GLOBAL_MULTIPLIER))
+    }
+
     pub fn get_global_multiplier_history(
         env: Env,
         offset: u32,

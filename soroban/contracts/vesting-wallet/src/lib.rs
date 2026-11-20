@@ -289,8 +289,11 @@ impl VestingWallet {
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("vest"), symbol_short!("released")),
-            (beneficiary, releasable, released + releasable),
+            (beneficiary.clone(), releasable, released + releasable),
         );
+
+        // Issue #645: emit milestone events at 25 / 50 / 75 / 100 % vested.
+        Self::check_milestones(&env, &beneficiary, released, released + releasable);
 
         Ok(releasable)
     }
@@ -697,6 +700,35 @@ impl VestingWallet {
         );
 
         Ok(net_amount)
+    }
+
+    /// Emit a milestone event when vesting crosses a 25 / 50 / 75 / 100 %
+    /// threshold (#645).
+    ///
+    /// `prev_released` and `new_released` are the cumulative released amounts
+    /// before and after the current `release()` call. A milestone fires when
+    /// the threshold was not yet crossed before but is now.
+    fn check_milestones(
+        env: &Env,
+        beneficiary: &Address,
+        prev_released: i128,
+        new_released: i128,
+    ) {
+        let total = get_total_amount(env);
+        if total <= 0 {
+            return;
+        }
+        // Milestones at 25 %, 50 %, 75 %, 100 %.
+        for bps in [2_500u32, 5_000, 7_500, 10_000] {
+            let threshold = total.saturating_mul(bps as i128) / 10_000;
+            if prev_released < threshold && new_released >= threshold {
+                #[allow(deprecated)]
+                env.events().publish(
+                    (symbol_short!("vest"), symbol_short!("milestone")),
+                    (beneficiary.clone(), bps, new_released),
+                );
+            }
+        }
     }
 }
 
