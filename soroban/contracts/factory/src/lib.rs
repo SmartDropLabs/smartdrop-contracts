@@ -7,7 +7,8 @@ use soroban_sdk::{
     Vec,
 };
 use types::{
-    DataKey, ListPoolsResponse, PoolRecord, PoolSort, PoolStatus, RefreshPoolTtlsResponse,
+    DataKey, ListPoolsResponse, PoolComparison, PoolRecord, PoolSort, PoolStatus,
+    RefreshPoolTtlsResponse,
 };
 
 pub use types::FactoryError;
@@ -61,6 +62,9 @@ const RISK_SCORE_MAX: u32 = 100;
 const RISK_SCORE_DEPRECATED_PENALTY: u32 = 40;
 const RISK_SCORE_OUTDATED_WASM_PENALTY: u32 = 10;
 const RISK_SCORE_TVL_THRESHOLD: i128 = MIN_STAKE_AMOUNT;
+// Upper bound for `compare_pools`: each entry reads several storage keys, so an
+// unbounded list could exhaust the host's footprint budget (#617).
+const MAX_COMPARE_POOLS: u32 = 10;
 
 /// Convert a "credits per day" figure into the deployed pool's native
 /// "credits per ledger" `credit_rate`.
@@ -769,6 +773,64 @@ impl Factory {
             .ok_or(FactoryError::PoolNotFound)?;
         bump_pool(&env, pool_id);
         compute_pool_risk_score(&env, pool_id, &record)
+    }
+
+    /// Compare up to `MAX_COMPARE_POOLS` registered pools side by side (#617).
+    ///
+    /// Results follow the exact order of `pool_ids`; no sorting is applied so
+    /// callers can align the response with their own UI. Each entry includes
+    /// the pool's `risk_score` from `get_pool_risk`, letting dashboards rank
+    /// pools without one call per pool. Duplicate IDs are rejected so a single
+    /// pool cannot skew comparisons.
+    ///
+    /// Returns `NotInitialized` before `initialize`, `EmptyPoolList` for an
+    /// empty request, `TooManyPools` above the cap, `DuplicatePoolId` for
+    /// repeated IDs, and `PoolNotFound` for any unknown ID.
+    pub fn compare_pools(
+        env: Env,
+        pool_ids: Vec<u32>,
+    ) -> Result<Vec<PoolComparison>, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        if pool_ids.is_empty() {
+            return Err(FactoryError::EmptyPoolList);
+        }
+        if pool_ids.len() > MAX_COMPARE_POOLS {
+            return Err(FactoryError::TooManyPools);
+        }
+
+        let mut seen: Vec<u32> = Vec::new(&env);
+        let mut comparisons: Vec<PoolComparison> = Vec::new(&env);
+        for pool_id in pool_ids.iter() {
+            if seen.contains(pool_id) {
+                return Err(FactoryError::DuplicatePoolId);
+            }
+            seen.push_back(pool_id);
+
+            let record = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+                .ok_or(FactoryError::PoolNotFound)?;
+            bump_pool(&env, pool_id);
+            let risk_score = compute_pool_risk_score(&env, pool_id, &record)?;
+
+            comparisons.push_back(PoolComparison {
+                pool_id,
+                address: record.address,
+                asset: record.asset,
+                daily_rate: record.daily_rate,
+                credit_rate: record.credit_rate,
+                global_multiplier: record.global_multiplier,
+                min_lock_period: record.min_lock_period,
+                tvl: read_pool_tvl(&env, pool_id),
+                risk_score,
+                deprecated: record.deprecated,
+            });
+        }
+
+        Ok(comparisons)
     }
 
     /// Return a page of pool records in ascending pool ID order.

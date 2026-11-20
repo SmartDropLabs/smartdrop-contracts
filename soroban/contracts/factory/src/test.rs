@@ -2358,3 +2358,86 @@ fn test_get_pool_risk_rejects_uninitialized_and_unknown_pool() {
         Err(Ok(FactoryError::PoolNotFound))
     );
 }
+
+// ── compare_pools (#617) ───────────────────────────────────────────────────────
+
+#[test]
+fn test_compare_pools_returns_requested_order_with_risk_and_state() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let outdated = BytesN::from_array(&env, &[9; 32]);
+    let configs = [
+        (
+            risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, false),
+            10_000_000i128,
+            0i128,
+        ),
+        (
+            risk_pool_record(&env, &outdated, 60_000_000, 1, true),
+            0i128,
+            0i128,
+        ),
+    ];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    let compared = client.compare_pools(&vec![&env, 1u32, 0u32]);
+    assert_eq!(compared.len(), 2);
+
+    let risky = compared.get(0).unwrap();
+    assert_eq!(risky.pool_id, 1);
+    assert_eq!(risky.risk_score, 100);
+    assert_eq!(risky.deprecated, true);
+    assert_eq!(risky.tvl, 0);
+    assert_eq!(risky.credit_rate, 60_000_000);
+
+    let healthy = compared.get(1).unwrap();
+    assert_eq!(healthy.pool_id, 0);
+    assert_eq!(healthy.risk_score, 0);
+    assert_eq!(healthy.deprecated, false);
+    assert_eq!(healthy.tvl, 10_000_000);
+    assert_eq!(healthy.address, configs[0].0.address);
+    assert_eq!(healthy.asset, configs[0].0.asset);
+}
+
+#[test]
+fn test_compare_pools_rejects_invalid_requests() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let configs = [(
+        risk_pool_record(&env, &wasm_hash, 1_000, 100, false),
+        1_000_000i128,
+        0i128,
+    )];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    assert_eq!(
+        client.try_compare_pools(&vec![&env]),
+        Err(Ok(FactoryError::EmptyPoolList))
+    );
+    assert_eq!(
+        client.try_compare_pools(&vec![&env, 0u32, 0u32]),
+        Err(Ok(FactoryError::DuplicatePoolId))
+    );
+    assert_eq!(
+        client.try_compare_pools(&vec![&env, 99u32]),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
+
+    let mut too_many: Vec<u32> = Vec::new(&env);
+    for id in 0..11 {
+        too_many.push_back(id);
+    }
+    assert_eq!(
+        client.try_compare_pools(&too_many),
+        Err(Ok(FactoryError::TooManyPools))
+    );
+}
+
+#[test]
+fn test_compare_pools_requires_initialization() {
+    let (env, uninitialized) = setup_uninitialized();
+    assert_eq!(
+        uninitialized.try_compare_pools(&vec![&env, 0u32]),
+        Err(Ok(FactoryError::NotInitialized))
+    );
+}
