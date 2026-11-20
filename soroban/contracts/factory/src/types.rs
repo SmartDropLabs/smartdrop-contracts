@@ -76,6 +76,9 @@ pub struct PoolRecord {
     /// are still readable but callers should treat them as decommissioned.
     /// See #602.
     pub deprecated: bool,
+    /// Monotonically-increasing version counter, incremented on each
+    /// `upgrade_pool` call so callers can detect upgrades (#638).
+    pub version: u32,
 }
 
 /// Sort keys supported by `list_pools_sorted`.

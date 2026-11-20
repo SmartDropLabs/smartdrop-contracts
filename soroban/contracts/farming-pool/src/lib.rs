@@ -17,7 +17,7 @@ use types::{
     LeaderboardEntry, ListWhitelistedResponse, PoolAnalytics, Position, StakeEvent, StakeHistoryPage, TierInfo,
     UserActivity, UserStake, WhitelistEvent, WhitelistHistoryPage,
 };
-pub use types::{PoolError, PoolInfo, UserSummary};
+pub use types::{MultiplierBreakdown, PoolError, PoolInfo, UserSummary};
 
 // Expose compiled WASM bytes so sibling crates (e.g. `factory`) can upload the
 // real farming-pool contract in their integration tests via:
@@ -1652,6 +1652,43 @@ impl FarmingPool {
     /// Alias for `calculate_credits` providing explicit system-specific naming.
     pub fn get_position_credits(env: Env, user: Address) -> Result<i128, PoolError> {
         Self::calculate_credits(env, user)
+    }
+
+    /// Return a detailed breakdown of how `user`'s reward multiplier is
+    /// composed (#640).
+    ///
+    /// Useful for dashboards that want to show users exactly why their
+    /// effective stake differs from their raw stake amount without having to
+    /// replicate the pool's arithmetic client-side.
+    pub fn get_multiplier_breakdown(
+        env: Env,
+        user: Address,
+    ) -> Result<MultiplierBreakdown, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
+        let global_multiplier = read_global_multiplier(&env);
+
+        let (stake_amount, credit_rate, banked_credits) =
+            match get_user_stake(&env, &user) {
+                Some(stake) => (stake.amount, stake.credit_rate, stake.credits_banked),
+                None => match get_position(&env, &user) {
+                    Some(pos) => (pos.amount, pos.credit_rate, pos.total_credits),
+                    None => (0i128, read_credit_rate(&env), 0i128),
+                },
+            };
+
+        let effective_stake = compute_total_stake(stake_amount, allocation_pct, global_multiplier);
+
+        Ok(MultiplierBreakdown {
+            stake_amount,
+            allocation_pct,
+            global_multiplier,
+            effective_stake,
+            credit_rate,
+            banked_credits,
+        })
     }
 
     pub fn get_user_position(env: Env, user: Address) -> Result<Option<Position>, PoolError> {

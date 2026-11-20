@@ -483,6 +483,7 @@ fn create_pool_inner(
         daily_rate,
         wasm_hash: wasm_hash.clone(),
         deprecated: false,
+        version: 0,
     };
     env.storage()
         .persistent()
@@ -674,6 +675,24 @@ impl Factory {
             Some(r) => {
                 bump_pool(&env, pool_id);
                 Ok(r)
+            }
+            None => Err(FactoryError::PoolNotFound),
+        }
+    }
+
+    /// Return the version counter for `pool_id` (#638).
+    ///
+    /// The counter starts at 0 when a pool is created and is incremented by
+    /// each successful `upgrade_pool` call. Callers (indexers, dashboards) can
+    /// poll this to detect upgrades without scanning wasm-hash changes.
+    pub fn get_pool_version(env: Env, pool_id: u32) -> Result<u32, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let key = DataKey::Pool(pool_id);
+        match env.storage().persistent().get::<DataKey, PoolRecord>(&key) {
+            Some(r) => {
+                bump_pool(&env, pool_id);
+                Ok(r.version)
             }
             None => Err(FactoryError::PoolNotFound),
         }
@@ -1192,6 +1211,7 @@ impl Factory {
 
         let old_hash = record.wasm_hash.clone();
         record.wasm_hash = new_wasm_hash.clone();
+        record.version = record.version.saturating_add(1);
         env.storage().persistent().set(&key, &record);
 
         let old_wasm_key = DataKey::PoolsByWasmHash(old_hash.clone());
