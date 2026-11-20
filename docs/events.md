@@ -216,6 +216,17 @@ Emitted by `release` (and by `release_all`) whenever a nonzero amount is transfe
 | `releasable` | `i128` | The amount transferred in this call. |
 | `released_total` | `i128` | The cumulative released total **after** this call. |
 
+### `cliff_end`
+Emitted once when a schedule with a real cliff (`cliff_ledger > start_ledger`) first reaches its cliff ledger. Triggers from `release`, `release_all`, `withdraw_early`, or `revoke`; repeated calls emit no further event. Schedules without a cliff emit nothing.
+
+* **Topics:** `(Symbol, Symbol)` -> `(symbol_short!("vest"), symbol_short!("cliff_end"))`
+* **Payload Structure (tuple order):**
+
+| Field | Rust Type | Description |
+| :--- | :--- | :--- |
+| `beneficiary` | `Address` | The schedule's beneficiary. |
+| `timestamp` | `u64` | Ledger timestamp at the moment the cliff was detected. |
+
 See [`vesting-api.md`](vesting-api.md) for the full VestingWallet entry-point reference.
 
 ### `revoked`
