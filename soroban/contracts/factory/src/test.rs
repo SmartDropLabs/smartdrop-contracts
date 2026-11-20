@@ -2238,3 +2238,48 @@ fn test_asset_index_survives_a_paginated_walk() {
         "every indexed pool for the asset should be returned exactly once"
     );
 }
+
+
+// ── Pool governance ballots (#620) ──────────────────────────────────────────
+#[test]
+fn test_pool_governance_ballots_are_authenticated_and_unique() {
+    let t = setup_with_pool_records(1);
+    let alice = Address::generate(&t.env);
+    let bob = Address::generate(&t.env);
+    assert_eq!(t.client.pool_vote_totals(&0), (0, 0));
+    assert_eq!(t.client.pool_vote_of(&0, &alice), None);
+    t.client.vote_on_pool(&0, &alice, &true);
+    t.client.vote_on_pool(&0, &bob, &false);
+    assert_eq!(t.client.pool_vote_totals(&0), (1, 1));
+    assert_eq!(t.client.pool_vote_of(&0, &alice), Some(true));
+    assert_eq!(t.client.pool_vote_of(&0, &bob), Some(false));
+    assert_eq!(
+        t.client.try_vote_on_pool(&0, &alice, &false),
+        Err(Ok(FactoryError::AlreadyVoted))
+    );
+    assert_eq!(t.client.pool_vote_totals(&0), (1, 1));
+}
+
+#[test]
+fn test_pool_governance_rejects_unknown_pools() {
+    let t = setup_with_pool_records(1);
+    let alice = Address::generate(&t.env);
+    assert_eq!(
+        t.client.try_vote_on_pool(&99, &alice, &true),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
+    assert_eq!(
+        t.client.try_pool_vote_totals(&99),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
+}
+
+#[test]
+fn test_migrate_pool_requires_valid_registered_pool() {
+    let t = setup();
+    let new_hash = upload_replacement_wasm(&t.env);
+    assert_eq!(
+        t.client.try_migrate_pool(&99, &new_hash),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
+}
