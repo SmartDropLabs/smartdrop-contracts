@@ -53,6 +53,8 @@ pub enum DataKey {
     Treasury,
     /// Delegated address that can claim vesting rights on behalf of beneficiary.
     Delegate,
+    /// Set once the cliff has been reached and its notification emitted (#615).
+    CliffEndNotified,
 }
 
 /// Emitted when admin rights are transferred.

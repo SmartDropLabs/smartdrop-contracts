@@ -1,5 +1,17 @@
 use soroban_sdk::{contracterror, contracttype, Address, BytesN, Vec};
 
+/// Health status returned by `check_pool_health` (issue #653).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HealthStatus {
+    /// Pool is operating normally.
+    Healthy,
+    /// Pool's TVL could not be read; it may be running an older WASM.
+    Degraded,
+    /// Pool is deprecated and no longer accepting new stakes.
+    Deprecated,
+}
+
 /// Parameters for creating one farming pool through `create_pools_batch`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -81,6 +93,25 @@ pub struct PoolRecord {
     /// Whether this pool has been deprecated by the admin. Deprecated pools
     /// are still readable but callers should treat them as decommissioned.
     /// See #602.
+    pub deprecated: bool,
+    /// Monotonically-increasing version counter, incremented on each
+    /// `upgrade_pool` call so callers can detect upgrades (#638).
+    pub version: u32,
+}
+
+/// Side-by-side view of a pool returned by `compare_pools` (#617).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolComparison {
+    pub pool_id: u32,
+    pub address: Address,
+    pub asset: Address,
+    pub daily_rate: u128,
+    pub credit_rate: i128,
+    pub global_multiplier: u32,
+    pub min_lock_period: u32,
+    pub tvl: i128,
+    pub risk_score: u32,
     pub deprecated: bool,
 }
 
@@ -211,6 +242,10 @@ pub enum FactoryError {
     AlreadyDeprecated = 22,
     /// Insufficient funds in the insurance fund for the requested claim.
     InsufficientFunds = 23,
-    /// A wallet cannot submit another ballot for the same pool.
-    AlreadyVoted = 24,
+    /// `compare_pools` was called with an empty ID list.
+    EmptyPoolList = 24,
+    /// `compare_pools` was called with more than `MAX_COMPARE_POOLS` IDs.
+    TooManyPools = 25,
+    /// `compare_pools` was called with the same pool ID more than once.
+    DuplicatePoolId = 26,
 }

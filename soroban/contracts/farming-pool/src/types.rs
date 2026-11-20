@@ -44,6 +44,13 @@ pub enum PoolError {
     /// crediting `amount` would leave the pool short of its own liabilities.
     /// See #458.
     TransferAmountMismatch = 21,
+    /// `rollback_multiplier` was called but there is no history entry to roll
+    /// back to (#664).
+    NoMultiplierHistory = 22,
+    /// `rollback_multiplier` was called but the current multiplier does not
+    /// match the last recorded `new_multiplier` — a concurrent change occurred
+    /// (#664).
+    MultiplierRollbackConflict = 23,
 }
 
 /// Per-user boost configuration returned by `get_boost_config`.
@@ -216,6 +223,8 @@ pub enum DataKey {
     PeakTotalStaked,
     /// Current number of unique users with any stake or position.
     UniqueUserCount,
+    /// Cached reward multiplier per user (issue #652).
+    CachedMultiplier(Address),
 }
 
 /// Paginated response for `get_whitelisted_users`.
@@ -282,6 +291,28 @@ pub struct UserSummary {
     pub is_whitelisted: bool,
     /// Ledger at which the locked position unlocks (or 0 if none).
     pub unlock_ledger: u32,
+}
+
+/// Detailed breakdown of a user's current reward multiplier (#640).
+///
+/// Returned by `get_multiplier_breakdown` so clients can show how the
+/// effective rate is composed without having to replicate the arithmetic.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiplierBreakdown {
+    /// Raw stake amount the user has locked/staked.
+    pub stake_amount: i128,
+    /// Percentage of the stake the user has allocated to boosted staking (0-100).
+    pub allocation_pct: u32,
+    /// The global multiplier that applies to the allocated portion.
+    pub global_multiplier: u32,
+    /// Effective total stake used for credit computation:
+    /// `amount * (100 - alloc + alloc * global_multiplier) / 100`.
+    pub effective_stake: i128,
+    /// Per-ledger credit rate in effect for this user.
+    pub credit_rate: i128,
+    /// Total accrued credits so far (before the current ledger's accrual).
+    pub banked_credits: i128,
 }
 
 // ─── History / audit trail types ─────────────────────────────────────────────

@@ -17,7 +17,7 @@ use types::{
     LeaderboardEntry, ListWhitelistedResponse, PoolAnalytics, Position, StakeEvent, StakeHistoryPage, TierInfo,
     UserActivity, UserStake, WhitelistEvent, WhitelistHistoryPage,
 };
-pub use types::{PoolError, PoolInfo, UserSummary};
+pub use types::{MultiplierBreakdown, PoolError, PoolInfo, UserSummary};
 
 // Expose compiled WASM bytes so sibling crates (e.g. `factory`) can upload the
 // real farming-pool contract in their integration tests via:
@@ -431,6 +431,7 @@ fn read_user_activity_count(env: &Env, user: &Address) -> u32 {
 
 // ── Feature 2: Performance Tier System ───────────────────────────────────────
 
+#[allow(dead_code)]
 fn get_user_tier(env: &Env, user: &Address) -> u32 {
     let key = DataKey::UserTier(user.clone());
     let tier: u32 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -538,6 +539,7 @@ fn increment_unique_user_count(env: &Env) {
         .set(&DataKey::UniqueUserCount, &(count + 1));
 }
 
+#[allow(dead_code)]
 fn decrement_unique_user_count(env: &Env) {
     let count: u32 = env
         .storage()
@@ -998,6 +1000,22 @@ fn compute_total_stake(amount: i128, allocation_pct: u32, multiplier: u32) -> i1
     amount * (100 - alloc + alloc * mult) / 100
 }
 
+/// Stake-size reward multiplier in percent, as specified by #616.
+///
+/// This is deliberately separate from the point-based `TierInfo.reward_multiplier`
+/// (basis points, #555): large stakes earn 1.5x/2x credits here regardless of
+/// the user's performance tier. Thresholds are strictly greater-than so the
+/// boundary amounts themselves stay in the lower band.
+fn get_tier_multiplier(stake_amount: i128) -> u32 {
+    if stake_amount > 1_000_000 {
+        200
+    } else if stake_amount > 100_000 {
+        150
+    } else {
+        100
+    }
+}
+
 fn compute_credits(
     amount: i128,
     allocation_pct: u32,
@@ -1005,10 +1023,13 @@ fn compute_credits(
     credit_rate: i128,
     ledgers_elapsed: u32,
 ) -> i128 {
-    compute_total_stake(amount, allocation_pct, multiplier)
+    let base = compute_total_stake(amount, allocation_pct, multiplier)
         .checked_mul(credit_rate)
         .and_then(|t| t.checked_mul(ledgers_elapsed as i128))
+        .expect("credits arithmetic overflow");
+    base.checked_mul(get_tier_multiplier(amount) as i128)
         .expect("credits arithmetic overflow")
+        / 100
 }
 
 fn compute_stake_accrual(env: &Env, user: &Address, stake: &UserStake, current: u32) -> i128 {
@@ -1652,6 +1673,43 @@ impl FarmingPool {
     /// Alias for `calculate_credits` providing explicit system-specific naming.
     pub fn get_position_credits(env: Env, user: Address) -> Result<i128, PoolError> {
         Self::calculate_credits(env, user)
+    }
+
+    /// Return a detailed breakdown of how `user`'s reward multiplier is
+    /// composed (#640).
+    ///
+    /// Useful for dashboards that want to show users exactly why their
+    /// effective stake differs from their raw stake amount without having to
+    /// replicate the pool's arithmetic client-side.
+    pub fn get_multiplier_breakdown(
+        env: Env,
+        user: Address,
+    ) -> Result<MultiplierBreakdown, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
+        let global_multiplier = read_global_multiplier(&env);
+
+        let (stake_amount, credit_rate, banked_credits) =
+            match get_user_stake(&env, &user) {
+                Some(stake) => (stake.amount, stake.credit_rate, stake.credits_banked),
+                None => match get_position(&env, &user) {
+                    Some(pos) => (pos.amount, pos.credit_rate, pos.total_credits),
+                    None => (0i128, read_credit_rate(&env), 0i128),
+                },
+            };
+
+        let effective_stake = compute_total_stake(stake_amount, allocation_pct, global_multiplier);
+
+        Ok(MultiplierBreakdown {
+            stake_amount,
+            allocation_pct,
+            global_multiplier,
+            effective_stake,
+            credit_rate,
+            banked_credits,
+        })
     }
 
     pub fn get_user_position(env: Env, user: Address) -> Result<Option<Position>, PoolError> {
@@ -2434,6 +2492,47 @@ impl FarmingPool {
 
     /// Set the global credit multiplier. Rejects 0 and anything above
     /// `MAX_GLOBAL_MULTIPLIER` — see #89 for the overflow-safety derivation.
+    /// Revert the global multiplier to its previous value (#664).
+    ///
+    /// Reads the last entry in `GlobalMultiplierHistory`, validates that the
+    /// stored `new_multiplier` is what is currently live, and re-applies the
+    /// stored `old_multiplier` via the same code path as `set_global_multiplier`.
+    ///
+    /// Returns `PoolError::NoMultiplierHistory` if there is no history entry to
+    /// roll back to, or `PoolError::MultiplierRollbackConflict` if the current
+    /// multiplier differs from the last recorded `new_multiplier` (which would
+    /// indicate a concurrent change that must be resolved manually).
+    pub fn rollback_multiplier(env: Env) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GlobalMultiplierEventCount)
+            .unwrap_or(0);
+        if count == 0 {
+            return Err(PoolError::NoMultiplierHistory);
+        }
+        let last_idx = count - 1;
+        let event: GlobalMultiplierEvent = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GlobalMultiplierHistory(last_idx))
+            .ok_or(PoolError::NoMultiplierHistory)?;
+
+        let current = read_global_multiplier(&env);
+        if current != event.new_multiplier {
+            return Err(PoolError::MultiplierRollbackConflict);
+        }
+
+        // Apply the rollback through the standard setter to keep history
+        // consistent and re-emit the multiplier change event.
+        Self::set_global_multiplier(env, event.old_multiplier)
+    }
+
     pub fn set_global_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
         require_initialized(&env)?;
         let admin = get_admin(&env)?;
@@ -3256,6 +3355,17 @@ impl FarmingPool {
     ///
     /// `offset`: zero-based index of the first event to return.
     /// `limit`: maximum number of events to return per call.
+    /// Return the enforced multiplier range as (min, max) (#646).
+    ///
+    /// `set_global_multiplier` already validates against `MAX_GLOBAL_MULTIPLIER`
+    /// (= 1 000) with a minimum of 1.  Exposing the limits here lets dashboards
+    /// and SDK clients display the bounds to users without hard-coding them.
+    pub fn get_multiplier_limits(env: Env) -> Result<(u32, u32), PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok((1u32, MAX_GLOBAL_MULTIPLIER))
+    }
+
     pub fn get_global_multiplier_history(
         env: Env,
         offset: u32,
@@ -3343,6 +3453,22 @@ impl FarmingPool {
         })
     }
 
+    /// Return the stake-size reward multiplier in percent for `stake_amount` (#616).
+    ///
+    /// `100` (1.0x) at or below 100_000, `150` (1.5x) above 100_000 up to
+    /// 1_000_000, and `200` (2.0x) above 1_000_000. This multiplier is applied
+    /// to all credit accrual. It is distinct from the basis-point
+    /// `TierInfo.reward_multiplier` reported by `get_user_tier_info`, which is
+    /// driven by earned tier points rather than stake size.
+    pub fn get_tier_multiplier(env: Env, stake_amount: i128) -> Result<u32, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        if stake_amount < 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+        Ok(get_tier_multiplier(stake_amount))
+    }
+
     /// Award tier points to a user (admin-only).
     ///
     /// Admin can award tier points to users for special achievements or milestones.
@@ -3421,12 +3547,12 @@ impl FarmingPool {
         }
 
         add_total_distributed_rewards(&env, total_distributed);
-        record_distribution_event(&env, users.len() as u32, total_distributed, &admin);
+        record_distribution_event(&env, users.len(), total_distributed, &admin);
 
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("pool"), symbol_short!("bulk_rwd")),
-            (users.len() as u32, total_distributed),
+            (users.len(), total_distributed),
         );
 
         Ok(())
@@ -3603,6 +3729,58 @@ impl FarmingPool {
         Ok(read_global_multiplier_change_ledger(&env))
     }
 
+    /// Validate that `multiplier` is an acceptable global multiplier value (#661).
+    ///
+    /// Returns `Ok(())` when the value is in [1, MAX_GLOBAL_MULTIPLIER].
+    /// Returns `Err(PoolError::InvalidGlobalMultiplier)` otherwise.
+    /// Useful for client-side pre-validation before calling `set_global_multiplier`.
+    pub fn validate_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        if !(1..=MAX_GLOBAL_MULTIPLIER).contains(&multiplier) {
+            return Err(PoolError::InvalidGlobalMultiplier);
+        }
+        Ok(())
+    }
+
+    /// Simulate the credits a user would earn over `ledgers` with `new_multiplier` (#655).
+    ///
+    /// Returns the projected credit amount using the current user position and
+    /// credit rate but with `new_multiplier` substituted for the live global
+    /// multiplier, so an admin can preview the impact of a multiplier change
+    /// before applying it.
+    pub fn simulate_multiplier(
+        env: Env,
+        user: Address,
+        new_multiplier: u32,
+        ledgers: u32,
+    ) -> Result<i128, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        if !(1..=MAX_GLOBAL_MULTIPLIER).contains(&new_multiplier) {
+            return Err(PoolError::InvalidGlobalMultiplier);
+        }
+
+        let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
+
+        let (stake_amount, credit_rate) = match get_user_stake(&env, &user) {
+            Some(stake) => (stake.amount, stake.credit_rate),
+            None => match get_position(&env, &user) {
+                Some(pos) => (pos.amount, pos.credit_rate),
+                None => return Ok(0),
+            },
+        };
+
+        Ok(compute_credits(
+            stake_amount,
+            allocation_pct,
+            new_multiplier,
+            credit_rate,
+            ledgers,
+        ))
+    }
+
     // ── Feature improvements: #578, #579 ───────────────────────────────────
 
     /// Return the net token flow into the pool: total deposits minus total withdrawals (Issue #578).
@@ -3649,24 +3827,13 @@ impl FarmingPool {
         let staked_users = get_staked_users_list(&env);
 
         for user in staked_users.iter() {
-            if let Some(stake) = get_user_stake(&env, &user) {
-                if stake.balance > 0 {
-                    let pending_credits = stake
-                        .credits_outstanding
-                        .saturating_sub(stake.credits_claimed);
-
-                    if pending_credits > 0 {
-                        set_user_stake(
-                            &env,
-                            &user,
-                            &UserStake {
-                                balance: stake.balance,
-                                credits_claimed: stake.credits_outstanding,
-                                credits_outstanding: stake.credits_outstanding,
-                            },
-                        );
-                        total_distributed = total_distributed.saturating_add(pending_credits);
-                    }
+            if let Some(mut stake) = get_user_stake(&env, &user) {
+                let banked_before = stake.credits_banked;
+                checkpoint(&env, &user, &mut stake);
+                let newly_banked = stake.credits_banked.saturating_sub(banked_before);
+                if newly_banked > 0 {
+                    set_user_stake(&env, &user, &stake);
+                    total_distributed = total_distributed.saturating_add(newly_banked);
                 }
             }
         }
@@ -3695,13 +3862,18 @@ impl FarmingPool {
 
         for user in staked_users.iter() {
             if let Some(stake) = get_user_stake(&env, &user) {
-                if stake.balance > 0 {
-                    leaderboard.push_back((user, stake.balance));
+                if stake.amount > 0 {
+                    let mut insert_at = leaderboard.len();
+                    for (index, (_, amount)) in leaderboard.iter().enumerate() {
+                        if stake.amount > amount {
+                            insert_at = index as u32;
+                            break;
+                        }
+                    }
+                    leaderboard.insert(insert_at, (user, stake.amount));
                 }
             }
         }
-
-        leaderboard.sort_by(|a, b| b.1.cmp(&a.1));
 
         let mut result: Vec<LeaderboardEntry> = Vec::new(&env);
         for (index, (staker, balance)) in leaderboard.iter().enumerate() {
@@ -3720,3 +3892,31 @@ impl FarmingPool {
 }
 
 mod test;
+
+impl FarmingPool {
+    /// Return the cached reward multiplier for `user`, recomputing and caching
+    /// it if no valid cache entry exists (issue #652).
+    ///
+    /// The multiplier is stored in persistent storage keyed by
+    /// `DataKey::CachedMultiplier(user)`. Callers that change inputs that affect
+    /// the multiplier (e.g. `set_boost`) must invalidate the cache entry by
+    /// calling `invalidate_multiplier_cache`.
+    pub fn get_cached_multiplier(env: Env, user: Address) -> Result<u32, PoolError> {
+        let key = DataKey::CachedMultiplier(user.clone());
+        if let Some(cached) = env.storage().persistent().get::<_, u32>(&key) {
+            return Ok(cached);
+        }
+        let multiplier = read_global_multiplier(&env);
+        env.storage().persistent().set(&key, &multiplier);
+        Ok(multiplier)
+    }
+
+    /// Invalidate the cached multiplier for `user` so the next call to
+    /// `get_cached_multiplier` recomputes it from the current global multiplier.
+    pub fn invalidate_multiplier_cache(env: Env, user: Address) -> Result<(), PoolError> {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CachedMultiplier(user));
+        Ok(())
+    }
+}
