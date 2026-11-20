@@ -451,10 +451,7 @@ impl VestingWallet {
     pub fn cliff_end_notified(env: Env) -> Result<bool, VestingError> {
         require_initialized(&env)?;
         bump_instance(&env);
-        Ok(env
-            .storage()
-            .instance()
-            .has(&DataKey::CliffEndNotified))
+        Ok(env.storage().instance().has(&DataKey::CliffEndNotified))
     }
 
     /// Return the current beneficiary address. Reflects any prior

@@ -1135,7 +1135,9 @@ fn cliff_end_events(t: &TestEnv) -> std::vec::Vec<ScVal> {
         .events()
         .iter()
         .filter_map(|event| match &event.body {
-            ContractEventBody::V0(body) if body.topics.as_slice() == topics.as_slice() => Some(body.data.clone()),
+            ContractEventBody::V0(body) if body.topics.as_slice() == topics.as_slice() => {
+                Some(body.data.clone())
+            }
             _ => None,
         })
         .collect()

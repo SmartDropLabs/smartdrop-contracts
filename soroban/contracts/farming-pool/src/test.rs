@@ -26,8 +26,9 @@ fn setup() -> TestEnv {
     let contract_id = env.register(FarmingPool, ());
     let client = FarmingPoolClient::new(&env, &contract_id);
     client.initialize(&admin, &asset.address(), &1u32, &1_000i128, &1u32, &1i128);
-    let client =
-        unsafe { core::mem::transmute::<FarmingPoolClient<'_>, FarmingPoolClient<'static>>(client) };
+    let client = unsafe {
+        core::mem::transmute::<FarmingPoolClient<'_>, FarmingPoolClient<'static>>(client)
+    };
 
     TestEnv {
         env,

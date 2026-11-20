@@ -358,9 +358,7 @@ fn compute_pool_risk_score(
     };
 
     if record.credit_rate > 0 {
-        let rate_pct = (record.credit_rate as u128)
-            .saturating_mul(100)
-            / (MAX_CREDIT_RATE as u128);
+        let rate_pct = (record.credit_rate as u128).saturating_mul(100) / (MAX_CREDIT_RATE as u128);
         if rate_pct >= 50 {
             score += 20;
         } else if rate_pct >= 10 {
