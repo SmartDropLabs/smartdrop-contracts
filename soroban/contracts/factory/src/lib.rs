@@ -679,6 +679,46 @@ impl Factory {
         }
     }
 
+    /// Validate that every pool ID in `deps` is registered in the factory (#656).
+    ///
+    /// Returns `Ok(())` when all IDs resolve to a known `PoolRecord`.
+    /// Returns `Err(FactoryError::PoolNotFound)` for the first unrecognised ID.
+    /// Useful for protocols that compose multiple pools and want to assert that
+    /// all prerequisites are live before deploying a dependent contract.
+    pub fn validate_pool_dependencies(
+        env: Env,
+        deps: Vec<u32>,
+    ) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        for i in 0..deps.len() {
+            let dep_id = deps.get_unchecked(i);
+            if !env.storage().persistent().has(&DataKey::Pool(dep_id)) {
+                return Err(FactoryError::PoolNotFound);
+            }
+        }
+        Ok(())
+    }
+
+    /// Return a snapshot of `pool_id`'s `PoolRecord` for backup purposes (#659).
+    ///
+    /// A backup is just the pool's current `PoolRecord` — a fully serialisable
+    /// value that can be stored off-chain and later used with a future
+    /// `import_pool` call to restore the entry.  Extends the pool's TTL so the
+    /// record is not archived between the backup and a potential restore.
+    pub fn backup_pool(env: Env, pool_id: u32) -> Result<PoolRecord, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let key = DataKey::Pool(pool_id);
+        match env.storage().persistent().get::<DataKey, PoolRecord>(&key) {
+            Some(r) => {
+                bump_pool(&env, pool_id);
+                Ok(r)
+            }
+            None => Err(FactoryError::PoolNotFound),
+        }
+    }
+
     /// Return a page of pool records in ascending pool ID order.
     ///
     /// `limit` is capped at 20 records so callers can page through large

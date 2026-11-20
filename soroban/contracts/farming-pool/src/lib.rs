@@ -3603,6 +3603,58 @@ impl FarmingPool {
         Ok(read_global_multiplier_change_ledger(&env))
     }
 
+    /// Validate that `multiplier` is an acceptable global multiplier value (#661).
+    ///
+    /// Returns `Ok(())` when the value is in [1, MAX_GLOBAL_MULTIPLIER].
+    /// Returns `Err(PoolError::InvalidGlobalMultiplier)` otherwise.
+    /// Useful for client-side pre-validation before calling `set_global_multiplier`.
+    pub fn validate_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        if !(1..=MAX_GLOBAL_MULTIPLIER).contains(&multiplier) {
+            return Err(PoolError::InvalidGlobalMultiplier);
+        }
+        Ok(())
+    }
+
+    /// Simulate the credits a user would earn over `ledgers` with `new_multiplier` (#655).
+    ///
+    /// Returns the projected credit amount using the current user position and
+    /// credit rate but with `new_multiplier` substituted for the live global
+    /// multiplier, so an admin can preview the impact of a multiplier change
+    /// before applying it.
+    pub fn simulate_multiplier(
+        env: Env,
+        user: Address,
+        new_multiplier: u32,
+        ledgers: u32,
+    ) -> Result<i128, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        if !(1..=MAX_GLOBAL_MULTIPLIER).contains(&new_multiplier) {
+            return Err(PoolError::InvalidGlobalMultiplier);
+        }
+
+        let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
+
+        let (stake_amount, credit_rate) = match get_user_stake(&env, &user) {
+            Some(stake) => (stake.amount, stake.credit_rate),
+            None => match get_position(&env, &user) {
+                Some(pos) => (pos.amount, pos.credit_rate),
+                None => return Ok(0),
+            },
+        };
+
+        Ok(compute_credits(
+            stake_amount,
+            allocation_pct,
+            new_multiplier,
+            credit_rate,
+            ledgers,
+        ))
+    }
+
     // ── Feature improvements: #578, #579 ───────────────────────────────────
 
     /// Return the net token flow into the pool: total deposits minus total withdrawals (Issue #578).
