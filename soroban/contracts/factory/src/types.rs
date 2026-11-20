@@ -44,6 +44,8 @@ pub enum DataKey {
     /// Last-synced TVL for a single pool, keyed by pool ID. This is the term
     /// currently folded into `TotalTvl` for that pool (#249).
     PoolTvl(u32),
+    /// Insurance fund balance for a specific pool.
+    InsuranceFund(u32),
 }
 
 /// On-chain record for a registered farming pool.
@@ -201,4 +203,6 @@ pub enum FactoryError {
     /// `deprecate_pool` was called on a pool that is already deprecated.
     /// See #602.
     AlreadyDeprecated = 22,
+    /// Insufficient funds in the insurance fund for the requested claim.
+    InsufficientFunds = 23,
 }

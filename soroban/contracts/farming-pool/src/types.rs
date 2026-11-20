@@ -461,3 +461,15 @@ pub struct PoolAnalytics {
     /// Pool TVL turnover ratio (total_deposits / total_staked).
     pub tvl_ratio: u64,
 }
+
+/// Leaderboard entry for top stakers returned by `get_leaderboard`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaderboardEntry {
+    /// The staker's address.
+    pub staker: Address,
+    /// Total stake balance held by this staker.
+    pub stake_balance: i128,
+    /// Rank position in the leaderboard.
+    pub rank: u32,
+}

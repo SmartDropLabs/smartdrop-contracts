@@ -540,6 +540,40 @@ impl VestingWallet {
         Ok(())
     }
 
+    /// Set a delegate address that can claim vesting rights on behalf of the beneficiary.
+    /// Beneficiary must authorise this delegation.
+    ///
+    /// The delegate can call `release` to claim vested tokens on behalf of the beneficiary.
+    /// The beneficiary remains the ultimate owner and can revoke delegation by setting
+    /// a zero address (or calling this again with a different address).
+    pub fn delegate(env: Env, delegate: Address) -> Result<(), VestingError> {
+        require_initialized(&env)?;
+        let beneficiary = get_beneficiary(&env);
+        beneficiary.require_auth();
+        bump_instance(&env);
+
+        if delegate == zero_address(&env) {
+            env.storage().instance().remove(&DataKey::Delegate);
+        } else {
+            env.storage().instance().set(&DataKey::Delegate, &delegate);
+        }
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("vest"), symbol_short!("del_set")),
+            delegate,
+        );
+
+        Ok(())
+    }
+
+    /// Get the current delegate address, if one is set.
+    pub fn get_delegate(env: Env) -> Result<Option<Address>, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(env.storage().instance().get(&DataKey::Delegate))
+    }
+
     /// Return the token address for the vesting schedule.
     pub fn token(env: Env) -> Result<Address, VestingError> {
         require_initialized(&env)?;
