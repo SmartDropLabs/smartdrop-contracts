@@ -557,6 +557,7 @@ fn create_pool_inner(
         daily_rate,
         wasm_hash: wasm_hash.clone(),
         deprecated: false,
+        version: 0,
     };
     env.storage()
         .persistent()
@@ -1345,6 +1346,7 @@ impl Factory {
 
         let old_hash = record.wasm_hash.clone();
         record.wasm_hash = new_wasm_hash.clone();
+        record.version = record.version.saturating_add(1);
         env.storage().persistent().set(&key, &record);
 
         let old_wasm_key = DataKey::PoolsByWasmHash(old_hash.clone());

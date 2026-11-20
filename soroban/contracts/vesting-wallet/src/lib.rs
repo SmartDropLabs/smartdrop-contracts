@@ -483,6 +483,36 @@ impl VestingWallet {
         })
     }
 
+    /// Import a vesting schedule from an external source (#639).
+    ///
+    /// Allows an admin to initialise this contract from a `VestingSchedule`
+    /// produced elsewhere (e.g. migrated from an off-chain spreadsheet or a
+    /// deprecated contract version) instead of having to pass each field
+    /// individually. Under the hood this delegates to `initialize`, so the
+    /// same validations apply and the wallet must not already be initialised.
+    ///
+    /// `token` and `admin` are passed separately because `VestingSchedule`
+    /// carries the logical parameters only (what, when) not the operational
+    /// ones (which token contract, who administers it).
+    pub fn import_vesting(
+        env: Env,
+        schedule: VestingSchedule,
+        token: Address,
+        admin: Address,
+    ) -> Result<(), VestingError> {
+        Self::initialize(
+            env,
+            schedule.beneficiary,
+            token,
+            schedule.total_amount,
+            schedule.start_ledger,
+            schedule.cliff_ledger,
+            schedule.end_ledger,
+            schedule.revocable,
+            admin,
+        )
+    }
+
     /// Return the whole schedule *and* its live progress in a single call.
     ///
     /// `get_vesting_schedule` returns the configured parameters only, so a
