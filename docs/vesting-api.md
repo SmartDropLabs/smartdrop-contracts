@@ -71,13 +71,35 @@ clients already decoding it keep working. New consumers should prefer
 
 | Entry point | Authorization | Notes |
 | :--- | :--- | :--- |
-| `initialize(...)` | `admin` | Once per wallet. Pulls `total_amount` from `admin`. |
+| `initialize(...)` | `admin` | Once per wallet. Pulls `total_amount` from `admin`. Rejects schedules over the [limits](#schedule-limits). |
 | `release()` | `beneficiary` | Transfers the **entire** vested-but-unclaimed balance in one transfer. |
 | `release_all()` | `beneficiary` | Convenience alias for `release()`. |
 | `revoke()` | `admin` | Only when `revocable` and not already revoked. |
 | `emergency_withdraw()` | `admin` | Break-glass: drains the raw balance and marks the schedule revoked. |
 | `transfer_beneficiary(...)` | `admin` | Rejects the zero address. |
 | `transfer_admin(...)` | `admin` | Current admin only. |
+
+### Schedule limits
+
+`initialize` (and `import_vesting`, which calls it) bounds the schedule so a mistake cannot
+lock funds for an unreasonable time. Funds are pulled in at initialisation and the schedule
+cannot be changed afterwards, so the check happens before anything is stored or transferred.
+
+| Limit | Value | Error |
+| :--- | :--- | :--- |
+| Duration (`end_ledger - start_ledger`) | at most **6,307,200 ledgers** (365 days at about 5 s per ledger) | `InvalidSchedule` |
+| `total_amount` | at most `i128::MAX / u32::MAX`, the ceiling the vesting formula can handle without overflow | `TotalAmountTooLarge` |
+
+- The duration is measured from `start_ledger` to `end_ledger`, so a late cliff does not extend
+  it: a cliff at the limit with the end one ledger later is still rejected.
+- A schedule of exactly 6,307,200 ledgers is accepted; one ledger more is not.
+- If both limits are broken, `TotalAmountTooLarge` is reported.
+- A rejected `initialize` changes nothing: the wallet stays uninitialised and no tokens move,
+  so it can be initialised again with a valid schedule.
+- Before this limit a schedule could run for up to `u32::MAX` ledgers (over 600 years). Any
+  schedule longer than 365 days must now be split or shortened.
+- The other ordering rules are unchanged: `start_ledger` in the future, `cliff_ledger >=
+  start_ledger`, `end_ledger > cliff_ledger`, and a positive `total_amount`.
 
 ### `release_all`
 
@@ -177,9 +199,10 @@ Emitted by `transfer_admin`.
 
 ## Errors
 
-`VestingError`: `AlreadyInitialized`, `NotInitialized`, `NotRevocable`,
-`AlreadyRevoked`, `Unauthorized`, `TotalAmountTooLarge`, `ArithmeticOverflow`,
-`InvalidInput`.
+`VestingError`: `AlreadyInitialized` (1), `NotInitialized` (2), `NotRevocable` (3),
+`AlreadyRevoked` (4), `Unauthorized` (5), `TotalAmountTooLarge` (6), `ArithmeticOverflow` (7),
+`InvalidInput` (8), `InsufficientBalance` (9), `TreasuryNotConfigured` (10), `InvalidAmount` (11),
+`InvalidSchedule` (12, a schedule longer than 365 days; see [Schedule limits](#schedule-limits)).
 
 ## Deployment caveat
 

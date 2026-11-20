@@ -13,10 +13,23 @@ const TTL_THRESHOLD: u32 = 518_400;
 const TTL_EXTEND_TO: u32 = 1_036_800;
 
 // The vesting formula multiplies total_amount by the elapsed portion of the
-// schedule. Since valid ledger values are u32 and the largest valid duration
-// is u32::MAX, this ceiling guarantees that product fits in i128 for every
-// valid schedule: i128::MAX / u32::MAX.
+// schedule. Valid ledger values are u32, so even the largest possible duration
+// is below u32::MAX; this ceiling, computed for u32::MAX, therefore guarantees
+// the product fits in i128 for every valid schedule: i128::MAX / u32::MAX.
+// (Schedules are further limited to MAX_VESTING_DURATION_LEDGERS below.)
 const MAX_TOTAL_AMOUNT: i128 = i128::MAX / 4_294_967_295i128;
+
+/// Seconds a ledger takes to close, which the schedule limits are expressed
+/// against (about 5 s on Stellar, the same assumption the TTL constants above make).
+const SECONDS_PER_LEDGER: u32 = 5;
+
+/// Longest vesting schedule `initialize` accepts, in seconds: 365 days (#684).
+const MAX_VESTING_DURATION_SECS: u32 = 365 * 24 * 60 * 60;
+
+/// The same limit in ledgers (6_307_200), because schedules are configured in
+/// ledger sequences. Measured from `start_ledger` to `end_ledger`, so a late
+/// cliff does not extend it.
+const MAX_VESTING_DURATION_LEDGERS: u32 = MAX_VESTING_DURATION_SECS / SECONDS_PER_LEDGER;
 
 /// Early-withdrawal penalty in basis points (10% = 1_000 bps). See #605.
 const EARLY_WITHDRAWAL_PENALTY_BPS: i128 = 1_000;
@@ -210,6 +223,12 @@ impl VestingWallet {
     /// - `cliff_ledger`: ledger before which nothing is releasable (≥ start_ledger).
     /// - `end_ledger`: ledger at which the full amount is vested (> cliff_ledger).
     /// - `revocable`: if true, `admin` may cancel the unvested portion later.
+    ///
+    /// Returns `InvalidSchedule` if the schedule runs for more than 365 days
+    /// (`end_ledger - start_ledger` above 6_307_200 ledgers, at about 5 s per
+    /// ledger), and `TotalAmountTooLarge` if `total_amount` exceeds the ceiling
+    /// the vesting formula can handle (which takes precedence). `import_vesting`
+    /// applies the same limits (#684).
     pub fn initialize(
         env: Env,
         beneficiary: Address,
@@ -239,6 +258,13 @@ impl VestingWallet {
         let duration = i128::from(end_ledger - start_ledger);
         if total_amount > MAX_TOTAL_AMOUNT || total_amount.checked_mul(duration).is_none() {
             return Err(VestingError::TotalAmountTooLarge);
+        }
+        // #684 — bound how long a schedule can run. Without a limit a schedule could
+        // lock funds for up to u32::MAX ledgers (over 600 years), which is almost
+        // certainly a mistake and could never be corrected once funds are pulled in.
+        // `end > cliff >= start` was asserted above, so `duration` is positive.
+        if duration > i128::from(MAX_VESTING_DURATION_LEDGERS) {
+            return Err(VestingError::InvalidSchedule);
         }
 
         admin.require_auth();
