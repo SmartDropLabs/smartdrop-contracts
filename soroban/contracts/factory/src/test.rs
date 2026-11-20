@@ -2238,3 +2238,123 @@ fn test_asset_index_survives_a_paginated_walk() {
         "every indexed pool for the asset should be returned exactly once"
     );
 }
+
+// ── get_pool_risk (#614) ───────────────────────────────────────────────────────
+
+fn risk_pool_record(
+    env: &Env,
+    wasm_hash: &BytesN<32>,
+    credit_rate: i128,
+    min_lock_period: u32,
+    deprecated: bool,
+) -> PoolRecord {
+    PoolRecord {
+        address: Address::generate(env),
+        asset: Address::generate(env),
+        credit_rate,
+        global_multiplier: 1_000,
+        min_lock_period,
+        daily_rate: (credit_rate as u128) * 17_280,
+        wasm_hash: wasm_hash.clone(),
+        deprecated,
+    }
+}
+
+/// Fixture-free setup: writes pool records straight to storage after a tiny
+/// WASM upload, so risk tests never depend on the oversized farming-pool WASM.
+fn setup_risk_fixture(
+    env: &Env,
+    wasm_hash: &BytesN<32>,
+    configs: &[(PoolRecord, i128, i128)],
+) -> (FactoryClient<'static>, Address) {
+    env.mock_all_auths();
+    let admin = Address::generate(env);
+    let factory_addr = env.register(Factory, ());
+    let client = FactoryClient::new(env, &factory_addr);
+    client.initialize(&admin, wasm_hash);
+    let client =
+        unsafe { core::mem::transmute::<FactoryClient<'_>, FactoryClient<'static>>(client) };
+
+    env.as_contract(&factory_addr, || {
+        for (pool_id, (record, tvl, insurance)) in configs.iter().enumerate() {
+            let pool_id = pool_id as u32;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Pool(pool_id), record);
+            env.storage()
+                .persistent()
+                .set(&DataKey::PoolTvl(pool_id), tvl);
+            if *insurance > 0 {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::InsuranceFund(pool_id), insurance);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolCount, &(configs.len() as u32));
+    });
+
+    (client, factory_addr)
+}
+
+#[test]
+fn test_get_pool_risk_healthy_pool_scores_zero() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let configs = [(
+        risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, false),
+        10_000_000i128,
+        0i128,
+    )];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    assert_eq!(client.get_pool_risk(&0), 0);
+    assert_eq!(client.get_pool_risk(&0), client.get_pool_risk(&0));
+}
+
+#[test]
+fn test_get_pool_risk_all_signals_fire_and_are_capped() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let outdated = BytesN::from_array(&env, &[9; 32]);
+    let configs = [(
+        risk_pool_record(&env, &outdated, 60_000_000, 1, true),
+        0i128,
+        0i128,
+    )];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    assert_eq!(client.get_pool_risk(&0), 100);
+}
+
+#[test]
+fn test_get_pool_risk_insurance_offsets_deprecation_and_short_lock() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let configs = [(
+        risk_pool_record(&env, &wasm_hash, 0, 1, true),
+        10_000_000i128,
+        10_000_000i128,
+    )];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    assert_eq!(client.get_pool_risk(&0), 50);
+}
+
+#[test]
+fn test_get_pool_risk_rejects_uninitialized_and_unknown_pool() {
+    let (_, uninitialized) = setup_uninitialized();
+    assert_eq!(
+        uninitialized.try_get_pool_risk(&0),
+        Err(Ok(FactoryError::NotInitialized))
+    );
+
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &[]);
+    assert_eq!(
+        client.try_get_pool_risk(&0),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
+}
