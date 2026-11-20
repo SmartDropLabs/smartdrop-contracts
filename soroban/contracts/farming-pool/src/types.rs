@@ -216,6 +216,8 @@ pub enum DataKey {
     PeakTotalStaked,
     /// Current number of unique users with any stake or position.
     UniqueUserCount,
+    /// Cached reward multiplier per user (issue #652).
+    CachedMultiplier(Address),
 }
 
 /// Paginated response for `get_whitelisted_users`.

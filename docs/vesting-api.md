@@ -30,6 +30,7 @@ vested(now) = 0                                        now < cliff_ledger
 | `releasable()` | `i128` | Vested minus released — what a release would transfer right now. |
 | `vesting_dates()` | `(u32, u32, u32)` | `(start_ledger, cliff_ledger, end_ledger)` in one read. |
 | `revocable()` / `revoked()` | `bool` | Whether `admin` may revoke, and whether it already has. |
+| `cliff_end_notified()` | `bool` | Whether the one-time `vest/cliff_end` event has fired (#615). |
 | `beneficiary()` / `token()` / `admin()` | `Address` | Current addresses. `beneficiary` reflects `transfer_beneficiary`. |
 | `release_count()` / `get_release_count()` | `u32` | Number of successful release operations. |
 
@@ -132,6 +133,19 @@ emits nothing, so an indexer never records a release that did not happen.
 > three, so an indexer built from that table would mis-parse it. Track progress
 > from `released_total` and the previous event's value rather than summing the
 > per-call amounts yourself.
+
+### `cliff_end`
+
+Emitted once when a schedule with a real cliff reaches its cliff ledger. The
+check runs in `release`, `withdraw_early`, and `revoke`; the stored flag makes
+it idempotent. Schedules with `cliff_ledger == start_ledger` emit nothing.
+
+* **Topics:** `(Symbol, Symbol)` → `(symbol_short!("vest"), symbol_short!("cliff_end"))`
+
+| Field | Rust Type | Description |
+| :--- | :--- | :--- |
+| `beneficiary` | `Address` | The schedule's beneficiary. |
+| `timestamp` | `u64` | Ledger timestamp when the cliff was detected. |
 
 ### `revoked`
 

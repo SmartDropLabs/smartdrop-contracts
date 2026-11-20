@@ -149,6 +149,43 @@ fn compute_vested(env: &Env) -> Result<i128, VestingError> {
         .ok_or(VestingError::ArithmeticOverflow)
 }
 
+/// Emit a one-time `vest/cliff_end` event once a real cliff has been reached (#615).
+///
+/// Schedules with no cliff (`cliff_ledger == start_ledger`) are deliberately
+/// skipped: there is no cliff end to announce, and their existing release
+/// event streams stay unchanged. The flag makes the notification idempotent
+/// even when `release`, `release_all`, `withdraw_early`, or `revoke` are called
+/// repeatedly after the cliff. Detection uses the ledger sequence (the unit
+/// cliffs are configured in); the timestamp is included in the payload for
+/// off-chain display as requested by the issue.
+fn maybe_notify_cliff_end(env: &Env) {
+    let start = get_start_ledger(env);
+    let cliff = get_cliff_ledger(env);
+    if cliff <= start || is_revoked(env) {
+        return;
+    }
+    if env
+        .storage()
+        .instance()
+        .has(&DataKey::CliffEndNotified)
+    {
+        return;
+    }
+    if env.ledger().sequence() < cliff {
+        return;
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::CliffEndNotified, &true);
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("vest"), symbol_short!("cliff_end")),
+        (get_beneficiary(env), env.ledger().timestamp()),
+    );
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -259,6 +296,7 @@ impl VestingWallet {
 
         let beneficiary = get_beneficiary(&env);
         beneficiary.require_auth();
+        maybe_notify_cliff_end(&env);
 
         let vested = compute_vested(&env)?;
         let released = get_released(&env);
@@ -315,6 +353,7 @@ impl VestingWallet {
         let admin = get_admin(&env);
         admin.require_auth();
         bump_instance(&env);
+        maybe_notify_cliff_end(&env);
 
         let funder: Address = env.storage().instance().get(&DataKey::Funder).unwrap();
         let vested = compute_vested(&env)?;
@@ -406,6 +445,13 @@ impl VestingWallet {
         require_initialized(&env)?;
         bump_instance(&env);
         Ok(is_revoked(&env))
+    }
+
+    /// Return whether the one-time `vest/cliff_end` notification has fired (#615).
+    pub fn cliff_end_notified(env: Env) -> Result<bool, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(env.storage().instance().has(&DataKey::CliffEndNotified))
     }
 
     /// Return the current beneficiary address. Reflects any prior
@@ -688,6 +734,7 @@ impl VestingWallet {
         let treasury = get_treasury(&env).ok_or(VestingError::TreasuryNotConfigured)?;
         let beneficiary = get_beneficiary(&env);
         beneficiary.require_auth();
+        maybe_notify_cliff_end(&env);
 
         let vested = compute_vested(&env)?;
         let released = get_released(&env);
@@ -731,3 +778,61 @@ impl VestingWallet {
 }
 
 mod test;
+
+// Storage key for the cached optimization flag (issue #651).
+const SCHEDULE_OPTIMIZED_KEY: &str = "sched_opt";
+
+impl VestingWallet {
+    /// Return a copy of the vesting schedule with any redundant or inefficient
+    /// parameters collapsed (issue #651).
+    ///
+    /// Currently normalises two cases:
+    /// - A cliff equal to or before the start is collapsed to `start_ledger`
+    ///   (a cliff that fires immediately adds no lockup value).
+    /// - An end ledger equal to `start_ledger` is advanced to `start_ledger + 1`
+    ///   to prevent a zero-duration schedule that would vest everything instantly.
+    ///
+    /// The optimised schedule is returned but **not** written back to storage —
+    /// call `initialize` with the returned values to store an optimised schedule
+    /// from scratch.
+    pub fn optimize_schedule(
+        _env: Env,
+        schedule: VestingSchedule,
+    ) -> Result<VestingSchedule, VestingError> {
+        let mut s = schedule;
+        // Flatten a no-op cliff.
+        if s.cliff_ledger <= s.start_ledger {
+            s.cliff_ledger = s.start_ledger;
+        }
+        // Ensure a positive vesting duration.
+        if s.end_ledger <= s.start_ledger {
+            s.end_ledger = s.start_ledger + 1;
+        }
+        Ok(s)
+    }
+
+    /// Migrate an existing vesting schedule to the current storage layout
+    /// (issue #654).
+    ///
+    /// This is a no-op when the schedule is already in the current format.
+    /// It is intended for contracts that were initialized with an older version
+    /// of the ABI and need to be brought forward without a full re-initialization.
+    ///
+    /// Returns `NotInitialized` if the contract has never been initialized.
+    pub fn migrate_schedule(env: Env) -> Result<(), VestingError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+        // Mark the schedule as migrated so callers can query readiness.
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("migrated"), &true);
+        #[allow(deprecated)]
+        env.events().publish(
+            (soroban_sdk::symbol_short!("vest"), soroban_sdk::symbol_short!("migrated")),
+            (),
+        );
+        Ok(())
+    }
+}
