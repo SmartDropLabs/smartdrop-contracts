@@ -12,6 +12,7 @@ use types::{
 };
 
 pub use types::FactoryError;
+pub use types::HealthStatus;
 pub use types::PoolParams;
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
@@ -1913,3 +1914,33 @@ impl Factory {
 }
 
 mod test;
+
+impl Factory {
+    /// Return a `HealthStatus` for the pool identified by `pool_id` (issue #653).
+    ///
+    /// - `Deprecated` — the pool's `PoolRecord.deprecated` flag is set.
+    /// - `Degraded` — the pool exists but its TVL cannot be read (older WASM).
+    /// - `Healthy` — the pool exists and its TVL can be read.
+    ///
+    /// Returns `FactoryError::NotInitialized` if the factory has not been
+    /// initialized, or `FactoryError::PoolNotFound` if no pool with that id exists.
+    pub fn check_pool_health(env: Env, pool_id: u32) -> Result<HealthStatus, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+
+        if record.deprecated {
+            return Ok(HealthStatus::Deprecated);
+        }
+
+        match query_pool_tvl(&env, &record.pool) {
+            Ok(_) => Ok(HealthStatus::Healthy),
+            Err(_) => Ok(HealthStatus::Degraded),
+        }
+    }
+}

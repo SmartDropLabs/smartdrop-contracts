@@ -3751,3 +3751,31 @@ impl FarmingPool {
 }
 
 mod test;
+
+impl FarmingPool {
+    /// Return the cached reward multiplier for `user`, recomputing and caching
+    /// it if no valid cache entry exists (issue #652).
+    ///
+    /// The multiplier is stored in persistent storage keyed by
+    /// `DataKey::CachedMultiplier(user)`. Callers that change inputs that affect
+    /// the multiplier (e.g. `set_boost`) must invalidate the cache entry by
+    /// calling `invalidate_multiplier_cache`.
+    pub fn get_cached_multiplier(env: Env, user: Address) -> Result<u32, PoolError> {
+        let key = DataKey::CachedMultiplier(user.clone());
+        if let Some(cached) = env.storage().persistent().get::<_, u32>(&key) {
+            return Ok(cached);
+        }
+        let multiplier = read_global_multiplier(&env);
+        env.storage().persistent().set(&key, &multiplier);
+        Ok(multiplier)
+    }
+
+    /// Invalidate the cached multiplier for `user` so the next call to
+    /// `get_cached_multiplier` recomputes it from the current global multiplier.
+    pub fn invalidate_multiplier_cache(env: Env, user: Address) -> Result<(), PoolError> {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CachedMultiplier(user));
+        Ok(())
+    }
+}
