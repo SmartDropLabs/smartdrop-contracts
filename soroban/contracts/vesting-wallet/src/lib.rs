@@ -701,3 +701,63 @@ impl VestingWallet {
 }
 
 mod test;
+
+impl VestingWallet {
+    /// Restore the vesting schedule parameters from a previously exported
+    /// `VestingSchedule` backup (issue #660).
+    ///
+    /// Only the schedule parameters (`start_ledger`, `cliff_ledger`,
+    /// `end_ledger`, `total_amount`) are restored — `beneficiary`, `token`,
+    /// and `revocable` are intentionally not overwritten to prevent privilege
+    /// escalation. Admin auth is required.
+    ///
+    /// Returns `NotInitialized` if the contract has not yet been set up.
+    pub fn restore_schedule(
+        env: Env,
+        backup: VestingSchedule,
+    ) -> Result<(), VestingError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+
+        env.storage().instance().set(&DataKey::StartLedger, &backup.start_ledger);
+        env.storage().instance().set(&DataKey::CliffLedger, &backup.cliff_ledger);
+        env.storage().instance().set(&DataKey::EndLedger,   &backup.end_ledger);
+        env.storage().instance().set(&DataKey::TotalAmount, &backup.total_amount);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("vest"), symbol_short!("restored")),
+            (backup.start_ledger, backup.end_ledger, backup.total_amount),
+        );
+
+        Ok(())
+    }
+
+    /// Emit an audit event for a vesting schedule action (issue #663).
+    ///
+    /// Any privileged action on the schedule that is not already covered by an
+    /// existing event (initialize, release, revoke …) can call this helper to
+    /// leave a verifiable on-chain trail.  Admin auth is required.
+    ///
+    /// The event topic is `("vest", "audit")` and the data is `(action, detail)`.
+    pub fn emit_audit(
+        env: Env,
+        action: soroban_sdk::String,
+        detail: soroban_sdk::String,
+    ) -> Result<(), VestingError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("vest"), symbol_short!("audit")),
+            (action, detail),
+        );
+
+        Ok(())
+    }
+}

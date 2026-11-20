@@ -1761,3 +1761,68 @@ impl Factory {
 }
 
 mod test;
+
+impl Factory {
+    /// Return a snapshot of the `PoolRecord` for `pool_id` as a portable data
+    /// struct (issue #662).
+    ///
+    /// This is a thin alias over `get_pool` that makes the intent of
+    /// "export for integration / off-chain use" explicit in the API surface.
+    /// The returned `PoolRecord` contains all pool parameters recorded at
+    /// creation time (asset, credit_rate, global_multiplier, min_lock_period,
+    /// daily_rate, wasm_hash, deprecated flag).
+    ///
+    /// Returns `FactoryError::PoolNotFound` if no pool with that id exists.
+    pub fn export_pool(env: Env, pool_id: u32) -> Result<PoolRecord, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        env.storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)
+    }
+
+    /// Roll back the mutable parameters of pool `pool_id` to those stored in
+    /// the provided `snapshot` (issue #644).
+    ///
+    /// Only the fields that the factory controls and that can safely be
+    /// overwritten are rolled back: `credit_rate`, `global_multiplier`,
+    /// `min_lock_period`, and `daily_rate`. The pool contract address,
+    /// asset, wasm_hash, and deprecated flag are never modified by this call.
+    ///
+    /// Admin auth is required.  Returns `FactoryError::PoolNotFound` if the
+    /// pool does not exist.
+    pub fn rollback_pool(
+        env: Env,
+        admin: soroban_sdk::Address,
+        pool_id: u32,
+        snapshot: PoolRecord,
+    ) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        validate_factory_admin(&env, &admin)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        let mut record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+
+        record.credit_rate = snapshot.credit_rate;
+        record.global_multiplier = snapshot.global_multiplier;
+        record.min_lock_period = snapshot.min_lock_period;
+        record.daily_rate = snapshot.daily_rate;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pool(pool_id), &record);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("pool"), soroban_sdk::symbol_short!("rollback")),
+            (pool_id, admin),
+        );
+
+        Ok(())
+    }
+}
