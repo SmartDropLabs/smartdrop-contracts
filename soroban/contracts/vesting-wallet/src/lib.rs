@@ -149,6 +149,43 @@ fn compute_vested(env: &Env) -> Result<i128, VestingError> {
         .ok_or(VestingError::ArithmeticOverflow)
 }
 
+/// Emit a one-time `vest/cliff_end` event once a real cliff has been reached (#615).
+///
+/// Schedules with no cliff (`cliff_ledger == start_ledger`) are deliberately
+/// skipped: there is no cliff end to announce, and their existing release
+/// event streams stay unchanged. The flag makes the notification idempotent
+/// even when `release`, `release_all`, `withdraw_early`, or `revoke` are called
+/// repeatedly after the cliff. Detection uses the ledger sequence (the unit
+/// cliffs are configured in); the timestamp is included in the payload for
+/// off-chain display as requested by the issue.
+fn maybe_notify_cliff_end(env: &Env) {
+    let start = get_start_ledger(env);
+    let cliff = get_cliff_ledger(env);
+    if cliff <= start || is_revoked(env) {
+        return;
+    }
+    if env
+        .storage()
+        .instance()
+        .has(&DataKey::CliffEndNotified)
+    {
+        return;
+    }
+    if env.ledger().sequence() < cliff {
+        return;
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::CliffEndNotified, &true);
+
+    #[allow(deprecated)]
+    env.events().publish(
+        (symbol_short!("vest"), symbol_short!("cliff_end")),
+        (get_beneficiary(env), env.ledger().timestamp()),
+    );
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -259,6 +296,7 @@ impl VestingWallet {
 
         let beneficiary = get_beneficiary(&env);
         beneficiary.require_auth();
+        maybe_notify_cliff_end(&env);
 
         let vested = compute_vested(&env)?;
         let released = get_released(&env);
@@ -315,6 +353,7 @@ impl VestingWallet {
         let admin = get_admin(&env);
         admin.require_auth();
         bump_instance(&env);
+        maybe_notify_cliff_end(&env);
 
         let funder: Address = env.storage().instance().get(&DataKey::Funder).unwrap();
         let vested = compute_vested(&env)?;
@@ -406,6 +445,13 @@ impl VestingWallet {
         require_initialized(&env)?;
         bump_instance(&env);
         Ok(is_revoked(&env))
+    }
+
+    /// Return whether the one-time `vest/cliff_end` notification has fired (#615).
+    pub fn cliff_end_notified(env: Env) -> Result<bool, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(env.storage().instance().has(&DataKey::CliffEndNotified))
     }
 
     /// Return the current beneficiary address. Reflects any prior
@@ -658,6 +704,7 @@ impl VestingWallet {
         let treasury = get_treasury(&env).ok_or(VestingError::TreasuryNotConfigured)?;
         let beneficiary = get_beneficiary(&env);
         beneficiary.require_auth();
+        maybe_notify_cliff_end(&env);
 
         let vested = compute_vested(&env)?;
         let released = get_released(&env);

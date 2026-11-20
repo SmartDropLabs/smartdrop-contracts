@@ -90,6 +90,22 @@ pub struct PoolRecord {
     pub deprecated: bool,
 }
 
+/// Side-by-side view of a pool returned by `compare_pools` (#617).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolComparison {
+    pub pool_id: u32,
+    pub address: Address,
+    pub asset: Address,
+    pub daily_rate: u128,
+    pub credit_rate: i128,
+    pub global_multiplier: u32,
+    pub min_lock_period: u32,
+    pub tvl: i128,
+    pub risk_score: u32,
+    pub deprecated: bool,
+}
+
 /// Sort keys supported by `list_pools_sorted`.
 #[contracttype]
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -217,4 +233,10 @@ pub enum FactoryError {
     AlreadyDeprecated = 22,
     /// Insufficient funds in the insurance fund for the requested claim.
     InsufficientFunds = 23,
+    /// `compare_pools` was called with an empty ID list.
+    EmptyPoolList = 24,
+    /// `compare_pools` was called with more than `MAX_COMPARE_POOLS` IDs.
+    TooManyPools = 25,
+    /// `compare_pools` was called with the same pool ID more than once.
+    DuplicatePoolId = 26,
 }
