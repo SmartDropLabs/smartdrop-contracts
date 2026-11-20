@@ -1753,6 +1753,94 @@ impl Factory {
         )
     }
 
+    /// Register an externally-deployed farming pool with the factory (#665).
+    ///
+    /// Unlike `create_pool`, this function does **not** deploy a new contract.
+    /// It records a caller-supplied `PoolRecord` in the factory's registry so
+    /// the pool appears in `list_pools` / `get_pool` queries.  This is useful
+    /// when migrating pools from another factory instance or when a pool was
+    /// deployed directly (not via this factory) and needs to be brought under
+    /// management.
+    ///
+    /// The admin is required to authorise the import.  Validation checks:
+    /// - the pool address must not already be registered
+    /// - the asset must pass the same zero-address / self-referential checks as
+    ///   `create_pool`
+    /// - `global_multiplier` and `credit_rate` must be within the allowed caps
+    pub fn import_pool(env: Env, record: PoolRecord) -> Result<u32, FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        validate_factory_admin(&env, &admin)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCreationPaused)
+            .unwrap_or(false);
+        if paused {
+            return Err(FactoryError::PoolCreationPaused);
+        }
+
+        validate_asset(&env, &record.asset)?;
+        if record.global_multiplier < 1 || record.global_multiplier > MAX_GLOBAL_MULTIPLIER {
+            return Err(FactoryError::InvalidGlobalMultiplier);
+        }
+        if record.credit_rate <= 0 {
+            return Err(FactoryError::InvalidCreditRate);
+        }
+
+        let pool_id: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
+        let next_count = pool_id.saturating_add(1);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolCount, &next_count);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pool(pool_id), &record);
+        bump_pool(&env, pool_id);
+
+        let asset_key = DataKey::AssetPools(record.asset.clone());
+        let mut asset_pools: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&asset_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        asset_pools.push_back(pool_id);
+        env.storage().persistent().set(&asset_key, &asset_pools);
+
+        let asset_count_key = DataKey::AssetPoolCount(record.asset.clone());
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&asset_count_key)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&asset_count_key, &count.saturating_add(1));
+
+        let admin_key = DataKey::PoolsByAdmin(admin.clone());
+        let mut admin_pools: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&admin_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        admin_pools.push_back(pool_id);
+        env.storage().persistent().set(&admin_key, &admin_pools);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolTvl(pool_id), &0i128);
+
+        Ok(pool_id)
+    }
+
     /// Create multiple pools atomically using the same validation and setup as
     /// `create_pool`. If any item is invalid, the transaction rolls back every
     /// pool created earlier in this batch.
