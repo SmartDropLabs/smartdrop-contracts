@@ -73,3 +73,5 @@ different caller. Deployers must use a Stellar transaction flow that atomically
 batches the wallet deployment and its `initialize` invocation; never publish an
 uninitialized vesting-wallet address or submit deployment and initialization as
 separate transactions.
+
+
