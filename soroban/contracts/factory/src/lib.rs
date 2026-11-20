@@ -7,10 +7,12 @@ use soroban_sdk::{
     Vec,
 };
 use types::{
-    DataKey, ListPoolsResponse, PoolRecord, PoolSort, PoolStatus, RefreshPoolTtlsResponse,
+    DataKey, ListPoolsResponse, PoolComparison, PoolRecord, PoolSort, PoolStatus,
+    RefreshPoolTtlsResponse,
 };
 
 pub use types::FactoryError;
+pub use types::HealthStatus;
 pub use types::PoolParams;
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
@@ -55,6 +57,15 @@ const MAX_DAILY_RATE: u128 = MAX_CREDIT_RATE as u128 * LEDGERS_PER_DAY;
 // batch is a resource-exhaustion vector against the deploying transaction
 // (#528-#531).
 const MAX_BATCH_SIZE: u32 = 10;
+// Risk-score bounds and thresholds (#614). Scores run 0 (safest) to 100
+// (riskiest) and are computed from factory-owned state only.
+const RISK_SCORE_MAX: u32 = 100;
+const RISK_SCORE_DEPRECATED_PENALTY: u32 = 40;
+const RISK_SCORE_OUTDATED_WASM_PENALTY: u32 = 10;
+const RISK_SCORE_TVL_THRESHOLD: i128 = MIN_STAKE_AMOUNT;
+// Upper bound for `compare_pools`: each entry reads several storage keys, so an
+// unbounded list could exhaust the host's footprint budget (#617).
+const MAX_COMPARE_POOLS: u32 = 10;
 
 /// Convert a "credits per day" figure into the deployed pool's native
 /// "credits per ledger" `credit_rate`.
@@ -312,6 +323,69 @@ fn read_pool_tvl(env: &Env, pool_id: u32) -> i128 {
         .persistent()
         .get(&DataKey::PoolTvl(pool_id))
         .unwrap_or(0)
+}
+
+fn read_pool_insurance(env: &Env, pool_id: u32) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::InsuranceFund(pool_id))
+        .unwrap_or(0)
+}
+
+/// Deterministic 0-100 risk score derived solely from factory-owned state (#614).
+///
+/// Higher scores mean higher risk. Deprecation, short lock windows, high credit
+/// rates, low TVL, and running an outdated WASM add points; a funded insurance
+/// fund offsets them. No cross-contract calls are made, so the score cannot be
+/// manipulated by a misbehaving pool and is safe to use inside read-only
+/// comparison queries.
+fn compute_pool_risk_score(
+    env: &Env,
+    pool_id: u32,
+    record: &PoolRecord,
+) -> Result<u32, FactoryError> {
+    let mut score: u32 = 0;
+
+    if record.deprecated {
+        score += RISK_SCORE_DEPRECATED_PENALTY;
+    }
+
+    let one_day = LEDGERS_PER_DAY as u32;
+    score += match record.min_lock_period {
+        period if period >= 30 * one_day => 0,
+        period if period >= 7 * one_day => 10,
+        period if period >= one_day => 20,
+        _ => 30,
+    };
+
+    if record.credit_rate > 0 {
+        let rate_pct = (record.credit_rate as u128).saturating_mul(100) / (MAX_CREDIT_RATE as u128);
+        if rate_pct >= 50 {
+            score += 20;
+        } else if rate_pct >= 10 {
+            score += 10;
+        }
+    }
+
+    let tvl = read_pool_tvl(env, pool_id);
+    if tvl <= 0 {
+        score += 20;
+    } else if tvl < RISK_SCORE_TVL_THRESHOLD {
+        score += 10;
+    }
+
+    let insurance = read_pool_insurance(env, pool_id);
+    if insurance >= 10 * RISK_SCORE_TVL_THRESHOLD {
+        score = score.saturating_sub(20);
+    } else if insurance >= RISK_SCORE_TVL_THRESHOLD {
+        score = score.saturating_sub(10);
+    }
+
+    if load_wasm_hash(env)? != record.wasm_hash {
+        score += RISK_SCORE_OUTDATED_WASM_PENALTY;
+    }
+
+    Ok(score.min(RISK_SCORE_MAX))
 }
 
 fn increment_admin_transfer_count(env: &Env) {
@@ -677,6 +751,85 @@ impl Factory {
             }
             None => Err(FactoryError::PoolNotFound),
         }
+    }
+
+    /// Return a deterministic 0-100 risk score for a registered pool (#614).
+    ///
+    /// `0` means no risk signals were detected; `100` means every signal fired.
+    /// The score is derived entirely from factory-owned state, so it is safe to
+    /// call from other read-only queries and cannot be gamed by a pool contract.
+    ///
+    /// Returns `NotInitialized` before `initialize`, or `PoolNotFound` for an
+    /// unknown `pool_id`. Extends the pool record TTL on success, like `get_pool`.
+    pub fn get_pool_risk(env: Env, pool_id: u32) -> Result<u32, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        let key = DataKey::Pool(pool_id);
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&key)
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+        compute_pool_risk_score(&env, pool_id, &record)
+    }
+
+    /// Compare up to `MAX_COMPARE_POOLS` registered pools side by side (#617).
+    ///
+    /// Results follow the exact order of `pool_ids`; no sorting is applied so
+    /// callers can align the response with their own UI. Each entry includes
+    /// the pool's `risk_score` from `get_pool_risk`, letting dashboards rank
+    /// pools without one call per pool. Duplicate IDs are rejected so a single
+    /// pool cannot skew comparisons.
+    ///
+    /// Returns `NotInitialized` before `initialize`, `EmptyPoolList` for an
+    /// empty request, `TooManyPools` above the cap, `DuplicatePoolId` for
+    /// repeated IDs, and `PoolNotFound` for any unknown ID.
+    pub fn compare_pools(
+        env: Env,
+        pool_ids: Vec<u32>,
+    ) -> Result<Vec<PoolComparison>, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        if pool_ids.is_empty() {
+            return Err(FactoryError::EmptyPoolList);
+        }
+        if pool_ids.len() > MAX_COMPARE_POOLS {
+            return Err(FactoryError::TooManyPools);
+        }
+
+        let mut seen: Vec<u32> = Vec::new(&env);
+        let mut comparisons: Vec<PoolComparison> = Vec::new(&env);
+        for pool_id in pool_ids.iter() {
+            if seen.contains(pool_id) {
+                return Err(FactoryError::DuplicatePoolId);
+            }
+            seen.push_back(pool_id);
+
+            let record = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+                .ok_or(FactoryError::PoolNotFound)?;
+            bump_pool(&env, pool_id);
+            let risk_score = compute_pool_risk_score(&env, pool_id, &record)?;
+
+            comparisons.push_back(PoolComparison {
+                pool_id,
+                address: record.address,
+                asset: record.asset,
+                daily_rate: record.daily_rate,
+                credit_rate: record.credit_rate,
+                global_multiplier: record.global_multiplier,
+                min_lock_period: record.min_lock_period,
+                tvl: read_pool_tvl(&env, pool_id),
+                risk_score,
+                deprecated: record.deprecated,
+            });
+        }
+
+        Ok(comparisons)
     }
 
     /// Return a page of pool records in ascending pool ID order.
@@ -1711,7 +1864,7 @@ impl Factory {
             return Err(FactoryError::InvalidCreditRate);
         }
 
-        let record = env
+        let _record = env
             .storage()
             .persistent()
             .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
@@ -1763,66 +1916,31 @@ impl Factory {
 mod test;
 
 impl Factory {
-    /// Return a snapshot of the `PoolRecord` for `pool_id` as a portable data
-    /// struct (issue #662).
+    /// Return a `HealthStatus` for the pool identified by `pool_id` (issue #653).
     ///
-    /// This is a thin alias over `get_pool` that makes the intent of
-    /// "export for integration / off-chain use" explicit in the API surface.
-    /// The returned `PoolRecord` contains all pool parameters recorded at
-    /// creation time (asset, credit_rate, global_multiplier, min_lock_period,
-    /// daily_rate, wasm_hash, deprecated flag).
+    /// - `Deprecated` — the pool's `PoolRecord.deprecated` flag is set.
+    /// - `Degraded` — the pool exists but its TVL cannot be read (older WASM).
+    /// - `Healthy` — the pool exists and its TVL can be read.
     ///
-    /// Returns `FactoryError::PoolNotFound` if no pool with that id exists.
-    pub fn export_pool(env: Env, pool_id: u32) -> Result<PoolRecord, FactoryError> {
+    /// Returns `FactoryError::NotInitialized` if the factory has not been
+    /// initialized, or `FactoryError::PoolNotFound` if no pool with that id exists.
+    pub fn check_pool_health(env: Env, pool_id: u32) -> Result<HealthStatus, FactoryError> {
         require_initialized(&env)?;
         bump_instance(&env);
-        env.storage()
-            .persistent()
-            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
-            .ok_or(FactoryError::PoolNotFound)
-    }
 
-    /// Roll back the mutable parameters of pool `pool_id` to those stored in
-    /// the provided `snapshot` (issue #644).
-    ///
-    /// Only the fields that the factory controls and that can safely be
-    /// overwritten are rolled back: `credit_rate`, `global_multiplier`,
-    /// `min_lock_period`, and `daily_rate`. The pool contract address,
-    /// asset, wasm_hash, and deprecated flag are never modified by this call.
-    ///
-    /// Admin auth is required.  Returns `FactoryError::PoolNotFound` if the
-    /// pool does not exist.
-    pub fn rollback_pool(
-        env: Env,
-        admin: soroban_sdk::Address,
-        pool_id: u32,
-        snapshot: PoolRecord,
-    ) -> Result<(), FactoryError> {
-        require_initialized(&env)?;
-        validate_factory_admin(&env, &admin)?;
-        admin.require_auth();
-        bump_instance(&env);
-
-        let mut record = env
+        let record = env
             .storage()
             .persistent()
             .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
             .ok_or(FactoryError::PoolNotFound)?;
 
-        record.credit_rate = snapshot.credit_rate;
-        record.global_multiplier = snapshot.global_multiplier;
-        record.min_lock_period = snapshot.min_lock_period;
-        record.daily_rate = snapshot.daily_rate;
+        if record.deprecated {
+            return Ok(HealthStatus::Deprecated);
+        }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Pool(pool_id), &record);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("pool"), soroban_sdk::symbol_short!("rollback")),
-            (pool_id, admin),
-        );
-
-        Ok(())
+        match query_pool_tvl(&env, &record.pool) {
+            Ok(_) => Ok(HealthStatus::Healthy),
+            Err(_) => Ok(HealthStatus::Degraded),
+        }
     }
 }
