@@ -5,7 +5,9 @@ use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
     token::{StellarAssetClient, TokenClient},
-    vec, Address, Env, IntoVal,
+    vec,
+    xdr::{ContractEventBody, ScVal},
+    Address, Env, IntoVal, TryFromVal,
 };
 
 // The contract crate is `#![no_std]`; the event assertions below collect into
@@ -1112,4 +1114,87 @@ fn test_transfer_beneficiary_rejects_the_zero_address() {
     // A real address still works, and the rejected call changed nothing.
     t.client.transfer_beneficiary(&good);
     assert_eq!(t.client.beneficiary(), good);
+}
+
+// ── cliff-end notification (#615) ─────────────────────────────────────────────
+
+fn cliff_end_events(t: &TestEnv) -> std::vec::Vec<ScVal> {
+    let topic_vals: soroban_sdk::Vec<soroban_sdk::Val> = vec![
+        &t.env,
+        symbol_short!("vest").into_val(&t.env),
+        symbol_short!("cliff_end").into_val(&t.env),
+    ];
+    let mut topics: std::vec::Vec<ScVal> = std::vec::Vec::new();
+    for value in topic_vals.iter() {
+        topics.push(ScVal::try_from_val(&t.env, &value).unwrap());
+    }
+
+    t.env
+        .events()
+        .all()
+        .events()
+        .iter()
+        .filter_map(|event| match &event.body {
+            ContractEventBody::V0(body) if body.topics.as_slice() == topics.as_slice() => Some(body.data.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_cliff_end_payload(t: &TestEnv, data: &ScVal) {
+    let expected_val: soroban_sdk::Val =
+        (t.beneficiary.clone(), t.env.ledger().timestamp()).into_val(&t.env);
+    let expected = ScVal::try_from_val(&t.env, &expected_val).unwrap();
+    assert_eq!(*data, expected);
+}
+
+#[test]
+fn test_cliff_end_event_fires_once_when_cliff_is_reached() {
+    let t = setup(10, 100, 1_000);
+
+    advance_ledgers(&t.env, 9);
+    assert_eq!(t.client.release(), 0);
+    assert!(cliff_end_events(&t).is_empty());
+    assert!(!t.client.cliff_end_notified());
+
+    advance_ledgers(&t.env, 1);
+    assert!(t.client.release() > 0);
+    let events = cliff_end_events(&t);
+    assert_eq!(events.len(), 1);
+    assert_cliff_end_payload(&t, &events[0]);
+    assert!(t.client.cliff_end_notified());
+
+    t.client.release();
+    assert!(cliff_end_events(&t).is_empty());
+}
+
+#[test]
+fn test_no_cliff_schedule_does_not_emit_cliff_end_event() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+
+    assert!(t.client.release() > 0);
+    assert!(cliff_end_events(&t).is_empty());
+    assert!(!t.client.cliff_end_notified());
+}
+
+#[test]
+fn test_revoke_before_cliff_does_not_emit_cliff_end_event() {
+    let t = setup_revocable(10, 100, 1_000);
+
+    t.client.revoke();
+    assert!(cliff_end_events(&t).is_empty());
+    assert!(!t.client.cliff_end_notified());
+}
+
+#[test]
+fn test_revoke_after_cliff_emits_cliff_end_event_once() {
+    let t = setup_revocable(10, 100, 1_000);
+
+    advance_ledgers(&t.env, 10);
+    t.client.revoke();
+    let events = cliff_end_events(&t);
+    assert_eq!(events.len(), 1);
+    assert_cliff_end_payload(&t, &events[0]);
+    assert!(t.client.cliff_end_notified());
 }
