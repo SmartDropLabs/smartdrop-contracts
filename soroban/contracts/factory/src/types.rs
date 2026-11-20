@@ -46,6 +46,12 @@ pub enum DataKey {
     PoolTvl(u32),
     /// Insurance fund balance for a specific pool.
     InsuranceFund(u32),
+    /// One recorded ballot per authenticated address and pool.
+    PoolVote(u32, Address),
+    /// Aggregate approval votes for a pool.
+    PoolYesVotes(u32),
+    /// Aggregate rejection votes for a pool.
+    PoolNoVotes(u32),
 }
 
 /// On-chain record for a registered farming pool.
@@ -205,4 +211,6 @@ pub enum FactoryError {
     AlreadyDeprecated = 22,
     /// Insufficient funds in the insurance fund for the requested claim.
     InsufficientFunds = 23,
+    /// A wallet cannot submit another ballot for the same pool.
+    AlreadyVoted = 24,
 }
