@@ -12,6 +12,21 @@ pub use types::{
     VestingOverview, VestingSchedule, SCHEDULE_BACKUP_VERSION,
 };
 
+fn is_locked(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::ScheduleLocked)
+        .unwrap_or(false)
+}
+
+fn require_not_locked(env: &Env) -> Result<(), VestingError> {
+    if is_locked(env) {
+        Err(VestingError::ScheduleIsLocked)
+    } else {
+        Ok(())
+    }
+}
+
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5 s/ledger).
 const TTL_THRESHOLD: u32 = 518_400;
 const TTL_EXTEND_TO: u32 = 1_036_800;
@@ -494,6 +509,7 @@ impl VestingWallet {
     /// funder still receives their unvested tokens.
     pub fn revoke(env: Env) -> Result<(), VestingError> {
         require_initialized(&env)?;
+        require_not_locked(&env)?;
         if !is_revocable(&env) {
             return Err(VestingError::NotRevocable);
         }
@@ -901,6 +917,34 @@ impl VestingWallet {
         Ok(template)
     }
 
+    /// Permanently lock this vesting schedule against admin modifications (#657).
+    ///
+    /// Beneficiary-only. Once locked:
+    /// - `revoke()` returns `ScheduleIsLocked` (the admin can no longer pull
+    ///   back the tokens).
+    /// - `emergency_withdraw()` returns `ScheduleIsLocked`.
+    ///
+    /// Normal beneficiary operations (`release`, `withdraw_early`) are
+    /// unaffected — locking restricts admin-initiated changes only.
+    /// Locking is permanent and cannot be undone.
+    pub fn lock_schedule(env: Env) -> Result<(), VestingError> {
+        require_initialized(&env)?;
+        let beneficiary = get_beneficiary(&env);
+        beneficiary.require_auth();
+        bump_instance(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::ScheduleLocked, &true);
+        Ok(())
+    }
+
+    /// Return whether the schedule has been permanently locked (#657).
+    pub fn is_schedule_locked(env: Env) -> Result<bool, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(is_locked(&env))
+    }
+
     /// Return the shared schedule template, or `NotInitialized` if none has
     /// been published yet (#648).
     ///
@@ -973,6 +1017,7 @@ impl VestingWallet {
     /// schedule processing is unavailable.
     pub fn emergency_withdraw(env: Env) -> Result<i128, VestingError> {
         require_initialized(&env)?;
+        require_not_locked(&env)?;
         let admin = get_admin(&env);
         admin.require_auth();
         bump_instance(&env);
