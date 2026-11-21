@@ -2714,6 +2714,66 @@ impl FarmingPool {
         Ok(())
     }
 
+    /// Set the default reward multiplier for new users (#685).
+    ///
+    /// Stores a default multiplier value that can be applied to users when they
+    /// first stake. This provides flexibility for pool operators to configure
+    /// default multipliers without hardcoding them. Admin-only.
+    ///
+    /// # Arguments
+    /// * `multiplier` - The default multiplier value (must be between 1 and MAX_GLOBAL_MULTIPLIER)
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `NotInitialized` - If the pool has not been initialized
+    /// * `InvalidGlobalMultiplier` - If multiplier is out of bounds (< 1 or > MAX_GLOBAL_MULTIPLIER)
+    pub fn set_default_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        
+        if !(1..=MAX_GLOBAL_MULTIPLIER).contains(&multiplier) {
+            return Err(PoolError::InvalidGlobalMultiplier);
+        }
+        bump_instance(&env);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultMultiplier, &multiplier);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("def_mult")),
+            multiplier,
+        );
+
+        record_admin_action(&env, symbol_short!("def_mult"), &admin);
+
+        Ok(())
+    }
+
+    /// Get the default reward multiplier (#685).
+    ///
+    /// Returns the stored default multiplier value, or `None` if no default
+    /// has been set.
+    ///
+    /// # Returns
+    /// * `Option<u32>` - The default multiplier if set, None otherwise
+    ///
+    /// # Errors
+    /// * `NotInitialized` - If the pool has not been initialized
+    pub fn get_default_multiplier(env: Env) -> Result<Option<u32>, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        Ok(env
+            .storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::DefaultMultiplier))
+    }
+
     /// Set the credit accrual rate. Rejects non-positive values and anything
     /// above `MAX_CREDIT_RATE` — see #89 for the overflow-safety derivation.
     ///

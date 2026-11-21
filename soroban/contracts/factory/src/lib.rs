@@ -14,6 +14,7 @@ use types::{
 
 pub use types::{ConfigComparison, ConfigSuggestions};
 
+pub use types::DefaultPoolConfig;
 pub use types::DependencyGraph;
 pub use types::FactoryError;
 pub use types::HealthStatus;
@@ -52,6 +53,8 @@ const MAX_GLOBAL_MULTIPLIER: u32 = 1_000;
 // Maximum credit rate per ledger, mirroring the farming pool's own limit so an
 // excessive daily rate is caught before pool deployment (#495).
 const MAX_CREDIT_RATE: i128 = 100_000_000;
+// Maximum reward rate per pool, to prevent invalid configurations (#683).
+const MAX_REWARD_RATE: u32 = 10_000;
 // Maximum caller-facing daily rate, derived from the credit-rate ceiling so
 // `create_pool`'s public unit is bounded directly rather than only after
 // ledger conversion (#524-#527).
@@ -626,6 +629,12 @@ fn create_pool_inner(
     // oversized rate is rejected at the API boundary before ledger conversion.
     if daily_rate > MAX_DAILY_RATE {
         return Err(FactoryError::InvalidCreditRate);
+    }
+
+    // Validation: Enforce reward rate limit to prevent invalid pool configurations (#683).
+    let reward_rate = global_multiplier;
+    if reward_rate > MAX_REWARD_RATE {
+        return Err(FactoryError::InvalidConfig);
     }
 
     // Validation 25: Convert and validate daily_rate with strict bounds checking
@@ -2715,5 +2724,108 @@ impl Factory {
             // min_stake_amount is not stored in PoolRecord, use default
             MIN_STAKE_AMOUNT,
         )
+    }
+
+    /// Set default pool configuration for creating pools (#686).
+    ///
+    /// Stores a default configuration that can be used as a template when
+    /// creating new pools. Admin-only.
+    ///
+    /// # Arguments
+    /// * `config` - The default configuration to store
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    /// * `InvalidCreditRate` - If daily_rate is invalid
+    /// * `InvalidGlobalMultiplier` - If global_multiplier is out of bounds
+    /// * `MinLockPeriodTooShort` - If min_lock_period is too short
+    /// * `MinLockPeriodAboveCeiling` - If min_lock_period is too long
+    /// * `InvalidMinStakeAmount` - If min_stake_amount is out of range
+    /// * `InvalidConfig` - If reward_rate exceeds MAX_REWARD_RATE
+    pub fn set_default_config(
+        env: Env,
+        config: DefaultPoolConfig,
+    ) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        // Validate the configuration using the same rules as create_pool
+        if config.global_multiplier < 1 || config.global_multiplier > MAX_GLOBAL_MULTIPLIER {
+            return Err(FactoryError::InvalidGlobalMultiplier);
+        }
+
+        if config.daily_rate > MAX_DAILY_RATE {
+            return Err(FactoryError::InvalidCreditRate);
+        }
+
+        // Validate reward rate limit (#683)
+        let reward_rate = config.global_multiplier;
+        if reward_rate > MAX_REWARD_RATE {
+            return Err(FactoryError::InvalidConfig);
+        }
+
+        let credit_rate = daily_rate_to_credit_rate(config.daily_rate)?;
+        if credit_rate <= 0 || credit_rate > MAX_CREDIT_RATE {
+            return Err(FactoryError::InvalidCreditRate);
+        }
+
+        if config.min_lock_period == 0 {
+            return Err(FactoryError::MinLockPeriodTooShort);
+        }
+        let min_lock_period_u32: u32 = config
+            .min_lock_period
+            .try_into()
+            .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
+        if min_lock_period_u32 < MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodTooShort);
+        }
+        if min_lock_period_u32 > MAX_MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodAboveCeiling);
+        }
+
+        if config.min_stake_amount > MAX_STAKE_AMOUNT {
+            return Err(FactoryError::InvalidMinStakeAmount);
+        }
+        if config.min_stake_amount < -MAX_STAKE_AMOUNT {
+            return Err(FactoryError::InvalidMinStakeAmount);
+        }
+
+        // Store the validated configuration
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultPoolConfig, &config);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("def_cfg")),
+            config,
+        );
+
+        Ok(())
+    }
+
+    /// Get the default pool configuration (#686).
+    ///
+    /// Returns the stored default configuration, or `None` if no default has
+    /// been set.
+    ///
+    /// # Returns
+    /// * `Option<DefaultPoolConfig>` - The default configuration if set
+    ///
+    /// # Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    pub fn get_default_config(env: Env) -> Result<Option<DefaultPoolConfig>, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        Ok(env
+            .storage()
+            .instance()
+            .get::<DataKey, DefaultPoolConfig>(&DataKey::DefaultPoolConfig))
     }
 }

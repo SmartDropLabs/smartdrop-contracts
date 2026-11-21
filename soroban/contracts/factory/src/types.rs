@@ -75,6 +75,8 @@ pub enum DataKey {
     PoolConfigHistoryCount(u32),
     /// Pool configuration change event by index (#680).
     PoolConfigHistory(u32, u32),
+    /// Default pool configuration for creating pools (#686).
+    DefaultPoolConfig,
 }
 
 /// On-chain record for a registered farming pool.
@@ -347,6 +349,9 @@ pub enum FactoryError {
     /// `set_pool_dependencies` was called with more entries than
     /// `MAX_POOL_DEPENDENCIES`.
     TooManyDependencies = 29,
+    /// Pool configuration exceeds limits (e.g., reward_rate > MAX_REWARD_RATE).
+    /// See #683.
+    InvalidConfig = 30,
 }
 
 /// A single pool configuration change event (#680).
@@ -366,4 +371,14 @@ pub struct PoolConfigChangeEntry {
 pub struct PoolConfigHistoryPage {
     pub events: Vec<PoolConfigChangeEntry>,
     pub total: u32,
+}
+
+/// Default pool configuration for creating pools (#686).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DefaultPoolConfig {
+    pub daily_rate: u128,
+    pub global_multiplier: u32,
+    pub min_lock_period: u64,
+    pub min_stake_amount: i128,
 }
