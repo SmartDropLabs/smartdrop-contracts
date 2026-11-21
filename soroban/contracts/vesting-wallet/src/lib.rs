@@ -5,8 +5,10 @@
 mod types;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
-use types::DataKey;
-pub use types::{AdminTransferred, VestingError, VestingOverview, VestingSchedule};
+use types::{DataKey, SCHEDULE_BACKUP_VERSION};
+pub use types::{
+    AdminTransferred, ScheduleBackup, VestingError, VestingOverview, VestingSchedule,
+};
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5 s/ledger).
 const TTL_THRESHOLD: u32 = 518_400;
@@ -483,6 +485,59 @@ impl VestingWallet {
             cliff_ledger: get_cliff_ledger(&env),
             end_ledger: get_end_ledger(&env),
             revocable: is_revocable(&env),
+        })
+    }
+
+    /// Take a backup of the wallet's whole vesting state (#693).
+    ///
+    /// Returns the configured schedule together with the administrator, funder,
+    /// treasury, delegate, release progress and revocation state, read at one
+    /// ledger so the parts agree. It is read-only and permissionless like the
+    /// other getters: every field is already readable through them, and nothing
+    /// is written.
+    ///
+    /// `beneficiary` must be this wallet's beneficiary. A wrong address is
+    /// rejected with `InvalidInput`, so a backup cannot be taken (and later
+    /// mistaken for) another wallet's schedule. Returns `NotInitialized` if the
+    /// wallet has not been initialized.
+    pub fn backup_schedule(env: Env, beneficiary: Address) -> Result<ScheduleBackup, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        if beneficiary != get_beneficiary(&env) {
+            return Err(VestingError::InvalidInput);
+        }
+
+        let revoked = is_revoked(&env);
+        let revoked_vested = if revoked {
+            env.storage()
+                .instance()
+                .get(&DataKey::RevokedVested)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        Ok(ScheduleBackup {
+            version: SCHEDULE_BACKUP_VERSION,
+            backed_up_at_ledger: env.ledger().sequence(),
+            schedule: VestingSchedule {
+                beneficiary: get_beneficiary(&env),
+                token: get_token(&env),
+                total_amount: get_total_amount(&env),
+                start_ledger: get_start_ledger(&env),
+                cliff_ledger: get_cliff_ledger(&env),
+                end_ledger: get_end_ledger(&env),
+                revocable: is_revocable(&env),
+            },
+            admin: get_admin(&env),
+            funder: env.storage().instance().get(&DataKey::Funder).unwrap(),
+            treasury: get_treasury(&env),
+            delegate: env.storage().instance().get(&DataKey::Delegate),
+            released_amount: get_released(&env),
+            release_count: read_release_count(&env),
+            revoked,
+            revoked_vested,
         })
     }
 
