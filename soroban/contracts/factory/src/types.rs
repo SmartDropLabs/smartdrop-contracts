@@ -64,6 +64,10 @@ pub enum DataKey {
     PoolYesVotes(u32),
     /// Aggregate rejection votes for a pool.
     PoolNoVotes(u32),
+    /// Global counter for pool configuration change events (#680).
+    PoolConfigHistoryCount(u32),
+    /// Pool configuration change event by index (#680).
+    PoolConfigHistory(u32, u32),
 }
 
 /// On-chain record for a registered farming pool.
@@ -248,6 +252,8 @@ pub enum FactoryError {
     TooManyPools = 25,
     /// `compare_pools` was called with the same pool ID more than once.
     DuplicatePoolId = 26,
+    /// A voter has already voted on a pool.
+    AlreadyVoted = 27,
 }
 
 /// A single pool configuration change event (#680).

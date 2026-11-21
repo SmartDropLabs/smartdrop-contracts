@@ -1103,4 +1103,33 @@ impl VestingWallet {
 
         Ok(ScheduleHistoryPage { events, total })
     }
+
+    /// Export the vesting schedule for the specified beneficiary (issue #699).
+    ///
+    /// Returns the complete vesting schedule data for external use or backup.
+    /// This is a read-only operation that requires beneficiary authorization.
+    ///
+    /// ## Arguments
+    /// * `beneficiary` - Address of the beneficiary whose schedule to export
+    ///
+    /// ## Returns
+    /// * `VestingSchedule` containing all schedule parameters
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the wallet has not been initialized
+    pub fn export_schedule(env: Env, beneficiary: Address) -> Result<VestingSchedule, VestingError> {
+        require_initialized(&env)?;
+        beneficiary.require_auth();
+        bump_instance(&env);
+
+        Ok(VestingSchedule {
+            beneficiary: get_beneficiary(&env),
+            token: get_token(&env),
+            total_amount: get_total_amount(&env),
+            start_ledger: get_start_ledger(&env),
+            cliff_ledger: get_cliff_ledger(&env),
+            end_ledger: get_end_ledger(&env),
+            revocable: is_revocable(&env),
+        })
+    }
 }

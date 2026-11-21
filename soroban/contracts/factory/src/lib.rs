@@ -2322,4 +2322,66 @@ impl Factory {
 
         Ok(PoolConfigHistoryPage { events, total })
     }
+
+    /// Export the pool configuration for a specific pool (issue #698).
+    ///
+    /// Returns the complete pool configuration data for external use or backup.
+    /// This is a read-only operation that does not require authorization.
+    ///
+    /// ## Arguments
+    /// * `pool_id` - The ID of the pool to export
+    ///
+    /// ## Returns
+    /// * `PoolRecord` containing all pool configuration parameters
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    /// * `PoolNotFound` - If no pool with the given ID exists
+    pub fn export_config(env: Env, pool_id: u32) -> Result<PoolRecord, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        
+        bump_pool(&env, pool_id);
+        Ok(record)
+    }
+
+    /// Import a pool configuration (issue #701).
+    ///
+    /// Creates a new pool from an existing PoolRecord configuration.
+    /// This allows migrating pools from other factories or restoring backed-up configurations.
+    /// Requires admin authorization.
+    ///
+    /// ## Arguments
+    /// * `config` - The PoolRecord containing the pool configuration to import
+    ///
+    /// ## Returns
+    /// * `u32` - The newly assigned pool ID
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    /// * `PoolCreationPaused` - If pool creation is currently paused
+    /// * Various validation errors if the configuration is invalid
+    pub fn import_config(env: Env, config: PoolRecord) -> Result<u32, FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        admin.require_auth();
+
+        // Use the existing internal pool creation logic
+        create_pool_inner(
+            env,
+            admin,
+            config.asset,
+            config.daily_rate,
+            config.global_multiplier,
+            config.min_lock_period as u64,
+            // min_stake_amount is not stored in PoolRecord, use default
+            MIN_STAKE_AMOUNT,
+        )
+    }
 }
