@@ -11,6 +11,7 @@ use types::{
     PoolRecord, PoolSort, PoolStatus, RefreshPoolTtlsResponse,
 };
 
+pub use types::DependencyGraph;
 pub use types::FactoryError;
 pub use types::HealthStatus;
 pub use types::PoolParams;
@@ -66,6 +67,9 @@ const RISK_SCORE_TVL_THRESHOLD: i128 = MIN_STAKE_AMOUNT;
 // Upper bound for `compare_pools`: each entry reads several storage keys, so an
 // unbounded list could exhaust the host's footprint budget (#617).
 const MAX_COMPARE_POOLS: u32 = 10;
+// Upper bound for `set_pool_dependencies`: an unbounded dependency list would
+// let a single call exhaust the footprint budget (#668).
+const MAX_POOL_DEPENDENCIES: u32 = 10;
 
 /// Convert a "credits per day" figure into the deployed pool's native
 /// "credits per ledger" `credit_rate`.
@@ -158,6 +162,22 @@ fn bump_pool_tvl(env: &Env, pool_id: u32) {
 fn bump_wasm_pools(env: &Env, wasm_hash: &BytesN<32>) {
     env.storage().persistent().extend_ttl(
         &DataKey::PoolsByWasmHash(wasm_hash.clone()),
+        TTL_THRESHOLD,
+        TTL_EXTEND_TO,
+    );
+}
+
+fn bump_pool_dependencies(env: &Env, pool_id: u32) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::PoolDependencies(pool_id),
+        TTL_THRESHOLD,
+        TTL_EXTEND_TO,
+    );
+}
+
+fn bump_pools_with_dependencies(env: &Env) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::PoolsWithDependencies,
         TTL_THRESHOLD,
         TTL_EXTEND_TO,
     );
@@ -871,6 +891,115 @@ impl Factory {
         }
 
         Ok(comparisons)
+    }
+
+    /// Set the pool IDs that `pool_id` depends on (#668). Admin-only.
+    ///
+    /// Each entry in `deps` must be an existing, distinct pool ID other than
+    /// `pool_id` itself. Calling this again for the same `pool_id` replaces
+    /// its previously stored dependency list; passing an empty `deps`
+    /// clears it. Query the resulting graph via `get_dependency_graph` or a
+    /// single pool's edges via `get_pool_dependencies`.
+    ///
+    /// Returns `NotInitialized` before `initialize`, `PoolNotFound` if
+    /// `pool_id` or any dependency does not exist, `SelfDependency` if
+    /// `pool_id` appears in `deps`, and `TooManyDependencies` above
+    /// `MAX_POOL_DEPENDENCIES`.
+    pub fn set_pool_dependencies(
+        env: Env,
+        pool_id: u32,
+        deps: Vec<u32>,
+    ) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        if !env.storage().persistent().has(&DataKey::Pool(pool_id)) {
+            return Err(FactoryError::PoolNotFound);
+        }
+        if deps.len() > MAX_POOL_DEPENDENCIES {
+            return Err(FactoryError::TooManyDependencies);
+        }
+        for dep in deps.iter() {
+            if dep == pool_id {
+                return Err(FactoryError::SelfDependency);
+            }
+            if !env.storage().persistent().has(&DataKey::Pool(dep)) {
+                return Err(FactoryError::PoolNotFound);
+            }
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolDependencies(pool_id), &deps);
+        bump_pool_dependencies(&env, pool_id);
+
+        let mut pools_with_deps: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolsWithDependencies)
+            .unwrap_or_else(|| vec![&env]);
+        if !pools_with_deps.contains(pool_id) {
+            pools_with_deps.push_back(pool_id);
+            env.storage()
+                .persistent()
+                .set(&DataKey::PoolsWithDependencies, &pools_with_deps);
+        }
+        bump_pools_with_dependencies(&env);
+
+        Ok(())
+    }
+
+    /// Return the pool IDs that `pool_id` depends on, as set by
+    /// `set_pool_dependencies` (#668). Returns an empty list if none have
+    /// been set. Returns `PoolNotFound` if `pool_id` does not exist.
+    pub fn get_pool_dependencies(env: Env, pool_id: u32) -> Result<Vec<u32>, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        if !env.storage().persistent().has(&DataKey::Pool(pool_id)) {
+            return Err(FactoryError::PoolNotFound);
+        }
+
+        let deps = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolDependencies(pool_id))
+            .unwrap_or_else(|| vec![&env]);
+        bump_pool_dependencies(&env, pool_id);
+        Ok(deps)
+    }
+
+    /// Return the full pool dependency graph (#668).
+    ///
+    /// Includes one edge per pool that has had dependencies set via
+    /// `set_pool_dependencies`; pools with none configured are omitted.
+    /// Lets dashboards and off-chain tooling visualize how pools compose
+    /// without walking every pool ID individually.
+    pub fn get_dependency_graph(env: Env) -> Result<DependencyGraph, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let pools_with_deps: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolsWithDependencies)
+            .unwrap_or_else(|| vec![&env]);
+
+        let mut edges: Vec<(u32, Vec<u32>)> = Vec::new(&env);
+        for pool_id in pools_with_deps.iter() {
+            let deps = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PoolDependencies(pool_id))
+                .unwrap_or_else(|| vec![&env]);
+            bump_pool_dependencies(&env, pool_id);
+            edges.push_back((pool_id, deps));
+        }
+        bump_pools_with_dependencies(&env);
+
+        Ok(DependencyGraph { edges })
     }
 
     /// Return a page of pool records in ascending pool ID order.
@@ -2211,9 +2340,10 @@ impl Factory {
             return Err(FactoryError::InsufficientFunds);
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::InsuranceFund(pool_id), &(current_insurance - amount));
+        env.storage().persistent().set(
+            &DataKey::InsuranceFund(pool_id),
+            &(current_insurance - amount),
+        );
 
         #[allow(deprecated)]
         env.events().publish(

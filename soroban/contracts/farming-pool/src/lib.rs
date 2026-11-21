@@ -1723,14 +1723,13 @@ impl FarmingPool {
         let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
         let global_multiplier = read_global_multiplier(&env);
 
-        let (stake_amount, credit_rate, banked_credits) =
-            match get_user_stake(&env, &user) {
-                Some(stake) => (stake.amount, stake.credit_rate, stake.credits_banked),
-                None => match get_position(&env, &user) {
-                    Some(pos) => (pos.amount, pos.credit_rate, pos.total_credits),
-                    None => (0i128, read_credit_rate(&env), 0i128),
-                },
-            };
+        let (stake_amount, credit_rate, banked_credits) = match get_user_stake(&env, &user) {
+            Some(stake) => (stake.amount, stake.credit_rate, stake.credits_banked),
+            None => match get_position(&env, &user) {
+                Some(pos) => (pos.amount, pos.credit_rate, pos.total_credits),
+                None => (0i128, read_credit_rate(&env), 0i128),
+            },
+        };
 
         let effective_stake = compute_total_stake(stake_amount, allocation_pct, global_multiplier);
 

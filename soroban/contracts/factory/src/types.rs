@@ -147,6 +147,19 @@ pub struct ListPoolsResponse {
     pub has_more: bool,
 }
 
+/// Full pool dependency graph, returned by `get_dependency_graph` (#668).
+///
+/// `edges` holds one entry per pool that has explicit dependencies set via
+/// `set_pool_dependencies`, each pairing that pool's ID with the IDs it
+/// depends on. Pools with no dependencies configured are omitted rather than
+/// listed with an empty dependency list, so the graph stays proportional to
+/// how much of the registry actually declares dependencies.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DependencyGraph {
+    pub edges: Vec<(u32, Vec<u32>)>,
+}
+
 /// Result of a `refresh_pool_ttls` sweep (#393).
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
