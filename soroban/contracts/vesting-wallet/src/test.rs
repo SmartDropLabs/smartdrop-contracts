@@ -246,22 +246,252 @@ fn test_compute_vested_is_safe_at_maximum_duration_and_ceiling() {
     let token_sac = StellarAssetClient::new(&env, &asset.address());
     token_sac.mint(&admin, &MAX_TOTAL_AMOUNT);
 
+    // The longest schedule `initialize` accepts (#684), at the largest amount
+    // the formula supports. Just before the end the elapsed portion is at its
+    // largest, so `total * elapsed` is the biggest product the formula can see.
     client.initialize(
         &beneficiary,
         &asset.address(),
         &MAX_TOTAL_AMOUNT,
         &0u32,
         &0u32,
-        &u32::MAX,
+        &MAX_VESTING_DURATION_LEDGERS,
         &false,
         &admin,
     );
     env.ledger()
-        .with_mut(|ledger| ledger.sequence_number = 2_000_000_000);
+        .with_mut(|ledger| ledger.sequence_number = MAX_VESTING_DURATION_LEDGERS - 1);
 
     let vested = client.vested_amount();
     assert!(vested > 0);
     assert!(vested <= MAX_TOTAL_AMOUNT);
+}
+
+// ── Schedule length limit (#684) ──────────────────────────────────────────────
+
+/// A deployed but uninitialised wallet whose `admin` already holds `funds` tokens,
+/// for tests that call `initialize` with hand-picked ledgers.
+struct FundedWallet {
+    env: Env,
+    contract_id: Address,
+    token_address: Address,
+    admin: Address,
+    beneficiary: Address,
+}
+
+fn funded_uninitialised_wallet(funds: i128) -> FundedWallet {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin);
+    StellarAssetClient::new(&env, &asset.address()).mint(&admin, &funds);
+    let contract_id = env.register(VestingWallet, ());
+    FundedWallet {
+        env,
+        contract_id,
+        token_address: asset.address(),
+        admin,
+        beneficiary,
+    }
+}
+
+#[test]
+fn test_max_vesting_duration_is_one_year_of_ledgers() {
+    assert_eq!(MAX_VESTING_DURATION_SECS, 31_536_000);
+    assert_eq!(MAX_VESTING_DURATION_LEDGERS, 6_307_200);
+}
+
+#[test]
+fn test_invalid_schedule_error_code_is_stable() {
+    assert_eq!(VestingError::InvalidSchedule as u32, 12);
+}
+
+#[test]
+fn test_initialize_accepts_a_schedule_of_exactly_the_maximum_duration() {
+    let w = funded_uninitialised_wallet(1_000);
+    let client = VestingWalletClient::new(&w.env, &w.contract_id);
+    let start = w.env.ledger().sequence();
+
+    client.initialize(
+        &w.beneficiary,
+        &w.token_address,
+        &1_000i128,
+        &start,
+        &start,
+        &(start + MAX_VESTING_DURATION_LEDGERS),
+        &false,
+        &w.admin,
+    );
+
+    let schedule = client.get_vesting_schedule();
+    assert_eq!(
+        schedule.end_ledger - schedule.start_ledger,
+        MAX_VESTING_DURATION_LEDGERS
+    );
+}
+
+#[test]
+fn test_initialize_rejects_a_schedule_one_ledger_over_the_maximum() {
+    let w = funded_uninitialised_wallet(1_000);
+    let client = VestingWalletClient::new(&w.env, &w.contract_id);
+    let start = w.env.ledger().sequence();
+
+    let result = client.try_initialize(
+        &w.beneficiary,
+        &w.token_address,
+        &1_000i128,
+        &start,
+        &start,
+        &(start + MAX_VESTING_DURATION_LEDGERS + 1),
+        &false,
+        &w.admin,
+    );
+
+    assert!(matches!(result, Err(Ok(VestingError::InvalidSchedule))));
+}
+
+#[test]
+fn test_initialize_rejects_a_schedule_that_used_to_be_accepted_at_u32_max_duration() {
+    let w = funded_uninitialised_wallet(1_000);
+    let client = VestingWalletClient::new(&w.env, &w.contract_id);
+
+    let result = client.try_initialize(
+        &w.beneficiary,
+        &w.token_address,
+        &1_000i128,
+        &0u32,
+        &0u32,
+        &u32::MAX,
+        &false,
+        &w.admin,
+    );
+
+    assert!(matches!(result, Err(Ok(VestingError::InvalidSchedule))));
+}
+
+#[test]
+fn test_the_limit_is_measured_from_start_so_a_late_cliff_does_not_extend_it() {
+    let w = funded_uninitialised_wallet(1_000);
+    let client = VestingWalletClient::new(&w.env, &w.contract_id);
+    let start = w.env.ledger().sequence();
+
+    // The cliff sits at the maximum duration and the end one ledger later:
+    // only one ledger of linear vesting remains, but the schedule as a whole
+    // is one ledger over the limit.
+    let result = client.try_initialize(
+        &w.beneficiary,
+        &w.token_address,
+        &1_000i128,
+        &start,
+        &(start + MAX_VESTING_DURATION_LEDGERS),
+        &(start + MAX_VESTING_DURATION_LEDGERS + 1),
+        &false,
+        &w.admin,
+    );
+
+    assert!(matches!(result, Err(Ok(VestingError::InvalidSchedule))));
+}
+
+#[test]
+fn test_a_rejected_schedule_leaves_the_wallet_uninitialised_and_funds_untouched() {
+    let w = funded_uninitialised_wallet(1_000);
+    let client = VestingWalletClient::new(&w.env, &w.contract_id);
+    let token = TokenClient::new(&w.env, &w.token_address);
+    let start = w.env.ledger().sequence();
+
+    let rejected = client.try_initialize(
+        &w.beneficiary,
+        &w.token_address,
+        &1_000i128,
+        &start,
+        &start,
+        &(start + MAX_VESTING_DURATION_LEDGERS + 1),
+        &false,
+        &w.admin,
+    );
+    assert!(matches!(rejected, Err(Ok(VestingError::InvalidSchedule))));
+
+    // Nothing was stored and no tokens moved.
+    assert!(matches!(
+        client.try_beneficiary(),
+        Err(Ok(VestingError::NotInitialized))
+    ));
+    assert_eq!(token.balance(&w.admin), 1_000);
+    assert_eq!(token.balance(&w.contract_id), 0);
+
+    // The wallet is still free to be initialised with a valid schedule.
+    client.initialize(
+        &w.beneficiary,
+        &w.token_address,
+        &1_000i128,
+        &start,
+        &start,
+        &(start + MAX_VESTING_DURATION_LEDGERS),
+        &false,
+        &w.admin,
+    );
+    assert_eq!(token.balance(&w.contract_id), 1_000);
+}
+
+#[test]
+fn test_the_amount_ceiling_error_takes_precedence_over_the_duration_limit() {
+    let w = funded_uninitialised_wallet(1_000);
+    let client = VestingWalletClient::new(&w.env, &w.contract_id);
+
+    // Both limits are broken: the amount is above the ceiling and the duration
+    // is above the maximum. The amount error is reported, as before.
+    let result = client.try_initialize(
+        &w.beneficiary,
+        &w.token_address,
+        &(MAX_TOTAL_AMOUNT + 1),
+        &0u32,
+        &0u32,
+        &u32::MAX,
+        &false,
+        &w.admin,
+    );
+
+    assert!(matches!(result, Err(Ok(VestingError::TotalAmountTooLarge))));
+}
+
+#[test]
+fn test_import_vesting_enforces_the_same_duration_limit() {
+    let w = funded_uninitialised_wallet(1_000);
+    let client = VestingWalletClient::new(&w.env, &w.contract_id);
+    let start = w.env.ledger().sequence();
+
+    let too_long = VestingSchedule {
+        beneficiary: w.beneficiary.clone(),
+        token: w.token_address.clone(),
+        total_amount: 1_000,
+        start_ledger: start,
+        cliff_ledger: start,
+        end_ledger: start + MAX_VESTING_DURATION_LEDGERS + 1,
+        revocable: false,
+    };
+    let rejected = client.try_import_vesting(&too_long, &w.token_address, &w.admin);
+    assert!(matches!(rejected, Err(Ok(VestingError::InvalidSchedule))));
+
+    let at_limit = VestingSchedule {
+        end_ledger: start + MAX_VESTING_DURATION_LEDGERS,
+        ..too_long
+    };
+    client.import_vesting(&at_limit, &w.token_address, &w.admin);
+    assert_eq!(
+        client.get_vesting_schedule().end_ledger,
+        start + MAX_VESTING_DURATION_LEDGERS
+    );
+}
+
+#[test]
+fn test_ordinary_schedules_are_unaffected_by_the_limit() {
+    // Short schedules, with and without a cliff, still initialise and vest.
+    let t = setup(10, 90, 1_000);
+    advance_ledgers(&t.env, 50);
+
+    assert_eq!(t.client.vested_amount(), 500);
 }
 
 #[test]

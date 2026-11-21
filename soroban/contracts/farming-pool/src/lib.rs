@@ -14,8 +14,9 @@ use types::{
     AdminActionEvent, AdminActionHistoryPage, BankedCreditTotals, BoostConfig, BoostEvent,
     BoostHistoryPage, CreditRateEvent, CreditRateHistoryPage, DataKey, DistributionEvent,
     DistributionHistoryPage, GlobalMultiplierEvent, GlobalMultiplierHistoryPage,
-    LeaderboardEntry, ListWhitelistedResponse, PoolAnalytics, Position, StakeEvent, StakeHistoryPage, TierInfo,
-    UserActivity, UserStake, WhitelistEvent, WhitelistHistoryPage,
+    LeaderboardEntry, ListWhitelistedResponse, MultiplierAuditEntry, MultiplierAuditPage,
+    PoolAnalytics, Position, StakeEvent, StakeHistoryPage, TierInfo, UserActivity, UserStake,
+    WhitelistEvent, WhitelistHistoryPage,
 };
 pub use types::{MultiplierBreakdown, MultiplierData, PoolError, PoolInfo, UserSummary};
 
@@ -936,6 +937,29 @@ fn record_admin_action(env: &Env, action: soroban_sdk::Symbol, admin: &Address) 
         .set(&DataKey::AdminActionCount, &(count + 1));
 }
 
+fn read_multiplier_audit_count(env: &Env, user: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MultiplierAuditCount(user.clone()))
+        .unwrap_or(0)
+}
+
+fn record_multiplier_change(env: &Env, user: &Address, old_multiplier: u32, new_multiplier: u32) {
+    let count = read_multiplier_audit_count(env, user);
+    let entry = MultiplierAuditEntry {
+        user: user.clone(),
+        old_multiplier,
+        new_multiplier,
+        ledger: env.ledger().sequence(),
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::MultiplierAuditHistory(user.clone(), count), &entry);
+    env.storage()
+        .persistent()
+        .set(&DataKey::MultiplierAuditCount(user.clone()), &(count + 1));
+}
+
 // ── #310 — Credit rate history ────────────────────────────────────────────────
 
 fn record_credit_rate_change(env: &Env, old_rate: i128, new_rate: i128) {
@@ -1110,7 +1134,15 @@ fn checkpoint(env: &Env, user: &Address, stake: &mut UserStake) {
     }
     stake.start_ledger = current;
     stake.credit_rate = read_credit_rate(env);
-    stake.multiplier = read_global_multiplier(env);
+    
+    let old_multiplier = stake.multiplier;
+    let new_multiplier = read_global_multiplier(env);
+    stake.multiplier = new_multiplier;
+    
+    // Record multiplier change for audit (#679)
+    if old_multiplier != new_multiplier {
+        record_multiplier_change(env, user, old_multiplier, new_multiplier);
+    }
 
     if accrued > 0 {
         #[allow(deprecated)]
@@ -2542,6 +2574,57 @@ impl FarmingPool {
         Ok(read_total_credits(&env))
     }
 
+    /// Re-base one staker onto the current global multiplier and credit rate (#688).
+    ///
+    /// A `UserStake` keeps a snapshot of the global multiplier and credit rate,
+    /// refreshed only when that user next calls `stake`, `unstake` or has their
+    /// boost set (see `checkpoint`). Until then `get_boost_config` keeps
+    /// reporting the old multiplier, and accrual only accounts for the *latest*
+    /// multiplier change: if the multiplier changed twice since the user's last
+    /// checkpoint, the interval between the two changes is credited at the stale
+    /// snapshot instead of the multiplier that was live then.
+    ///
+    /// This runs the same `checkpoint` the user's next interaction would, without
+    /// the user having to act. Credits accrued so far are settled under the old
+    /// snapshot and banked, then the stake adopts the current multiplier and
+    /// credit rate for future accrual. The user's total credits at the moment of
+    /// the call are unchanged. Run it for a user *before* a further multiplier
+    /// change to stop the drift from compounding; it cannot recover credits
+    /// already mis-attributed by earlier changes.
+    ///
+    /// - Admin only. Allowed while the pool is paused: it moves no funds.
+    /// - Idempotent: a stake that is already current is left untouched and emits
+    ///   nothing, so keepers can call it blindly.
+    /// - `NoActiveStake` if `user` has no flexible `UserStake` (a time-locked
+    ///   `Position` has no multiplier snapshot to migrate).
+    ///
+    /// Emits `(boost, mult_mig)` with `(user, old_multiplier, new_multiplier,
+    /// credits_banked)`.
+    pub fn migrate_multiplier(env: Env, user: Address) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        let mut stake = get_user_stake(&env, &user).ok_or(PoolError::NoActiveStake)?;
+        let old_multiplier = stake.multiplier;
+        let new_multiplier = read_global_multiplier(&env);
+        if old_multiplier == new_multiplier && stake.credit_rate == read_credit_rate(&env) {
+            return Ok(());
+        }
+
+        checkpoint(&env, &user, &mut stake);
+        set_user_stake(&env, &user, &stake);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("boost"), symbol_short!("mult_mig")),
+            (user.clone(), old_multiplier, new_multiplier, stake.credits_banked),
+        );
+        record_admin_action(&env, symbol_short!("mult_mig"), &admin);
+        Ok(())
+    }
+
     /// Set the global credit multiplier. Rejects 0 and anything above
     /// `MAX_GLOBAL_MULTIPLIER` — see #89 for the overflow-safety derivation.
     /// Revert the global multiplier to its previous value (#664).
@@ -3970,5 +4053,46 @@ impl FarmingPool {
             .persistent()
             .remove(&DataKey::CachedMultiplier(user));
         Ok(())
+    }
+
+    /// Returns audit history of reward multiplier changes for a user (issue #679).
+    ///
+    /// Provides a paginated list of all multiplier change events for the user,
+    /// showing when their effective multiplier was updated during checkpoints.
+    ///
+    /// ## Arguments
+    /// * `user` - The user address to query
+    /// * `start` - Zero-based index to start reading from
+    /// * `limit` - Maximum number of events to return
+    ///
+    /// ## Returns
+    /// * `MultiplierAuditPage` containing the events and total count
+    pub fn get_multiplier_audit(
+        env: Env,
+        user: Address,
+        start: u32,
+        limit: u32,
+    ) -> Result<MultiplierAuditPage, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let total = read_multiplier_audit_count(&env, &user);
+        let mut events = Vec::new(&env);
+
+        let end = start.saturating_add(limit).min(total);
+        for i in start..end {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, MultiplierAuditEntry>(&DataKey::MultiplierAuditHistory(
+                    user.clone(),
+                    i,
+                ))
+            {
+                events.push_back(event);
+            }
+        }
+
+        Ok(MultiplierAuditPage { events, total })
     }
 }

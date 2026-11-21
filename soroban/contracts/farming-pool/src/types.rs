@@ -225,6 +225,10 @@ pub enum DataKey {
     UniqueUserCount,
     /// Cached reward multiplier per user (issue #652).
     CachedMultiplier(Address),
+    /// User multiplier audit event counter (#679).
+    MultiplierAuditCount(Address),
+    /// User multiplier audit event by index (#679).
+    MultiplierAuditHistory(Address, u32),
 }
 
 /// Paginated response for `get_whitelisted_users`.
@@ -388,7 +392,8 @@ pub struct StakeEvent {
 pub struct AdminActionEvent {
     /// What was changed: "credit_rate", "multiplier", "pause", "unpause",
     /// "min_lock", "min_stake", "upgrade", "admin_transfer", "migrate",
-    /// "whitelist_enable", "whitelist_disable", "recover_credits"
+    /// "whitelist_enable", "whitelist_disable", "recover_credits", "mult_mig"
+    /// (`migrate_multiplier`)
     pub action: soroban_sdk::Symbol,
     pub admin: Address,
     pub ledger: u32,
@@ -459,6 +464,25 @@ pub struct GlobalMultiplierHistoryPage {
     pub events: Vec<GlobalMultiplierEvent>,
     pub total: u32,
 }
+
+/// A single user multiplier change event for audit trail (#679).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiplierAuditEntry {
+    pub user: Address,
+    pub old_multiplier: u32,
+    pub new_multiplier: u32,
+    pub ledger: u32,
+}
+
+/// Paginated response for user multiplier audit queries (#679).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiplierAuditPage {
+    pub events: Vec<MultiplierAuditEntry>,
+    pub total: u32,
+}
+
 
 // ── Feature 1: User Activity Tracking (Issue #554) ─────────────────────────
 
