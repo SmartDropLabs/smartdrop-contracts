@@ -20,6 +20,9 @@ pub enum VestingError {
     TreasuryNotConfigured = 10,
     /// `withdraw_early` was called with a zero or negative amount. See #605.
     InvalidAmount = 11,
+    /// The vesting schedule is outside the supported limits: it runs for longer
+    /// than the maximum vesting duration (365 days of ledgers). See #684.
+    InvalidSchedule = 12,
 }
 
 /// Storage keys for all instance data in the vesting wallet.
@@ -55,6 +58,10 @@ pub enum DataKey {
     Delegate,
     /// Set once the cliff has been reached and its notification emitted (#615).
     CliffEndNotified,
+    /// Global counter for schedule change events (#681).
+    ScheduleHistoryCount,
+    /// Schedule history event by index (#681).
+    ScheduleHistory(u32),
 }
 
 /// Emitted when admin rights are transferred.
@@ -106,36 +113,20 @@ pub struct VestingOverview {
     pub releasable_amount: i128,
 }
 
-/// Layout version written into every `ScheduleBackup`. Bump it when the
-/// backup's fields change so a restore tool can refuse a layout it does not
-/// understand (#693).
-pub const SCHEDULE_BACKUP_VERSION: u32 = 1;
-
-/// Point-in-time copy of everything that defines a vesting wallet's state,
-/// returned by `backup_schedule` (#693).
-///
-/// `VestingSchedule` holds the configured parameters only. Recovering a wallet
-/// also needs who administers it, who funded it, how much has already been
-/// released and whether it was revoked, so those are captured here too. It is a
-/// separate type, not extra fields on `VestingSchedule`, so that struct's XDR
-/// layout stays unchanged for clients that already decode it.
+/// A single schedule change event (#681).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScheduleBackup {
-    /// `SCHEDULE_BACKUP_VERSION` at the time the backup was taken.
-    pub version: u32,
-    /// Ledger sequence the backup was read at.
-    pub backed_up_at_ledger: u32,
-    pub schedule: VestingSchedule,
-    pub admin: Address,
-    pub funder: Address,
-    pub treasury: Option<Address>,
-    pub delegate: Option<Address>,
-    /// Cumulative tokens already transferred to the beneficiary.
-    pub released_amount: i128,
-    /// Number of release operations performed.
-    pub release_count: u32,
-    pub revoked: bool,
-    /// Vested amount frozen at revocation; 0 when not revoked.
-    pub revoked_vested: i128,
+pub struct ScheduleHistoryEntry {
+    pub action: soroban_sdk::Symbol,
+    pub old_schedule: Option<VestingSchedule>,
+    pub new_schedule: Option<VestingSchedule>,
+    pub ledger: u32,
+}
+
+/// Paginated response for schedule history queries (#681).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleHistoryPage {
+    pub events: soroban_sdk::Vec<ScheduleHistoryEntry>,
+    pub total: u32,
 }

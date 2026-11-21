@@ -5,9 +5,10 @@
 mod types;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
-use types::{DataKey, SCHEDULE_BACKUP_VERSION};
+use types::DataKey;
 pub use types::{
-    AdminTransferred, ScheduleBackup, VestingError, VestingOverview, VestingSchedule,
+    AdminTransferred, ScheduleHistoryEntry, ScheduleHistoryPage, VestingError, VestingOverview,
+    VestingSchedule,
 };
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5 s/ledger).
@@ -15,10 +16,23 @@ const TTL_THRESHOLD: u32 = 518_400;
 const TTL_EXTEND_TO: u32 = 1_036_800;
 
 // The vesting formula multiplies total_amount by the elapsed portion of the
-// schedule. Since valid ledger values are u32 and the largest valid duration
-// is u32::MAX, this ceiling guarantees that product fits in i128 for every
-// valid schedule: i128::MAX / u32::MAX.
+// schedule. Valid ledger values are u32, so even the largest possible duration
+// is below u32::MAX; this ceiling, computed for u32::MAX, therefore guarantees
+// the product fits in i128 for every valid schedule: i128::MAX / u32::MAX.
+// (Schedules are further limited to MAX_VESTING_DURATION_LEDGERS below.)
 const MAX_TOTAL_AMOUNT: i128 = i128::MAX / 4_294_967_295i128;
+
+/// Seconds a ledger takes to close, which the schedule limits are expressed
+/// against (about 5 s on Stellar, the same assumption the TTL constants above make).
+const SECONDS_PER_LEDGER: u32 = 5;
+
+/// Longest vesting schedule `initialize` accepts, in seconds: 365 days (#684).
+const MAX_VESTING_DURATION_SECS: u32 = 365 * 24 * 60 * 60;
+
+/// The same limit in ledgers (6_307_200), because schedules are configured in
+/// ledger sequences. Measured from `start_ledger` to `end_ledger`, so a late
+/// cliff does not extend it.
+const MAX_VESTING_DURATION_LEDGERS: u32 = MAX_VESTING_DURATION_SECS / SECONDS_PER_LEDGER;
 
 /// Early-withdrawal penalty in basis points (10% = 1_000 bps). See #605.
 const EARLY_WITHDRAWAL_PENALTY_BPS: i128 = 1_000;
@@ -188,6 +202,35 @@ fn maybe_notify_cliff_end(env: &Env) {
     );
 }
 
+fn read_schedule_history_count(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ScheduleHistoryCount)
+        .unwrap_or(0)
+}
+
+fn record_schedule_event(
+    env: &Env,
+    action: soroban_sdk::Symbol,
+    old_schedule: Option<VestingSchedule>,
+    new_schedule: Option<VestingSchedule>,
+) {
+    let count = read_schedule_history_count(env);
+    let ledger = env.ledger().sequence();
+    let entry = ScheduleHistoryEntry {
+        action,
+        old_schedule,
+        new_schedule,
+        ledger,
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::ScheduleHistory(count), &entry);
+    env.storage()
+        .persistent()
+        .set(&DataKey::ScheduleHistoryCount, &(count + 1));
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -212,6 +255,12 @@ impl VestingWallet {
     /// - `cliff_ledger`: ledger before which nothing is releasable (≥ start_ledger).
     /// - `end_ledger`: ledger at which the full amount is vested (> cliff_ledger).
     /// - `revocable`: if true, `admin` may cancel the unvested portion later.
+    ///
+    /// Returns `InvalidSchedule` if the schedule runs for more than 365 days
+    /// (`end_ledger - start_ledger` above 6_307_200 ledgers, at about 5 s per
+    /// ledger), and `TotalAmountTooLarge` if `total_amount` exceeds the ceiling
+    /// the vesting formula can handle (which takes precedence). `import_vesting`
+    /// applies the same limits (#684).
     pub fn initialize(
         env: Env,
         beneficiary: Address,
@@ -241,6 +290,13 @@ impl VestingWallet {
         let duration = i128::from(end_ledger - start_ledger);
         if total_amount > MAX_TOTAL_AMOUNT || total_amount.checked_mul(duration).is_none() {
             return Err(VestingError::TotalAmountTooLarge);
+        }
+        // #684 — bound how long a schedule can run. Without a limit a schedule could
+        // lock funds for up to u32::MAX ledgers (over 600 years), which is almost
+        // certainly a mistake and could never be corrected once funds are pulled in.
+        // `end > cliff >= start` was asserted above, so `duration` is positive.
+        if duration > i128::from(MAX_VESTING_DURATION_LEDGERS) {
+            return Err(VestingError::InvalidSchedule);
         }
 
         admin.require_auth();
@@ -280,7 +336,24 @@ impl VestingWallet {
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("vest"), symbol_short!("init")),
-            (beneficiary, token, total_amount, start_ledger, end_ledger),
+            (beneficiary.clone(), token.clone(), total_amount, start_ledger, end_ledger),
+        );
+
+        // Record initial schedule creation (#681)
+        let schedule = VestingSchedule {
+            beneficiary: beneficiary.clone(),
+            token: token.clone(),
+            total_amount,
+            start_ledger,
+            cliff_ledger,
+            end_ledger,
+            revocable,
+        };
+        record_schedule_event(
+            &env,
+            symbol_short!("created"),
+            None,
+            Some(schedule),
         );
 
         bump_instance(&env);
@@ -383,6 +456,23 @@ impl VestingWallet {
         env.events().publish(
             (symbol_short!("vest"), symbol_short!("revoked")),
             (admin, get_beneficiary(&env), vested, unvested),
+        );
+
+        // Record revoke in schedule history (#681)
+        let old_schedule = VestingSchedule {
+            beneficiary: get_beneficiary(&env),
+            token: get_token(&env),
+            total_amount: get_total_amount(&env),
+            start_ledger: get_start_ledger(&env),
+            cliff_ledger: get_cliff_ledger(&env),
+            end_ledger: get_end_ledger(&env),
+            revocable: true,
+        };
+        record_schedule_event(
+            &env,
+            symbol_short!("revoked"),
+            Some(old_schedule),
+            None,
         );
 
         Ok(())
@@ -921,5 +1011,84 @@ impl VestingWallet {
             (),
         );
         Ok(())
+    }
+
+    /// Validates a vesting schedule before creation (issue #678).
+    ///
+    /// Checks that:
+    /// - start_ledger < cliff_ledger <= end_ledger
+    /// - total_amount > 0
+    /// - beneficiary is not the zero address
+    /// - token is not the zero address
+    ///
+    /// Returns `Ok(true)` if valid, or an error describing what failed.
+    /// This allows clients to validate parameters before calling `initialize`.
+    ///
+    /// ## Arguments
+    /// * `schedule` - The vesting schedule to validate
+    ///
+    /// ## Errors
+    /// * `InvalidInput` - If any validation check fails
+    pub fn validate_schedule(env: Env, schedule: VestingSchedule) -> Result<bool, VestingError> {
+        // Validate addresses are not zero
+        let zero = zero_address(&env);
+        if schedule.beneficiary == zero {
+            return Err(VestingError::InvalidInput);
+        }
+        if schedule.token == zero {
+            return Err(VestingError::InvalidInput);
+        }
+
+        // Validate total amount is positive
+        if schedule.total_amount <= 0 {
+            return Err(VestingError::InvalidInput);
+        }
+
+        // Validate ledger sequence: start < cliff <= end
+        if schedule.start_ledger >= schedule.cliff_ledger {
+            return Err(VestingError::InvalidInput);
+        }
+        if schedule.cliff_ledger > schedule.end_ledger {
+            return Err(VestingError::InvalidInput);
+        }
+
+        Ok(true)
+    }
+
+    /// Returns the vesting schedule history for this contract (issue #681).
+    ///
+    /// Provides a paginated list of all schedule change events (creation, revocation, etc.)
+    /// in chronological order.
+    ///
+    /// ## Arguments
+    /// * `start` - Zero-based index to start reading from
+    /// * `limit` - Maximum number of events to return
+    ///
+    /// ## Returns
+    /// * `ScheduleHistoryPage` containing the events and total count
+    pub fn get_schedule_history(
+        env: Env,
+        beneficiary: Address,
+        start: u32,
+        limit: u32,
+    ) -> Result<ScheduleHistoryPage, VestingError> {
+        require_initialized(&env)?;
+        beneficiary.require_auth();
+
+        let total = read_schedule_history_count(&env);
+        let mut events = soroban_sdk::Vec::new(&env);
+
+        let end = start.saturating_add(limit).min(total);
+        for i in start..end {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, ScheduleHistoryEntry>(&DataKey::ScheduleHistory(i))
+            {
+                events.push_back(event);
+            }
+        }
+
+        Ok(ScheduleHistoryPage { events, total })
     }
 }

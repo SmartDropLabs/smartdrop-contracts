@@ -58,6 +58,12 @@ pub enum DataKey {
     PoolTvl(u32),
     /// Insurance fund balance for a specific pool.
     InsuranceFund(u32),
+    /// One recorded ballot per authenticated address and pool.
+    PoolVote(u32, Address),
+    /// Aggregate approval votes for a pool.
+    PoolYesVotes(u32),
+    /// Aggregate rejection votes for a pool.
+    PoolNoVotes(u32),
 }
 
 /// On-chain record for a registered farming pool.
@@ -242,4 +248,23 @@ pub enum FactoryError {
     TooManyPools = 25,
     /// `compare_pools` was called with the same pool ID more than once.
     DuplicatePoolId = 26,
+}
+
+/// A single pool configuration change event (#680).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolConfigChangeEntry {
+    pub pool_id: u32,
+    pub action: soroban_sdk::Symbol,
+    pub old_config: Option<PoolRecord>,
+    pub new_config: Option<PoolRecord>,
+    pub ledger: u32,
+}
+
+/// Paginated response for pool configuration history queries (#680).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolConfigHistoryPage {
+    pub events: Vec<PoolConfigChangeEntry>,
+    pub total: u32,
 }
