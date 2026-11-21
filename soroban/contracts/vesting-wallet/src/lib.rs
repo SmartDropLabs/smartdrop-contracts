@@ -7,8 +7,8 @@ mod types;
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
 use types::DataKey;
 pub use types::{
-    AdminTransferred, ScheduleBackup, ScheduleHistoryEntry, ScheduleHistoryPage, VestingError, VestingOverview,
-    VestingSchedule, SCHEDULE_BACKUP_VERSION,
+    AdminTransferred, ScheduleHistoryEntry, ScheduleHistoryPage, VestingData, VestingError,
+    VestingOverview, VestingSchedule,
 };
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5 s/ledger).
@@ -659,6 +659,18 @@ impl VestingWallet {
             schedule.revocable,
             admin,
         )
+    }
+
+    /// Import a vesting schedule from external data (issue #702).
+    ///
+    /// Convenience function that wraps `import_vesting` with a bundled
+    /// `VestingData` type. This provides an easier API for importing schedules
+    /// from external sources without having to pass each parameter separately.
+    ///
+    /// Returns `Ok(())` on success, or an appropriate `VestingError` if
+    /// validation fails or the wallet is already initialized.
+    pub fn import_schedule(env: Env, data: VestingData) -> Result<(), VestingError> {
+        Self::import_vesting(env, data.schedule, data.token, data.admin)
     }
 
     /// Return the whole schedule *and* its live progress in a single call.
