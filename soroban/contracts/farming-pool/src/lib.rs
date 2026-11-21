@@ -4095,4 +4095,74 @@ impl FarmingPool {
 
         Ok(MultiplierAuditPage { events, total })
     }
+
+    /// Import multiplier data for a user (issue #700).
+    ///
+    /// Allows the admin to import multiplier data from an external source.
+    /// This can be used for migration or restoration purposes.
+    /// Requires admin authorization.
+    ///
+    /// ## Arguments
+    /// * `data` - The MultiplierData to import
+    ///
+    /// ## Returns
+    /// * `Result<(), PoolError>` - Success or error
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the pool has not been initialized
+    /// * `InvalidGlobalMultiplier` - If the global multiplier in data is invalid
+    /// * `InvalidAllocation` - If the allocation percentage is invalid
+    /// * `InvalidAmount` - If the stake amount is invalid
+    pub fn import_multiplier(env: Env, data: MultiplierData) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        // Validate the data
+        if data.global_multiplier < 1 || data.global_multiplier > MAX_GLOBAL_MULTIPLIER {
+            return Err(PoolError::InvalidGlobalMultiplier);
+        }
+
+        if data.allocation_pct > 100 {
+            return Err(PoolError::InvalidAllocation);
+        }
+
+        if data.stake_amount < 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+
+        // Set the global multiplier if different
+        let current_multiplier = read_global_multiplier(&env);
+        if data.global_multiplier != current_multiplier {
+            env.storage()
+                .instance()
+                .set(&DataKey::GlobalMultiplier, &data.global_multiplier);
+            env.storage()
+                .instance()
+                .set(&DataKey::GlobalMultiplierChangeLedger, &env.ledger().sequence());
+        }
+
+        // Import user-specific data if the user has an active stake
+        if data.has_active_stake && data.stake_amount > 0 {
+            // Set boost allocation if present
+            if data.allocation_pct > 0 {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::UserBoost(data.user.clone()), &data.allocation_pct);
+            }
+
+            // Create or update the user stake
+            let stake = UserStake {
+                amount: data.stake_amount,
+                start_ledger: data.exported_at_ledger,
+                credits_banked: data.banked_credits,
+                credit_rate: data.credit_rate,
+                multiplier: data.stake_multiplier,
+            };
+            set_user_stake(&env, &data.user, &stake);
+        }
+
+        Ok(())
+    }
 }
