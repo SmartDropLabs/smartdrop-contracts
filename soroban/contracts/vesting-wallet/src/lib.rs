@@ -1240,4 +1240,32 @@ impl VestingWallet {
             revocable: is_revocable(&env),
         })
     }
+
+    /// Return a snapshot of the vesting schedule (#711).
+    ///
+    /// Captures the complete vesting schedule including beneficiary, token address,
+    /// total amount, start/cliff/end ledgers, and revocability status in a single
+    /// query for analytics and state preservation.
+    ///
+    /// Returns the same `VestingSchedule` struct as `export_schedule`, which includes
+    /// all parameters needed to understand the vesting timeline.
+    ///
+    /// Returns `NotInitialized` if the wallet has not been initialized.
+    pub fn get_schedule_snapshot(
+        env: Env,
+        _beneficiary: Address,
+    ) -> Result<VestingSchedule, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        
+        Ok(VestingSchedule {
+            beneficiary: get_beneficiary(&env),
+            token: get_token(&env),
+            total_amount: get_total_amount(&env),
+            start_ledger: get_start_ledger(&env),
+            cliff_ledger: get_cliff_ledger(&env),
+            end_ledger: get_end_ledger(&env),
+            revocable: is_revocable(&env),
+        })
+    }
 }

@@ -2488,6 +2488,42 @@ impl Factory {
     /// Requires admin authorization.
     ///
     /// ## Arguments
+    /// Return a snapshot of the pool's current configuration (#710).
+    ///
+    /// Captures the complete pool configuration including asset, credit rate,
+    /// global multiplier, min lock period, daily rate, WASM hash, deprecation
+    /// status, and TVL in a single query for analytics and state preservation.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized, or
+    /// `PoolNotFound` if the pool ID does not exist.
+    pub fn get_config_snapshot(env: Env, pool_id: u32) -> Result<PoolComparison, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        let tvl = read_pool_tvl(&env, pool_id);
+        let risk_score = compute_pool_risk_score(&env, pool_id, &record)?;
+
+        Ok(PoolComparison {
+            pool_id,
+            address: record.address,
+            asset: record.asset,
+            daily_rate: record.daily_rate,
+            credit_rate: record.credit_rate,
+            global_multiplier: record.global_multiplier,
+            min_lock_period: record.min_lock_period,
+            tvl,
+            risk_score,
+            deprecated: record.deprecated,
+        })
+    }
+
     /// * `config` - The PoolRecord containing the pool configuration to import
     ///
     /// ## Returns
