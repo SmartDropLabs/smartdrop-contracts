@@ -68,6 +68,8 @@ pub enum DataKey {
     ScheduleHistoryCount,
     /// Schedule history event by index (#681).
     ScheduleHistory(u32),
+    /// Publicly shared schedule template set by beneficiary (#648).
+    SharedSchedule,
 }
 
 /// Emitted when admin rights are transferred.
@@ -137,6 +139,27 @@ pub struct SharingPermissions {
     pub public: bool,
     /// Addresses explicitly allowed to read when `public` is false.
     pub allowed_viewers: Vec<Address>,
+}
+
+/// A shareable vesting schedule template (#648).
+///
+/// When the beneficiary calls `share_schedule`, the wallet stores a copy of
+/// the current schedule parameters here so other wallets can read it as a
+/// reusable template without being granted full `SharingPermissions` access.
+/// The template is stripped of the beneficiary address since a consumer would
+/// substitute their own.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SharedScheduleTemplate {
+    /// Token this template was created with (a hint; consumers may substitute).
+    pub token: Address,
+    pub total_amount: i128,
+    pub start_ledger: u32,
+    pub cliff_ledger: u32,
+    pub end_ledger: u32,
+    pub revocable: bool,
+    /// Ledger at which the template was published.
+    pub shared_at_ledger: u32,
 }
 
 /// A single schedule change event (#681).
