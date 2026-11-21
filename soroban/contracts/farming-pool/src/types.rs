@@ -315,6 +315,41 @@ pub struct MultiplierBreakdown {
     pub banked_credits: i128,
 }
 
+/// Portable snapshot of one user's reward-multiplier state (#697).
+///
+/// Returned by `export_multiplier` so integrators and migration tooling can
+/// read everything that determines a user's multiplier in a single call.
+/// Every field is a plain value, so the record can be serialised off-chain and
+/// compared against a later export.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiplierData {
+    pub user: Address,
+    /// Contract schema version the export was taken under.
+    pub schema_version: u32,
+    /// Ledger sequence at which the export was read.
+    pub exported_at_ledger: u32,
+    /// Pool-wide multiplier currently in force.
+    pub global_multiplier: u32,
+    /// Multiplier snapshotted on the user's stake at its last checkpoint, or
+    /// the current global multiplier when the user has no stake.
+    pub stake_multiplier: u32,
+    /// Percentage of the stake allocated to boosted staking (0-100).
+    pub allocation_pct: u32,
+    /// Stake-size tier multiplier in percent (#616).
+    pub tier_multiplier_pct: u32,
+    /// Raw staked (or locked) amount.
+    pub stake_amount: i128,
+    /// `amount * (100 - alloc + alloc * global_multiplier) / 100`.
+    pub effective_stake: i128,
+    /// Per-ledger credit rate in effect for this user.
+    pub credit_rate: i128,
+    /// Credits banked so far, before the current ledger's accrual.
+    pub banked_credits: i128,
+    /// Whether the user has an active stake or locked position.
+    pub has_active_stake: bool,
+}
+
 // ─── History / audit trail types ─────────────────────────────────────────────
 
 /// A single whitelist change event (add or remove).

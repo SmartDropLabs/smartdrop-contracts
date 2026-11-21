@@ -17,7 +17,7 @@ use types::{
     LeaderboardEntry, ListWhitelistedResponse, PoolAnalytics, Position, StakeEvent, StakeHistoryPage, TierInfo,
     UserActivity, UserStake, WhitelistEvent, WhitelistHistoryPage,
 };
-pub use types::{MultiplierBreakdown, PoolError, PoolInfo, UserSummary};
+pub use types::{MultiplierBreakdown, MultiplierData, PoolError, PoolInfo, UserSummary};
 
 // Expose compiled WASM bytes so sibling crates (e.g. `factory`) can upload the
 // real farming-pool contract in their integration tests via:
@@ -1709,6 +1709,58 @@ impl FarmingPool {
             effective_stake,
             credit_rate,
             banked_credits,
+        })
+    }
+
+    /// Export everything that determines `user`'s reward multiplier as one
+    /// portable record (#697).
+    ///
+    /// Read-only and permissionless, like `get_multiplier_breakdown`: it
+    /// exposes no state that is not already readable through the getters, and
+    /// it never writes. A user with no stake or position exports their defaults
+    /// (zero stake, current global multiplier) rather than an error, so tooling
+    /// can export every address uniformly.
+    pub fn export_multiplier(env: Env, user: Address) -> Result<MultiplierData, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
+        let global_multiplier = read_global_multiplier(&env);
+
+        let (stake_amount, credit_rate, banked_credits, stake_multiplier, has_active_stake) =
+            match get_user_stake(&env, &user) {
+                Some(stake) => (
+                    stake.amount,
+                    stake.credit_rate,
+                    stake.credits_banked,
+                    stake.multiplier,
+                    true,
+                ),
+                None => match get_position(&env, &user) {
+                    Some(pos) => (
+                        pos.amount,
+                        pos.credit_rate,
+                        pos.total_credits,
+                        global_multiplier,
+                        true,
+                    ),
+                    None => (0i128, read_credit_rate(&env), 0i128, global_multiplier, false),
+                },
+            };
+
+        Ok(MultiplierData {
+            user,
+            schema_version: read_schema_version(&env),
+            exported_at_ledger: env.ledger().sequence(),
+            global_multiplier,
+            stake_multiplier,
+            allocation_pct,
+            tier_multiplier_pct: get_tier_multiplier(stake_amount),
+            stake_amount,
+            effective_stake: compute_total_stake(stake_amount, allocation_pct, global_multiplier),
+            credit_rate,
+            banked_credits,
+            has_active_stake,
         })
     }
 
