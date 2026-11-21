@@ -353,7 +353,8 @@ pub struct StakeEvent {
 pub struct AdminActionEvent {
     /// What was changed: "credit_rate", "multiplier", "pause", "unpause",
     /// "min_lock", "min_stake", "upgrade", "admin_transfer", "migrate",
-    /// "whitelist_enable", "whitelist_disable", "recover_credits"
+    /// "whitelist_enable", "whitelist_disable", "recover_credits", "mult_mig"
+    /// (`migrate_multiplier`)
     pub action: soroban_sdk::Symbol,
     pub admin: Address,
     pub ledger: u32,
