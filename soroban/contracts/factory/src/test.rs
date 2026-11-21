@@ -2445,6 +2445,58 @@ fn test_compare_pools_requires_initialization() {
     );
 }
 
+#[test]
+fn test_recommend_pools_uses_votes_and_ranks_eligible_pools() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let configs = [
+        (
+            risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, false),
+            10_000_000i128,
+            0i128,
+        ),
+        (
+            risk_pool_record(&env, &wasm_hash, 60_000_000, 1, false),
+            0i128,
+            0i128,
+        ),
+        (
+            risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, false),
+            10_000_000i128,
+            0i128,
+        ),
+        (
+            risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, true),
+            10_000_000i128,
+            0i128,
+        ),
+    ];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+    let user = Address::generate(&env);
+    client.vote_on_pool(&1, &user, &true);
+    client.vote_on_pool(&2, &user, &false);
+
+    assert_eq!(
+        client.recommend_pools(&user),
+        vec![&env, 1u32, 0u32]
+    );
+}
+
+#[test]
+fn test_recommend_pools_returns_empty_and_requires_initialization() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &[]);
+    let user = Address::generate(&env);
+    assert_eq!(client.recommend_pools(&user), vec![&env]);
+
+    let (_, uninitialized) = setup_uninitialized();
+    assert_eq!(
+        uninitialized.try_recommend_pools(&user),
+        Err(Ok(FactoryError::NotInitialized))
+    );
+}
+
 // ── pool dependency graph (#668) ────────────────────────────────────────────────
 
 #[test]
