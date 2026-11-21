@@ -1832,6 +1832,102 @@ impl Factory {
             .unwrap_or(false))
     }
 
+    /// Validate pool configuration parameters before creating a pool (issue #704).
+    ///
+    /// Performs all validation checks that `create_pool` would perform, but
+    /// without actually creating a pool. This allows callers to validate
+    /// configuration beforehand to improve UX and catch errors at the API
+    /// boundary rather than at runtime.
+    ///
+    /// Returns `Ok(true)` if all validations pass, or an appropriate
+    /// `FactoryError` if any check fails.
+    ///
+    /// ## Validations performed:
+    /// - Asset is not zero address
+    /// - Asset is not the factory contract itself
+    /// - Asset is not the same as the admin address
+    /// - Global multiplier is within bounds (1 to MAX_GLOBAL_MULTIPLIER)
+    /// - Daily rate is within bounds and converts to a valid credit rate
+    /// - Min lock period is within bounds (MIN_LOCK_PERIOD to MAX_MIN_LOCK_PERIOD)
+    /// - Min stake amount is within acceptable range
+    pub fn validate_config(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        daily_rate: u128,
+        global_multiplier: u32,
+        min_lock_period: u64,
+        min_stake_amount: i128,
+    ) -> Result<bool, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        validate_asset(&env, &asset)?;
+
+        // Validation: Ensure asset address is not zero/null
+        let zero_addr = Address::from_string(&String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        if asset == zero_addr {
+            return Err(FactoryError::InvalidAsset);
+        }
+
+        // Validation: Ensure the staking asset is not the factory contract itself
+        if asset == env.current_contract_address() {
+            return Err(FactoryError::InvalidAsset);
+        }
+
+        // Validation: Ensure the staking asset is not also the pool admin
+        if asset == admin {
+            return Err(FactoryError::InvalidAsset);
+        }
+
+        // Validation: Ensure global_multiplier is strictly within bounds
+        if global_multiplier < 1 {
+            return Err(FactoryError::InvalidGlobalMultiplier);
+        }
+        if global_multiplier > MAX_GLOBAL_MULTIPLIER {
+            return Err(FactoryError::InvalidGlobalMultiplier);
+        }
+
+        // Validation: Bound the caller-facing daily_rate directly
+        if daily_rate > MAX_DAILY_RATE {
+            return Err(FactoryError::InvalidCreditRate);
+        }
+
+        // Validation: Convert and validate daily_rate
+        let credit_rate = daily_rate_to_credit_rate(daily_rate)?;
+
+        if credit_rate <= 0 || credit_rate > MAX_CREDIT_RATE {
+            return Err(FactoryError::InvalidCreditRate);
+        }
+
+        // Validation: Reject a zero min_lock_period
+        if min_lock_period == 0 {
+            return Err(FactoryError::MinLockPeriodTooShort);
+        }
+        let min_lock_period_u32: u32 = min_lock_period
+            .try_into()
+            .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
+        if min_lock_period_u32 < MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodTooShort);
+        }
+        if min_lock_period_u32 > MAX_MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodAboveCeiling);
+        }
+
+        // Validation: Check min_stake_amount bounds
+        if min_stake_amount > MAX_STAKE_AMOUNT {
+            return Err(FactoryError::InvalidMinStakeAmount);
+        }
+        if min_stake_amount < -MAX_STAKE_AMOUNT {
+            return Err(FactoryError::InvalidMinStakeAmount);
+        }
+
+        Ok(true)
+    }
+
     /// Create, deploy, and initialize a new farming pool. Admin-only.
     ///
     /// Unlike the pre-#80 version of this function, the deployed pool is no
