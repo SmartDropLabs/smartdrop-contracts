@@ -308,3 +308,94 @@ fn test_a_no_op_migration_is_not_logged() {
         before
     );
 }
+
+// ── get_multiplier_optimization ───────────────────────────────────────────────
+
+#[test]
+fn test_multiplier_optimization_for_unknown_user_is_all_zero() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+
+    let opt = t.client.get_multiplier_optimization(&user);
+    assert!(!opt.has_active_stake);
+    assert!(!opt.boost_eligible);
+    assert_eq!(opt.stake_amount, 0);
+    assert_eq!(opt.optimal_allocation_pct, 0);
+    assert!(!opt.needs_migration);
+    assert_eq!(opt.tier_multiplier_pct, 100);
+    assert_eq!(opt.next_tier_multiplier_pct, 150);
+    assert_eq!(opt.additional_stake_for_next_tier, 100_001);
+    assert_eq!(opt.current_credits_per_ledger, 0);
+    assert_eq!(opt.optimal_credits_per_ledger, 0);
+}
+
+#[test]
+fn test_multiplier_optimization_suggests_full_boost_and_migration() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    StellarAssetClient::new(&t.env, &t.token_address).mint(&user, &STAKE_AMOUNT);
+    t.client.stake(&user, &STAKE_AMOUNT);
+    t.client.set_boost(&user, &50u32);
+    t.client.set_global_multiplier(&3u32);
+
+    let opt = t.client.get_multiplier_optimization(&user);
+    assert!(opt.has_active_stake);
+    assert!(opt.boost_eligible);
+    assert_eq!(opt.allocation_pct, 50);
+    assert_eq!(opt.optimal_allocation_pct, 100);
+    assert_eq!(opt.global_multiplier, 3);
+    // The stake still carries the 1x snapshot taken before the change.
+    assert_eq!(opt.stake_multiplier, 1);
+    assert!(opt.needs_migration);
+    assert_eq!(
+        opt.current_credits_per_ledger,
+        compute_credits(STAKE_AMOUNT, 50, 1, 1_000, 1)
+    );
+    assert_eq!(opt.optimal_credits_per_ledger, credits_at(3, 1));
+    assert!(opt.optimal_credits_per_ledger > opt.current_credits_per_ledger);
+    // 100_000 sits at the top of the base band.
+    assert_eq!(opt.next_tier_multiplier_pct, 150);
+    assert_eq!(opt.additional_stake_for_next_tier, 1);
+}
+
+#[test]
+fn test_multiplier_optimization_is_a_no_op_when_already_optimal() {
+    let t = setup();
+    let user = boosted_staker(&t);
+
+    // Global multiplier is 1x: allocation has no effect, so it is left alone.
+    let opt = t.client.get_multiplier_optimization(&user);
+    assert!(!opt.needs_migration);
+    assert_eq!(opt.optimal_allocation_pct, opt.allocation_pct);
+    assert_eq!(opt.optimal_credits_per_ledger, opt.current_credits_per_ledger);
+}
+
+#[test]
+fn test_multiplier_optimization_top_tier_has_no_next_step() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    StellarAssetClient::new(&t.env, &t.token_address).mint(&user, &2_000_000);
+    t.client.stake(&user, &2_000_000);
+
+    let opt = t.client.get_multiplier_optimization(&user);
+    assert_eq!(opt.tier_multiplier_pct, 200);
+    assert_eq!(opt.next_tier_multiplier_pct, 200);
+    assert_eq!(opt.additional_stake_for_next_tier, 0);
+}
+
+#[test]
+fn test_multiplier_optimization_locked_position_is_not_boost_eligible() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    StellarAssetClient::new(&t.env, &t.token_address).mint(&user, &1_000i128);
+    t.client.lock_assets(&user, &1_000i128);
+    t.client.set_global_multiplier(&5u32);
+
+    let opt = t.client.get_multiplier_optimization(&user);
+    assert!(opt.has_active_stake);
+    assert!(!opt.boost_eligible);
+    assert_eq!(opt.optimal_allocation_pct, 0);
+    assert!(!opt.needs_migration);
+    assert_eq!(opt.current_credits_per_ledger, 1_000 * 1_000);
+    assert_eq!(opt.optimal_credits_per_ledger, opt.current_credits_per_ledger);
+}

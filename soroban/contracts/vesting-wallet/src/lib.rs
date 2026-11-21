@@ -7,8 +7,9 @@ mod types;
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Vec};
 use types::DataKey;
 pub use types::{
-    AdminTransferred, ScheduleHistoryEntry, ScheduleHistoryPage, VestingData, VestingError,
-    VestingOverview, VestingSchedule,
+    AdminTransferred, ScheduleBackup, ScheduleComparison, ScheduleHistoryEntry,
+    ScheduleHistoryPage, SharingPermissions, VestingData, VestingError, VestingOverview,
+    VestingSchedule, SCHEDULE_BACKUP_VERSION,
 };
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5 s/ledger).
@@ -265,6 +266,39 @@ fn record_schedule_event(
     env.storage()
         .persistent()
         .set(&DataKey::ScheduleHistoryCount, &(count + 1));
+}
+
+/// Live overview of the vesting wallet at `wallet`. Reads locally when
+/// `wallet` is this contract (Soroban forbids self re-entry), otherwise calls
+/// the other wallet's `get_vesting_overview`.
+fn read_overview_of(env: &Env, wallet: &Address) -> Result<VestingOverview, VestingError> {
+    if *wallet == env.current_contract_address() {
+        return VestingWallet::get_vesting_overview(env.clone());
+    }
+    match VestingWalletClient::new(env, wallet).try_get_vesting_overview() {
+        Ok(Ok(overview)) => Ok(overview),
+        _ => Err(VestingError::InvalidInput),
+    }
+}
+
+/// Vested share of the total in basis points, capped at 10_000.
+fn vested_bps(o: &VestingOverview) -> u32 {
+    if o.total_amount <= 0 {
+        return 0;
+    }
+    let bps = o.vested_amount.max(0).saturating_mul(10_000) / o.total_amount;
+    bps.min(10_000) as u32
+}
+
+/// Wallet that wins a strict comparison, or `None` on a tie.
+fn pick_wallet(a: &Address, a_wins: bool, b: &Address, b_wins: bool) -> Option<Address> {
+    if a_wins {
+        Some(a.clone())
+    } else if b_wins {
+        Some(b.clone())
+    } else {
+        None
+    }
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -750,6 +784,54 @@ impl VestingWallet {
             // a negative "releasable" would be nonsense to a caller.
             releasable_amount: vested.saturating_sub(released).max(0),
             version: read_schedule_version(&env),
+        })
+    }
+
+    /// Compare the schedules of two vesting wallets side by side.
+    ///
+    /// `a` and `b` are vesting-wallet contract addresses (each wallet holds one
+    /// schedule). Either may be this contract. Both overviews are read in this
+    /// call, so they reflect the same ledger. Read-only and permissionless,
+    /// like `get_vesting_overview`.
+    ///
+    /// Returns `InvalidInput` when `a == b` or when either address does not
+    /// answer `get_vesting_overview` (not a vesting wallet, or uninitialized).
+    pub fn compare_schedules(
+        env: Env,
+        a: Address,
+        b: Address,
+    ) -> Result<ScheduleComparison, VestingError> {
+        if a == b {
+            return Err(VestingError::InvalidInput);
+        }
+
+        let oa = read_overview_of(&env, &a)?;
+        let ob = read_overview_of(&env, &b)?;
+
+        let duration_a = oa.end_ledger.saturating_sub(oa.start_ledger);
+        let duration_b = ob.end_ledger.saturating_sub(ob.start_ledger);
+
+        Ok(ScheduleComparison {
+            total_amount_diff: oa.total_amount.saturating_sub(ob.total_amount),
+            releasable_diff: oa.releasable_amount.saturating_sub(ob.releasable_amount),
+            duration_a,
+            duration_b,
+            cliff_a: oa.cliff_ledger.saturating_sub(oa.start_ledger),
+            cliff_b: ob.cliff_ledger.saturating_sub(ob.start_ledger),
+            vested_bps_a: vested_bps(&oa),
+            vested_bps_b: vested_bps(&ob),
+            same_token: oa.token == ob.token,
+            faster_vesting: pick_wallet(&a, duration_a < duration_b, &b, duration_b < duration_a),
+            earlier_unlock: pick_wallet(
+                &a,
+                oa.cliff_ledger < ob.cliff_ledger,
+                &b,
+                ob.cliff_ledger < oa.cliff_ledger,
+            ),
+            wallet_a: a,
+            wallet_b: b,
+            a: oa,
+            b: ob,
         })
     }
 

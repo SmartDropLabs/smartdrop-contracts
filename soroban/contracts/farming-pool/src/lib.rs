@@ -18,7 +18,9 @@ use types::{
     PoolAnalytics, Position, StakeEvent, StakeHistoryPage, TierInfo, UserActivity, UserStake,
     WhitelistEvent, WhitelistHistoryPage,
 };
-pub use types::{MultiplierBreakdown, MultiplierData, PoolError, PoolInfo, UserSummary};
+pub use types::{
+    MultiplierBreakdown, MultiplierData, MultiplierOptimization, PoolError, PoolInfo, UserSummary,
+};
 
 // Expose compiled WASM bytes so sibling crates (e.g. `factory`) can upload the
 // real farming-pool contract in their integration tests via:
@@ -1037,6 +1039,19 @@ fn get_tier_multiplier(stake_amount: i128) -> u32 {
         150
     } else {
         100
+    }
+}
+
+/// The next stake-size band above `stake_amount` as
+/// `(tier_multiplier_pct, extra_stake_needed)`, or `None` in the top band.
+/// Mirrors the strictly-greater-than thresholds of `get_tier_multiplier`.
+fn next_tier_step(stake_amount: i128) -> Option<(u32, i128)> {
+    if stake_amount > 1_000_000 {
+        None
+    } else if stake_amount > 100_000 {
+        Some((200, 1_000_001 - stake_amount))
+    } else {
+        Some((150, 100_001 - stake_amount))
     }
 }
 
@@ -3956,6 +3971,111 @@ impl FarmingPool {
             credit_rate,
             ledgers,
         ))
+    }
+
+    /// Suggest how `user` could raise their reward multiplier.
+    ///
+    /// Read-only and permissionless, like `get_multiplier_breakdown`. Reports
+    /// three levers and the per-ledger accrual each would unlock:
+    ///
+    /// - **Boost allocation**: at a live global multiplier above 1x, a 100%
+    ///   allocation maximises the effective stake. Only flexible stakes are
+    ///   boost-eligible.
+    /// - **Stale snapshot**: a stake whose multiplier or credit rate snapshot
+    ///   lags the live values is flagged via `needs_migration`.
+    /// - **Stake-size tier**: the extra stake that reaches the next band.
+    ///
+    /// A user with no stake or position gets an all-zero result (with the next
+    /// tier computed from a zero stake) rather than an error, so dashboards can
+    /// query any address uniformly.
+    pub fn get_multiplier_optimization(
+        env: Env,
+        user: Address,
+    ) -> Result<MultiplierOptimization, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let global_multiplier = read_global_multiplier(&env);
+        let live_credit_rate = read_credit_rate(&env);
+        let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
+
+        let (
+            has_active_stake,
+            boost_eligible,
+            stake_amount,
+            stake_multiplier,
+            needs_migration,
+            current_credits_per_ledger,
+        ) = match get_user_stake(&env, &user) {
+            Some(stake) => (
+                true,
+                true,
+                stake.amount,
+                stake.multiplier,
+                stake.multiplier != global_multiplier || stake.credit_rate != live_credit_rate,
+                compute_credits(
+                    stake.amount,
+                    allocation_pct,
+                    stake.multiplier,
+                    stake.credit_rate,
+                    1,
+                ),
+            ),
+            None => match get_position(&env, &user) {
+                Some(pos) => (
+                    true,
+                    false,
+                    pos.amount,
+                    global_multiplier,
+                    false,
+                    // Bounded by MAX_STAKE_AMOUNT * MAX_CREDIT_RATE, far
+                    // below i128::MAX; saturate rather than panic regardless.
+                    pos.amount.saturating_mul(pos.credit_rate),
+                ),
+                None => (false, false, 0i128, global_multiplier, false, 0i128),
+            },
+        };
+
+        let optimal_allocation_pct = if !boost_eligible {
+            0
+        } else if global_multiplier > 1 {
+            100
+        } else {
+            allocation_pct
+        };
+
+        let optimal_credits_per_ledger = if boost_eligible {
+            compute_credits(
+                stake_amount,
+                optimal_allocation_pct,
+                global_multiplier,
+                live_credit_rate,
+                1,
+            )
+        } else {
+            current_credits_per_ledger
+        };
+
+        let tier_multiplier_pct = get_tier_multiplier(stake_amount);
+        let (next_tier_multiplier_pct, additional_stake_for_next_tier) =
+            next_tier_step(stake_amount).unwrap_or((tier_multiplier_pct, 0));
+
+        Ok(MultiplierOptimization {
+            user,
+            has_active_stake,
+            boost_eligible,
+            stake_amount,
+            allocation_pct,
+            optimal_allocation_pct,
+            global_multiplier,
+            stake_multiplier,
+            needs_migration,
+            tier_multiplier_pct,
+            next_tier_multiplier_pct,
+            additional_stake_for_next_tier,
+            current_credits_per_ledger,
+            optimal_credits_per_ledger,
+        })
     }
 
     // ── Feature improvements: #578, #579 ───────────────────────────────────

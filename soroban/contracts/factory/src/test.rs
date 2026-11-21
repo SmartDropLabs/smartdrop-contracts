@@ -2535,3 +2535,89 @@ fn test_pool_dependencies_require_initialization() {
         Err(Ok(FactoryError::NotInitialized))
     );
 }
+
+// ── compare_configs / get_config_optimization ─────────────────────────────────
+
+#[test]
+fn test_compare_configs_reports_deltas_and_winners() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let configs = [
+        (risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, false), 10_000_000i128, 0i128),
+        (risk_pool_record(&env, &wasm_hash, 60_000_000, 1, false), 0i128, 0i128),
+    ];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    let cmp = client.compare_configs(&0u32, &1u32);
+    assert_eq!(cmp.a.pool_id, 0);
+    assert_eq!(cmp.b.pool_id, 1);
+    assert_eq!(cmp.credit_rate_diff, 1_000_000 - 60_000_000);
+    assert_eq!(cmp.min_lock_period_diff, 30 * 17_280 - 1);
+    assert_eq!(cmp.tvl_diff, 10_000_000);
+    assert_eq!(cmp.global_multiplier_diff, 0);
+    assert!(!cmp.same_asset);
+    assert_eq!(cmp.higher_yield, Some(1));
+    assert_eq!(cmp.lower_risk, Some(0));
+    assert!(cmp.risk_score_diff < 0);
+}
+
+#[test]
+fn test_compare_configs_rejects_invalid_requests() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let configs = [(risk_pool_record(&env, &wasm_hash, 1_000, 100, false), 1_000_000i128, 0i128)];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    assert_eq!(client.try_compare_configs(&0u32, &0u32), Err(Ok(FactoryError::DuplicatePoolId)));
+    assert_eq!(client.try_compare_configs(&0u32, &9u32), Err(Ok(FactoryError::PoolNotFound)));
+}
+
+#[test]
+fn test_config_optimization_empty_for_healthy_pool() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let configs = [(risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, false), 10_000_000i128, 0i128)];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    let opt = client.get_config_optimization(&0u32);
+    assert_eq!(opt.risk_score, 0);
+    assert_eq!(opt.suggestions.len(), 0);
+}
+
+#[test]
+fn test_config_optimization_lists_every_firing_signal() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let outdated = BytesN::from_array(&env, &[9; 32]);
+    let configs = [(risk_pool_record(&env, &outdated, 60_000_000, 1, false), 0i128, 0i128)];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    let opt = client.get_config_optimization(&0u32);
+    let kinds: std::vec::Vec<OptimizationKind> = opt.suggestions.iter().map(|s| s.kind).collect();
+    assert_eq!(
+        kinds,
+        std::vec![
+            OptimizationKind::IncreaseMinLockPeriod,
+            OptimizationKind::ReduceCreditRate,
+            OptimizationKind::IncreaseTvl,
+            OptimizationKind::UpgradeWasm,
+            OptimizationKind::IncreaseInsurance,
+        ]
+    );
+    let rate = opt.suggestions.get(1).unwrap();
+    assert_eq!(rate.current, 60_000_000);
+    assert_eq!(rate.suggested, 9_999_999);
+}
+
+#[test]
+fn test_config_optimization_deprecated_pool_only_suggests_migration() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let configs = [(risk_pool_record(&env, &wasm_hash, 60_000_000, 1, true), 0i128, 0i128)];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    let opt = client.get_config_optimization(&0u32);
+    assert_eq!(opt.suggestions.len(), 1);
+    assert_eq!(opt.suggestions.get(0).unwrap().kind, OptimizationKind::MigrateDeprecated);
+    assert_eq!(client.try_get_config_optimization(&5u32), Err(Ok(FactoryError::PoolNotFound)));
+}

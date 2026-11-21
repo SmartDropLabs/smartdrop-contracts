@@ -7,9 +7,12 @@ use soroban_sdk::{
     Vec,
 };
 use types::{
-    DataKey, ListPoolsResponse, PoolComparison, PoolConfigChangeEntry, PoolConfigHistoryPage,
-    PoolRecord, PoolSort, PoolStatus, RefreshPoolTtlsResponse,
+    ConfigSuggestion, DataKey, ListPoolsResponse, OptimizationKind, PoolComparison,
+    PoolConfigChangeEntry, PoolConfigHistoryPage, PoolRecord, PoolSort, PoolStatus,
+    RefreshPoolTtlsResponse,
 };
+
+pub use types::{ConfigComparison, ConfigSuggestions};
 
 pub use types::DependencyGraph;
 pub use types::FactoryError;
@@ -406,6 +409,113 @@ fn compute_pool_risk_score(
     }
 
     Ok(score.min(RISK_SCORE_MAX))
+}
+
+/// Load a pool and build its `PoolComparison` row, bumping the record TTL.
+/// Shared by `compare_pools` and `compare_configs`.
+fn build_pool_comparison(env: &Env, pool_id: u32) -> Result<PoolComparison, FactoryError> {
+    let record = env
+        .storage()
+        .persistent()
+        .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+        .ok_or(FactoryError::PoolNotFound)?;
+    bump_pool(env, pool_id);
+    let risk_score = compute_pool_risk_score(env, pool_id, &record)?;
+
+    Ok(PoolComparison {
+        pool_id,
+        address: record.address,
+        asset: record.asset,
+        daily_rate: record.daily_rate,
+        credit_rate: record.credit_rate,
+        global_multiplier: record.global_multiplier,
+        min_lock_period: record.min_lock_period,
+        tvl: read_pool_tvl(env, pool_id),
+        risk_score,
+        deprecated: record.deprecated,
+    })
+}
+
+/// Configuration changes that clear each risk signal `compute_pool_risk_score`
+/// fires for `record`. Thresholds are kept in lock-step with that function.
+fn config_suggestions(
+    env: &Env,
+    pool_id: u32,
+    record: &PoolRecord,
+) -> Result<Vec<ConfigSuggestion>, FactoryError> {
+    let mut out: Vec<ConfigSuggestion> = Vec::new(env);
+
+    if record.deprecated {
+        out.push_back(ConfigSuggestion {
+            kind: OptimizationKind::MigrateDeprecated,
+            current: 1,
+            suggested: 0,
+        });
+        // Tuning a decommissioned pool is pointless; migration is the advice.
+        return Ok(out);
+    }
+
+    let lowest_risk_lock = 30 * LEDGERS_PER_DAY as u32;
+    if record.min_lock_period < lowest_risk_lock {
+        out.push_back(ConfigSuggestion {
+            kind: OptimizationKind::IncreaseMinLockPeriod,
+            current: record.min_lock_period as i128,
+            suggested: lowest_risk_lock as i128,
+        });
+    }
+
+    // Risk fires at `credit_rate * 100 / MAX_CREDIT_RATE >= 10`, i.e. at or
+    // above MAX_CREDIT_RATE / 10; suggest the largest rate below that.
+    let high_rate_floor = MAX_CREDIT_RATE / 10;
+    if record.credit_rate >= high_rate_floor {
+        out.push_back(ConfigSuggestion {
+            kind: OptimizationKind::ReduceCreditRate,
+            current: record.credit_rate,
+            suggested: high_rate_floor - 1,
+        });
+    }
+
+    let tvl = read_pool_tvl(env, pool_id);
+    if tvl < RISK_SCORE_TVL_THRESHOLD {
+        out.push_back(ConfigSuggestion {
+            kind: OptimizationKind::IncreaseTvl,
+            current: tvl,
+            suggested: RISK_SCORE_TVL_THRESHOLD,
+        });
+    }
+
+    if load_wasm_hash(env)? != record.wasm_hash {
+        out.push_back(ConfigSuggestion {
+            kind: OptimizationKind::UpgradeWasm,
+            current: record.version as i128,
+            suggested: record.version as i128 + 1,
+        });
+    }
+
+    // Insurance only discounts other penalties, so it is advice only when at
+    // least one penalty above is firing.
+    let insurance = read_pool_insurance(env, pool_id);
+    let full_discount = 10 * RISK_SCORE_TVL_THRESHOLD;
+    if !out.is_empty() && insurance < full_discount {
+        out.push_back(ConfigSuggestion {
+            kind: OptimizationKind::IncreaseInsurance,
+            current: insurance,
+            suggested: full_discount,
+        });
+    }
+
+    Ok(out)
+}
+
+/// Pool ID that wins a strict comparison, or `None` on a tie.
+fn pick_winner(a_id: u32, a_wins: bool, b_id: u32, b_wins: bool) -> Option<u32> {
+    if a_wins {
+        Some(a_id)
+    } else if b_wins {
+        Some(b_id)
+    } else {
+        None
+    }
 }
 
 fn increment_admin_transfer_count(env: &Env) {
@@ -867,30 +977,86 @@ impl Factory {
                 return Err(FactoryError::DuplicatePoolId);
             }
             seen.push_back(pool_id);
-
-            let record = env
-                .storage()
-                .persistent()
-                .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
-                .ok_or(FactoryError::PoolNotFound)?;
-            bump_pool(&env, pool_id);
-            let risk_score = compute_pool_risk_score(&env, pool_id, &record)?;
-
-            comparisons.push_back(PoolComparison {
-                pool_id,
-                address: record.address,
-                asset: record.asset,
-                daily_rate: record.daily_rate,
-                credit_rate: record.credit_rate,
-                global_multiplier: record.global_multiplier,
-                min_lock_period: record.min_lock_period,
-                tvl: read_pool_tvl(&env, pool_id),
-                risk_score,
-                deprecated: record.deprecated,
-            });
+            comparisons.push_back(build_pool_comparison(&env, pool_id)?);
         }
 
         Ok(comparisons)
+    }
+
+    /// Compare two pool configurations head to head.
+    ///
+    /// Returns both pools' `PoolComparison` rows plus signed `a - b` deltas
+    /// for every tunable field, whether they stake the same asset, and which
+    /// pool wins on yield (`credit_rate * global_multiplier`) and on risk.
+    /// Use `compare_pools` for more than two pools without the deltas.
+    ///
+    /// Returns `NotInitialized` before `initialize`, `DuplicatePoolId` when
+    /// `a == b`, and `PoolNotFound` for an unknown ID.
+    pub fn compare_configs(env: Env, a: u32, b: u32) -> Result<ConfigComparison, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        if a == b {
+            return Err(FactoryError::DuplicatePoolId);
+        }
+
+        let pa = build_pool_comparison(&env, a)?;
+        let pb = build_pool_comparison(&env, b)?;
+
+        // Both factors are bounded (MAX_CREDIT_RATE, MAX_GLOBAL_MULTIPLIER),
+        // so the products cannot overflow i128.
+        let yield_a = pa.credit_rate * pa.global_multiplier as i128;
+        let yield_b = pb.credit_rate * pb.global_multiplier as i128;
+
+        Ok(ConfigComparison {
+            // daily_rate is capped at MAX_DAILY_RATE, which fits in i128.
+            daily_rate_diff: pa.daily_rate as i128 - pb.daily_rate as i128,
+            credit_rate_diff: pa.credit_rate - pb.credit_rate,
+            global_multiplier_diff: pa.global_multiplier as i64 - pb.global_multiplier as i64,
+            min_lock_period_diff: pa.min_lock_period as i64 - pb.min_lock_period as i64,
+            tvl_diff: pa.tvl.saturating_sub(pb.tvl),
+            risk_score_diff: pa.risk_score as i64 - pb.risk_score as i64,
+            same_asset: pa.asset == pb.asset,
+            higher_yield: pick_winner(a, yield_a > yield_b, b, yield_b > yield_a),
+            lower_risk: pick_winner(
+                a,
+                pa.risk_score < pb.risk_score,
+                b,
+                pb.risk_score < pa.risk_score,
+            ),
+            a: pa,
+            b: pb,
+        })
+    }
+
+    /// Suggest configuration changes that would lower a pool's risk score.
+    ///
+    /// Each suggestion corresponds to one signal in `get_pool_risk` and gives
+    /// the field's current value and the value that clears that signal. A
+    /// deprecated pool gets a single `MigrateDeprecated` suggestion. An empty
+    /// list means no risk signal is firing. Read-only: nothing is applied.
+    ///
+    /// Returns `NotInitialized` before `initialize`, or `PoolNotFound` for an
+    /// unknown `pool_id`. Extends the pool record TTL on success.
+    pub fn get_config_optimization(
+        env: Env,
+        pool_id: u32,
+    ) -> Result<ConfigSuggestions, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        Ok(ConfigSuggestions {
+            pool_id,
+            risk_score: compute_pool_risk_score(&env, pool_id, &record)?,
+            suggestions: config_suggestions(&env, pool_id, &record)?,
+        })
     }
 
     /// Set the pool IDs that `pool_id` depends on (#668). Admin-only.

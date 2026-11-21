@@ -354,6 +354,52 @@ pub struct MultiplierData {
     pub has_active_stake: bool,
 }
 
+/// Read-only advice on how `user` could raise their reward multiplier,
+/// returned by `get_multiplier_optimization`.
+///
+/// Every "optimal" figure is a projection computed with the pool's live
+/// parameters; nothing here is applied automatically. Boost allocation is
+/// admin-set via `set_boost`, a stale multiplier snapshot is refreshed via the
+/// admin-only `migrate_multiplier`, and the stake-size tier moves only when the
+/// user stakes more.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiplierOptimization {
+    pub user: Address,
+    /// Whether the user has a flexible stake or a time-locked position.
+    pub has_active_stake: bool,
+    /// Whether boost applies to the user. Only a flexible `UserStake` can be
+    /// boosted; a time-locked `Position` accrues at `amount * credit_rate`.
+    pub boost_eligible: bool,
+    /// Raw staked (or locked) amount.
+    pub stake_amount: i128,
+    /// Current boost allocation (0-100).
+    pub allocation_pct: u32,
+    /// Allocation that maximises accrual at the live global multiplier: 100
+    /// when the multiplier is above 1x, otherwise the current allocation
+    /// (boost has no effect at 1x). 0 when the user is not boost-eligible.
+    pub optimal_allocation_pct: u32,
+    /// Pool-wide multiplier currently in force.
+    pub global_multiplier: u32,
+    /// Multiplier snapshotted on the user's stake, used for current accrual.
+    pub stake_multiplier: u32,
+    /// True when the stake's snapshot multiplier or credit rate lags the live
+    /// pool values, so `migrate_multiplier` would change future accrual.
+    pub needs_migration: bool,
+    /// Current stake-size tier multiplier in percent (#616).
+    pub tier_multiplier_pct: u32,
+    /// Tier multiplier of the next stake-size band, or the current one when
+    /// already in the top band.
+    pub next_tier_multiplier_pct: u32,
+    /// Extra stake needed to reach the next band; 0 when already at the top.
+    pub additional_stake_for_next_tier: i128,
+    /// Credits accrued per ledger with the user's current settings.
+    pub current_credits_per_ledger: i128,
+    /// Credits per ledger with the optimal allocation, the live multiplier and
+    /// the live credit rate (stake amount unchanged).
+    pub optimal_credits_per_ledger: i128,
+}
+
 // ─── History / audit trail types ─────────────────────────────────────────────
 
 /// A single whitelist change event (add or remove).

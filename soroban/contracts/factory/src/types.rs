@@ -58,6 +58,13 @@ pub enum DataKey {
     PoolTvl(u32),
     /// Insurance fund balance for a specific pool.
     InsuranceFund(u32),
+    /// Pool IDs that a given pool depends on, as set by
+    /// `set_pool_dependencies` (#668).
+    PoolDependencies(u32),
+    /// Ordered list of pool IDs that currently have dependencies set, so
+    /// `get_dependency_graph` can be built without scanning every pool ID
+    /// up to `PoolCount` (#668).
+    PoolsWithDependencies,
     /// One recorded ballot per authenticated address and pool.
     PoolVote(u32, Address),
     /// Aggregate approval votes for a pool.
@@ -117,6 +124,73 @@ pub struct PoolComparison {
     pub tvl: i128,
     pub risk_score: u32,
     pub deprecated: bool,
+}
+
+/// Head-to-head comparison of two pool configurations, returned by
+/// `compare_configs`.
+///
+/// Every `*_diff` field is `a - b`, so a positive value means pool `a` is
+/// higher on that dimension. `higher_yield` and `lower_risk` name the winning
+/// pool ID, or `None` on a tie.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigComparison {
+    pub a: PoolComparison,
+    pub b: PoolComparison,
+    pub daily_rate_diff: i128,
+    pub credit_rate_diff: i128,
+    pub global_multiplier_diff: i64,
+    pub min_lock_period_diff: i64,
+    pub tvl_diff: i128,
+    pub risk_score_diff: i64,
+    /// Whether both pools stake the same asset (a like-for-like comparison).
+    pub same_asset: bool,
+    /// Pool with the larger `credit_rate * global_multiplier`.
+    pub higher_yield: Option<u32>,
+    /// Pool with the lower `risk_score`.
+    pub lower_risk: Option<u32>,
+}
+
+/// A configuration change that would lower a pool's risk score, as reported
+/// by `get_config_optimization`. Each kind maps to one `get_pool_risk` signal.
+#[contracttype]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum OptimizationKind {
+    /// Pool is deprecated; migrate stakers to a live pool instead of tuning it.
+    MigrateDeprecated,
+    /// `min_lock_period` (ledgers) is below the 30-day lowest-risk band.
+    IncreaseMinLockPeriod,
+    /// `credit_rate` is at or above 10% of the protocol ceiling.
+    ReduceCreditRate,
+    /// Synced TVL is below the protocol's minimum stake threshold.
+    IncreaseTvl,
+    /// Insurance fund is below the level that earns the full risk discount.
+    IncreaseInsurance,
+    /// Pool runs a WASM hash other than the factory's current one.
+    UpgradeWasm,
+}
+
+/// One optimization suggestion: the field's current value and the value that
+/// clears the corresponding risk signal. For `UpgradeWasm` the values are the
+/// pool's record `version` and the version after one `upgrade_pool`; for
+/// `MigrateDeprecated` they are `1` (deprecated) and `0`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigSuggestion {
+    pub kind: OptimizationKind,
+    pub current: i128,
+    pub suggested: i128,
+}
+
+/// Result of `get_config_optimization`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigSuggestions {
+    pub pool_id: u32,
+    /// Current `get_pool_risk` score.
+    pub risk_score: u32,
+    /// Ordered suggestions; empty when the pool is already optimal.
+    pub suggestions: Vec<ConfigSuggestion>,
 }
 
 /// Sort keys supported by `list_pools_sorted`.
@@ -267,6 +341,12 @@ pub enum FactoryError {
     DuplicatePoolId = 26,
     /// A voter has already voted on a pool.
     AlreadyVoted = 27,
+    /// `set_pool_dependencies` was called with a pool listed as its own
+    /// dependency.
+    SelfDependency = 28,
+    /// `set_pool_dependencies` was called with more entries than
+    /// `MAX_POOL_DEPENDENCIES`.
+    TooManyDependencies = 29,
 }
 
 /// A single pool configuration change event (#680).

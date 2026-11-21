@@ -58,6 +58,12 @@ pub enum DataKey {
     Delegate,
     /// Set once the cliff has been reached and its notification emitted (#615).
     CliffEndNotified,
+    /// Monotonically increasing schedule version, bumped whenever the
+    /// schedule's effective state changes (#666).
+    ScheduleVersion,
+    /// Sharing permissions controlling who may read via
+    /// `get_vesting_overview_for` (#669).
+    SharingPermissions,
     /// Global counter for schedule change events (#681).
     ScheduleHistoryCount,
     /// Schedule history event by index (#681).
@@ -160,4 +166,69 @@ pub struct VestingData {
     pub schedule: VestingSchedule,
     pub token: Address,
     pub admin: Address,
+}
+
+/// Layout version written into every `ScheduleBackup`. Bump it when the
+/// backup's fields change so a restore tool can refuse a layout it does not
+/// understand (#693).
+pub const SCHEDULE_BACKUP_VERSION: u32 = 1;
+
+/// Point-in-time copy of everything that defines a vesting wallet's state,
+/// returned by `backup_schedule` (#693).
+///
+/// `VestingSchedule` holds the configured parameters only. Recovering a wallet
+/// also needs who administers it, who funded it, how much has already been
+/// released and whether it was revoked, so those are captured here too. It is a
+/// separate type, not extra fields on `VestingSchedule`, so that struct's XDR
+/// layout stays unchanged for clients that already decode it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleBackup {
+    /// `SCHEDULE_BACKUP_VERSION` at the time the backup was taken.
+    pub version: u32,
+    /// Ledger sequence the backup was read at.
+    pub backed_up_at_ledger: u32,
+    pub schedule: VestingSchedule,
+    pub admin: Address,
+    pub funder: Address,
+    pub treasury: Option<Address>,
+    pub delegate: Option<Address>,
+    /// Cumulative tokens already transferred to the beneficiary.
+    pub released_amount: i128,
+    /// Number of release operations performed.
+    pub release_count: u32,
+    pub revoked: bool,
+    /// Vested amount frozen at revocation; 0 when not revoked.
+    pub revoked_vested: i128,
+}
+
+/// Head-to-head comparison of two vesting wallets' schedules, returned by
+/// `compare_schedules`.
+///
+/// `a` and `b` are the two wallets' live `VestingOverview`s, read at the same
+/// ledger. Every `*_diff` field is `a - b`. Durations are in ledgers:
+/// `duration_*` runs from start to end, `cliff_*` from start to cliff.
+/// `vested_bps_*` is the vested share of the total in basis points
+/// (10_000 = fully vested).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleComparison {
+    pub wallet_a: Address,
+    pub wallet_b: Address,
+    pub a: VestingOverview,
+    pub b: VestingOverview,
+    pub total_amount_diff: i128,
+    pub releasable_diff: i128,
+    pub duration_a: u32,
+    pub duration_b: u32,
+    pub cliff_a: u32,
+    pub cliff_b: u32,
+    pub vested_bps_a: u32,
+    pub vested_bps_b: u32,
+    /// Whether both wallets vest the same token (a like-for-like comparison).
+    pub same_token: bool,
+    /// Wallet with the shorter start-to-end duration; `None` on a tie.
+    pub faster_vesting: Option<Address>,
+    /// Wallet whose cliff ledger is reached first; `None` on a tie.
+    pub earlier_unlock: Option<Address>,
 }

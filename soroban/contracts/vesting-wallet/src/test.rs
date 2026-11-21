@@ -1538,3 +1538,51 @@ fn test_backup_schedule_is_read_only_and_repeatable() {
     assert_eq!(t.client.get_vesting_overview(), overview_before);
     assert_eq!(t.client.release_count(), 0);
 }
+
+// ── compare_schedules ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_compare_schedules_reports_diffs_and_winners() {
+    let w = funded_uninitialised_wallet(3_000);
+    let start = w.env.ledger().sequence();
+
+    let a = VestingWalletClient::new(&w.env, &w.contract_id);
+    a.initialize(&w.beneficiary, &w.token_address, &1_000i128, &start, &(start + 10), &(start + 100), &false, &w.admin);
+
+    let b_id = w.env.register(VestingWallet, ());
+    let b = VestingWalletClient::new(&w.env, &b_id);
+    b.initialize(&w.beneficiary, &w.token_address, &2_000i128, &start, &(start + 50), &(start + 200), &false, &w.admin);
+
+    advance_ledgers(&w.env, 50);
+
+    // Called on wallet `a`, comparing itself (local read) with `b` (cross-contract).
+    let cmp = a.compare_schedules(&w.contract_id, &b_id);
+    assert_eq!(cmp.total_amount_diff, -1_000);
+    assert_eq!(cmp.duration_a, 100);
+    assert_eq!(cmp.duration_b, 200);
+    assert_eq!(cmp.cliff_a, 10);
+    assert_eq!(cmp.cliff_b, 50);
+    assert_eq!(cmp.vested_bps_a, 5_000);
+    assert_eq!(cmp.vested_bps_b, 2_500);
+    assert!(cmp.same_token);
+    assert_eq!(cmp.faster_vesting, Some(w.contract_id.clone()));
+    assert_eq!(cmp.earlier_unlock, Some(w.contract_id.clone()));
+}
+
+#[test]
+fn test_compare_schedules_rejects_same_wallet_and_non_wallets() {
+    let w = funded_uninitialised_wallet(1_000);
+    let start = w.env.ledger().sequence();
+    let a = VestingWalletClient::new(&w.env, &w.contract_id);
+    a.initialize(&w.beneficiary, &w.token_address, &1_000i128, &start, &start, &(start + 100), &false, &w.admin);
+
+    assert_eq!(
+        a.try_compare_schedules(&w.contract_id, &w.contract_id),
+        Err(Ok(VestingError::InvalidInput))
+    );
+    let uninitialised = w.env.register(VestingWallet, ());
+    assert_eq!(
+        a.try_compare_schedules(&w.contract_id, &uninitialised),
+        Err(Ok(VestingError::InvalidInput))
+    );
+}
