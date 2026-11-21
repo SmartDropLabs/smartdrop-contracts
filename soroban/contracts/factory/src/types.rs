@@ -58,10 +58,12 @@ pub enum DataKey {
     PoolTvl(u32),
     /// Insurance fund balance for a specific pool.
     InsuranceFund(u32),
-    /// Pool configuration history counter (#680).
-    PoolConfigHistoryCount(u32),
-    /// Pool configuration history event by index (#680).
-    PoolConfigHistory(u32, u32),
+    /// One recorded ballot per authenticated address and pool.
+    PoolVote(u32, Address),
+    /// Aggregate approval votes for a pool.
+    PoolYesVotes(u32),
+    /// Aggregate rejection votes for a pool.
+    PoolNoVotes(u32),
 }
 
 /// On-chain record for a registered farming pool.
