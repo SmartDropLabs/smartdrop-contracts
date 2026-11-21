@@ -3866,16 +3866,16 @@ impl FarmingPool {
 
     /// Validate that `multiplier` is an acceptable global multiplier value (#661).
     ///
-    /// Returns `Ok(())` when the value is in [1, MAX_GLOBAL_MULTIPLIER].
+    /// Returns `Ok(true)` when the value is in [1, MAX_GLOBAL_MULTIPLIER].
     /// Returns `Err(PoolError::InvalidGlobalMultiplier)` otherwise.
     /// Useful for client-side pre-validation before calling `set_global_multiplier`.
-    pub fn validate_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
+    pub fn validate_multiplier(env: Env, multiplier: u32) -> Result<bool, PoolError> {
         require_initialized(&env)?;
         bump_instance(&env);
         if !(1..=MAX_GLOBAL_MULTIPLIER).contains(&multiplier) {
             return Err(PoolError::InvalidGlobalMultiplier);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Simulate the credits a user would earn over `ledgers` with `new_multiplier` (#655).
