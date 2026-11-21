@@ -130,3 +130,37 @@ pub struct ScheduleHistoryPage {
     pub events: soroban_sdk::Vec<ScheduleHistoryEntry>,
     pub total: u32,
 }
+
+/// Layout version written into every `ScheduleBackup`. Bump it when the
+/// backup's fields change so a restore tool can refuse a layout it does not
+/// understand (#693).
+pub const SCHEDULE_BACKUP_VERSION: u32 = 1;
+
+/// Point-in-time copy of everything that defines a vesting wallet's state,
+/// returned by `backup_schedule` (#693).
+///
+/// `VestingSchedule` holds the configured parameters only. Recovering a wallet
+/// also needs who administers it, who funded it, how much has already been
+/// released and whether it was revoked, so those are captured here too. It is a
+/// separate type, not extra fields on `VestingSchedule`, so that struct's XDR
+/// layout stays unchanged for clients that already decode it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleBackup {
+    /// `SCHEDULE_BACKUP_VERSION` at the time the backup was taken.
+    pub version: u32,
+    /// Ledger sequence the backup was read at.
+    pub backed_up_at_ledger: u32,
+    pub schedule: VestingSchedule,
+    pub admin: Address,
+    pub funder: Address,
+    pub treasury: Option<Address>,
+    pub delegate: Option<Address>,
+    /// Cumulative tokens already transferred to the beneficiary.
+    pub released_amount: i128,
+    /// Number of release operations performed.
+    pub release_count: u32,
+    pub revoked: bool,
+    /// Vested amount frozen at revocation; 0 when not revoked.
+    pub revoked_vested: i128,
+}
