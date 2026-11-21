@@ -8,7 +8,7 @@ use soroban_sdk::{
         Address as _, AuthorizedFunction, AuthorizedInvocation, Events as _, Ledger, MockAuth,
         MockAuthInvoke,
     },
-    vec, Address, BytesN, Env, IntoVal, Symbol,
+    vec, Address, BytesN, Env, IntoVal, String, Symbol,
 };
 
 use farming_pool::FarmingPoolClient;
@@ -850,6 +850,7 @@ fn test_create_pools_batch_returns_ids_and_registers_every_pool() {
             global_multiplier: 2,
             min_lock_period: 100,
             min_stake_amount: 1_000_000,
+            metadata: PoolMetadata { name: String::from_str(&env, "test-pool") },
         },
         PoolParams {
             asset: asset_b.clone(),
@@ -857,6 +858,7 @@ fn test_create_pools_batch_returns_ids_and_registers_every_pool() {
             global_multiplier: 3,
             min_lock_period: 200,
             min_stake_amount: 2_000_000,
+            metadata: PoolMetadata { name: String::from_str(&env, "test-pool") },
         },
     ];
 
@@ -879,6 +881,7 @@ fn test_create_pools_batch_rolls_back_when_any_pool_is_invalid() {
             global_multiplier: 2,
             min_lock_period: 100,
             min_stake_amount: 1_000_000,
+            metadata: PoolMetadata { name: String::from_str(&env, "test-pool") },
         },
         PoolParams {
             asset: test_asset(&t.env),
@@ -886,6 +889,7 @@ fn test_create_pools_batch_rolls_back_when_any_pool_is_invalid() {
             global_multiplier: 0,
             min_lock_period: 100,
             min_stake_amount: 1_000_000,
+            metadata: PoolMetadata { name: String::from_str(&env, "test-pool") },
         },
     ];
 
@@ -907,6 +911,7 @@ fn test_create_pools_batch_rejects_more_than_max_batch_size() {
             global_multiplier: 2,
             min_lock_period: 100,
             min_stake_amount: 1_000_000,
+            metadata: PoolMetadata { name: String::from_str(&env, "test-pool") },
         });
     }
 
@@ -928,6 +933,7 @@ fn test_create_pools_batch_accepts_exactly_max_batch_size() {
             global_multiplier: 2,
             min_lock_period: 100,
             min_stake_amount: 1_000_000,
+            metadata: PoolMetadata { name: String::from_str(&env, "test-pool") },
         });
     }
 
@@ -1602,6 +1608,7 @@ fn test_create_pools_batch_rejects_non_token_asset() {
             global_multiplier: 2,
             min_lock_period: 100,
             min_stake_amount: 1_000_000,
+            metadata: PoolMetadata { name: String::from_str(&env, "test-pool") },
         },
         PoolParams {
             asset: Address::generate(&t.env),
@@ -1609,6 +1616,7 @@ fn test_create_pools_batch_rejects_non_token_asset() {
             global_multiplier: 2,
             min_lock_period: 100,
             min_stake_amount: 1_000_000,
+            metadata: PoolMetadata { name: String::from_str(&env, "test-pool") },
         },
     ];
 
@@ -2186,6 +2194,7 @@ fn test_create_pools_batch_maintains_the_asset_index() {
             global_multiplier: 2u32,
             min_lock_period: 10u64,
             min_stake_amount: 0i128,
+            metadata: PoolMetadata { name: String::from_str(&env, "test-pool") },
         });
     }
     batch.push_back(PoolParams {
@@ -2194,6 +2203,7 @@ fn test_create_pools_batch_maintains_the_asset_index() {
         global_multiplier: 2u32,
         min_lock_period: 10u64,
         min_stake_amount: 0i128,
+        metadata: PoolMetadata { name: String::from_str(&env, "test-pool") },
     });
 
     let created = t.client.create_pools_batch(&batch);

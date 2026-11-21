@@ -14,6 +14,7 @@ use types::{
 pub use types::DependencyGraph;
 pub use types::FactoryError;
 pub use types::HealthStatus;
+pub use types::PoolMetadata;
 pub use types::PoolParams;
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
@@ -422,6 +423,13 @@ fn validate_factory_admin(env: &Env, admin: &Address) -> Result<(), FactoryError
     ));
     if admin == &zero_admin {
         return Err(FactoryError::InvalidAdmin);
+    }
+    Ok(())
+}
+
+fn validate_metadata(metadata: &PoolMetadata) -> Result<(), FactoryError> {
+    if metadata.name.is_empty() {
+        return Err(FactoryError::InvalidMetadata);
     }
     Ok(())
 }
@@ -2225,6 +2233,7 @@ impl Factory {
 
         let mut pool_ids = vec![&env];
         for params in pools.iter() {
+            validate_metadata(&params.metadata)?;
             pool_ids.push_back(create_pool_inner(
                 env.clone(),
                 admin.clone(),

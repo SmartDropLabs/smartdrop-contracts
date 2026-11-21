@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address, BytesN, Vec};
+use soroban_sdk::{contracterror, contracttype, Address, BytesN, String, Vec};
 
 /// Health status returned by `check_pool_health` (issue #653).
 #[contracttype]
@@ -12,6 +12,16 @@ pub enum HealthStatus {
     Deprecated,
 }
 
+/// Advisory metadata attached to a pool at creation time.
+/// Fields here are stored on-chain for display purposes; they are not enforced
+/// by the pool's own `initialize` and do not affect reward mechanics.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolMetadata {
+    /// Human-readable name for the pool. Must be non-empty.
+    pub name: String,
+}
+
 /// Parameters for creating one farming pool through `create_pools_batch`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -21,6 +31,8 @@ pub struct PoolParams {
     pub global_multiplier: u32,
     pub min_lock_period: u64,
     pub min_stake_amount: i128,
+    /// Advisory metadata for the pool. The name must be non-empty.
+    pub metadata: PoolMetadata,
 }
 
 /// Storage keys used by the factory contract.
@@ -267,6 +279,8 @@ pub enum FactoryError {
     DuplicatePoolId = 26,
     /// A voter has already voted on a pool.
     AlreadyVoted = 27,
+    /// `create_pool`'s metadata is invalid (e.g. empty name).
+    InvalidMetadata = 28,
 }
 
 /// A single pool configuration change event (#680).
