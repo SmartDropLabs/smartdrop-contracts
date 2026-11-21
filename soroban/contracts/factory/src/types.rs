@@ -75,6 +75,10 @@ pub enum DataKey {
     PoolConfigHistoryCount(u32),
     /// Pool configuration change event by index (#680).
     PoolConfigHistory(u32, u32),
+    /// Count of snapshots taken for a pool (#647).
+    PoolSnapshotCount(u32),
+    /// A snapshot entry by (pool_id, snapshot_index) (#647).
+    PoolSnapshot(u32, u32),
 }
 
 /// On-chain record for a registered farming pool.
@@ -347,6 +351,31 @@ pub enum FactoryError {
     /// `set_pool_dependencies` was called with more entries than
     /// `MAX_POOL_DEPENDENCIES`.
     TooManyDependencies = 29,
+}
+
+/// Point-in-time snapshot of a pool's state (#647).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Snapshot {
+    pub pool_id: u32,
+    pub ledger: u32,
+    pub tvl: i128,
+    pub global_multiplier: u32,
+    pub credit_rate: i128,
+    pub deprecated: bool,
+}
+
+/// Aggregated metrics for a pool (#650).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolMetrics {
+    pub pool_id: u32,
+    pub tvl: i128,
+    pub snapshot_count: u32,
+    pub last_snapshot_ledger: u32,
+    pub global_multiplier: u32,
+    pub credit_rate: i128,
+    pub deprecated: bool,
 }
 
 /// A single pool configuration change event (#680).

@@ -8,8 +8,8 @@ use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Vec
 use types::DataKey;
 pub use types::{
     AdminTransferred, ScheduleBackup, ScheduleComparison, ScheduleHistoryEntry,
-    ScheduleHistoryPage, SharingPermissions, VestingData, VestingError, VestingOverview,
-    VestingSchedule, SCHEDULE_BACKUP_VERSION,
+    ScheduleHistoryPage, SharedScheduleTemplate, SharingPermissions, VestingData, VestingError,
+    VestingOverview, VestingSchedule, SCHEDULE_BACKUP_VERSION,
 };
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5 s/ledger).
@@ -867,6 +867,52 @@ impl VestingWallet {
             .set(&DataKey::SharingPermissions, &permissions);
 
         Ok(())
+    }
+
+    /// Publish the current vesting schedule as a reusable template (#648).
+    ///
+    /// Beneficiary-only. Writes a `SharedScheduleTemplate` to persistent
+    /// storage so other wallets (or off-chain tooling) can read the
+    /// parameters and use them as a starting point when creating new
+    /// vesting wallets, without granting those callers any access to the
+    /// actual vesting state. Calling again overwrites the previous template.
+    pub fn share_schedule(env: Env) -> Result<SharedScheduleTemplate, VestingError> {
+        require_initialized(&env)?;
+        let beneficiary = get_beneficiary(&env);
+        beneficiary.require_auth();
+        bump_instance(&env);
+
+        let template = SharedScheduleTemplate {
+            token: get_token(&env),
+            total_amount: get_total_amount(&env),
+            start_ledger: get_start_ledger(&env),
+            cliff_ledger: get_cliff_ledger(&env),
+            end_ledger: get_end_ledger(&env),
+            revocable: env
+                .storage()
+                .instance()
+                .get(&DataKey::Revocable)
+                .unwrap_or(false),
+            shared_at_ledger: env.ledger().sequence(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::SharedSchedule, &template);
+        Ok(template)
+    }
+
+    /// Return the shared schedule template, or `NotInitialized` if none has
+    /// been published yet (#648).
+    ///
+    /// Any caller may read the template — it contains only schedule
+    /// parameters, never beneficiary address or vesting progress.
+    pub fn get_shared_schedule(env: Env) -> Result<SharedScheduleTemplate, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::SharedSchedule)
+            .ok_or(VestingError::NotInitialized)
     }
 
     /// Return the currently configured sharing permissions (#669).
