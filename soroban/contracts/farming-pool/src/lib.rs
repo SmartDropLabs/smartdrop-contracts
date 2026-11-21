@@ -3703,6 +3703,49 @@ impl FarmingPool {
             .unwrap_or(0))
     }
 
+    /// Return a snapshot of the user's current reward multiplier state (#709).
+    ///
+    /// Captures the user's global multiplier, stake multiplier, allocation percentage,
+    /// tier multiplier, stake amount, effective stake, credit rate, and banked credits
+    /// all in one call for analytics and state preservation.
+    ///
+    /// Returns the same `MultiplierData` struct as `export_multiplier`, which includes
+    /// the complete snapshot of multiplier-related state at the query ledger.
+    ///
+    /// Returns `NotInitialized` if the pool has not been initialized.
+    pub fn get_multiplier_snapshot(env: Env, user: Address) -> Result<MultiplierData, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        // Reuse the existing export_multiplier logic which already captures
+        // the full multiplier snapshot
+        Self::export_multiplier(env, user)
+    }
+
+    /// Compare reward multipliers for two users (#712).
+    ///
+    /// Returns a comparison structure containing both users' multiplier snapshots,
+    /// allowing easy comparison of their current multiplier states, allocation percentages,
+    /// and effective stakes in a single query.
+    ///
+    /// Useful for dashboards, analytics, and migration tooling that need to compare
+    /// multiplier allocations across multiple users.
+    ///
+    /// Returns `NotInitialized` if the pool has not been initialized.
+    pub fn compare_multipliers(
+        env: Env,
+        user_a: Address,
+        user_b: Address,
+    ) -> Result<(MultiplierData, MultiplierData), PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let snapshot_a = Self::export_multiplier(env.clone(), user_a)?;
+        let snapshot_b = Self::export_multiplier(env, user_b)?;
+
+        Ok((snapshot_a, snapshot_b))
+    }
+
     // ── Feature 4: Extended Pool Analytics (Issue #557) ────────────────────
 
     /// Get extended pool analytics including average lock duration and peak TVL.
