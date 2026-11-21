@@ -4,9 +4,11 @@
 
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Vec};
 use types::DataKey;
-pub use types::{AdminTransferred, VestingError, VestingOverview, VestingSchedule};
+pub use types::{
+    AdminTransferred, SharingPermissions, VestingError, VestingOverview, VestingSchedule,
+};
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5 s/ledger).
 const TTL_THRESHOLD: u32 = 518_400;
@@ -112,6 +114,46 @@ fn increment_release_count(env: &Env) {
         .set(&DataKey::ReleaseCount, &(count + 1));
 }
 
+/// Current schedule version; 1 if `initialize` has not yet set one (#666).
+fn read_schedule_version(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::ScheduleVersion)
+        .unwrap_or(1)
+}
+
+/// Bump the schedule version after a change to the schedule's effective
+/// state (#666). Called from `transfer_beneficiary`, `revoke`,
+/// `emergency_withdraw`, and `migrate_schedule`.
+fn bump_schedule_version(env: &Env) {
+    let version = read_schedule_version(env);
+    env.storage()
+        .instance()
+        .set(&DataKey::ScheduleVersion, &(version + 1));
+}
+
+/// Sharing permissions, defaulting to fully public when never configured
+/// (#669), which preserves the pre-existing unguarded read behavior.
+fn read_sharing_permissions(env: &Env) -> SharingPermissions {
+    env.storage()
+        .instance()
+        .get(&DataKey::SharingPermissions)
+        .unwrap_or(SharingPermissions {
+            public: true,
+            allowed_viewers: Vec::new(env),
+        })
+}
+
+/// Whether `viewer` may read this schedule via `get_vesting_overview_for`
+/// (#669). The beneficiary can always read their own schedule.
+fn can_view_schedule(env: &Env, viewer: &Address) -> bool {
+    if viewer == &get_beneficiary(env) {
+        return true;
+    }
+    let perms = read_sharing_permissions(env);
+    perms.public || perms.allowed_viewers.contains(viewer)
+}
+
 // ── Vesting formula ───────────────────────────────────────────────────────────
 
 /// Linear vesting with cliff.
@@ -164,11 +206,7 @@ fn maybe_notify_cliff_end(env: &Env) {
     if cliff <= start || is_revoked(env) {
         return;
     }
-    if env
-        .storage()
-        .instance()
-        .has(&DataKey::CliffEndNotified)
-    {
+    if env.storage().instance().has(&DataKey::CliffEndNotified) {
         return;
     }
     if env.ledger().sequence() < cliff {
@@ -267,6 +305,9 @@ impl VestingWallet {
         env.storage()
             .instance()
             .set(&DataKey::ReleasedAmount, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::ScheduleVersion, &1u32);
 
         // Pull tokens from admin into the contract.
         token::TokenClient::new(&env, &token).transfer(
@@ -368,6 +409,7 @@ impl VestingWallet {
             .instance()
             .set(&DataKey::RevokedVested, &vested);
         env.storage().instance().set(&DataKey::Revoked, &true);
+        bump_schedule_version(&env);
 
         if unvested > 0 {
             token::TokenClient::new(&env, &get_token(&env)).transfer(
@@ -552,7 +594,78 @@ impl VestingWallet {
             // lower than what was already released, so clamp with `.max(0)` —
             // a negative "releasable" would be nonsense to a caller.
             releasable_amount: vested.saturating_sub(released).max(0),
+            version: read_schedule_version(&env),
         })
+    }
+
+    /// Return the current schedule version (#666).
+    ///
+    /// Starts at 1 on `initialize` and increments by 1 each time the
+    /// schedule's effective state changes: `transfer_beneficiary`,
+    /// `revoke`, `emergency_withdraw`, or `migrate_schedule`. Lets a
+    /// frontend detect that something changed without diffing every field.
+    pub fn schedule_version(env: Env) -> Result<u32, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(read_schedule_version(&env))
+    }
+
+    /// Set who may read this schedule's progress via
+    /// `get_vesting_overview_for` (#669).
+    ///
+    /// Beneficiary-only: it is their vesting data whose visibility is being
+    /// controlled, and they can always read their own schedule regardless of
+    /// this setting.
+    pub fn set_sharing_permissions(
+        env: Env,
+        permissions: SharingPermissions,
+    ) -> Result<(), VestingError> {
+        require_initialized(&env)?;
+        let beneficiary = get_beneficiary(&env);
+        beneficiary.require_auth();
+        bump_instance(&env);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SharingPermissions, &permissions);
+
+        Ok(())
+    }
+
+    /// Return the currently configured sharing permissions (#669).
+    ///
+    /// Defaults to `{ public: true, allowed_viewers: [] }` when never set,
+    /// matching the pre-existing unguarded behavior of
+    /// `get_vesting_schedule` / `get_vesting_overview`.
+    pub fn get_sharing_permissions(env: Env) -> Result<SharingPermissions, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(read_sharing_permissions(&env))
+    }
+
+    /// Return the schedule overview gated by `set_sharing_permissions` (#669).
+    ///
+    /// `viewer` must authorise the call so the permission check cannot be
+    /// spoofed by passing someone else's address. Returns
+    /// `VestingError::Unauthorized` unless `viewer` is the beneficiary, an
+    /// explicitly allowed address, or permissions are public.
+    ///
+    /// `get_vesting_overview` itself remains unguarded and always available
+    /// to any caller — this is an additive, opt-in restriction for
+    /// integrators that want one.
+    pub fn get_vesting_overview_for(
+        env: Env,
+        viewer: Address,
+    ) -> Result<VestingOverview, VestingError> {
+        require_initialized(&env)?;
+        viewer.require_auth();
+        bump_instance(&env);
+
+        if !can_view_schedule(&env, &viewer) {
+            return Err(VestingError::Unauthorized);
+        }
+
+        Self::get_vesting_overview(env)
     }
 
     /// Returns `(start_ledger, cliff_ledger, end_ledger)` in a single read for
@@ -587,6 +700,7 @@ impl VestingWallet {
         env.storage()
             .instance()
             .set(&DataKey::RevokedVested, &0i128);
+        bump_schedule_version(&env);
 
         if amount > 0 {
             token::TokenClient::new(&env, &token).transfer(
@@ -615,6 +729,7 @@ impl VestingWallet {
         env.storage()
             .instance()
             .set(&DataKey::Beneficiary, &new_beneficiary);
+        bump_schedule_version(&env);
 
         Ok(())
     }
@@ -638,10 +753,8 @@ impl VestingWallet {
         }
 
         #[allow(deprecated)]
-        env.events().publish(
-            (symbol_short!("vest"), symbol_short!("del_set")),
-            delegate,
-        );
+        env.events()
+            .publish((symbol_short!("vest"), symbol_short!("del_set")), delegate);
 
         Ok(())
     }
@@ -705,10 +818,8 @@ impl VestingWallet {
         bump_instance(&env);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         #[allow(deprecated)]
-        env.events().publish(
-            (symbol_short!("vest"), symbol_short!("trs_set")),
-            treasury,
-        );
+        env.events()
+            .publish((symbol_short!("vest"), symbol_short!("trs_set")), treasury);
         Ok(())
     }
 
@@ -785,12 +896,7 @@ impl VestingWallet {
     /// `prev_released` and `new_released` are the cumulative released amounts
     /// before and after the current `release()` call. A milestone fires when
     /// the threshold was not yet crossed before but is now.
-    fn check_milestones(
-        env: &Env,
-        beneficiary: &Address,
-        prev_released: i128,
-        new_released: i128,
-    ) {
+    fn check_milestones(env: &Env, beneficiary: &Address, prev_released: i128, new_released: i128) {
         let total = get_total_amount(env);
         if total <= 0 {
             return;
@@ -860,9 +966,13 @@ impl VestingWallet {
         env.storage()
             .instance()
             .set(&soroban_sdk::symbol_short!("migrated"), &true);
+        bump_schedule_version(&env);
         #[allow(deprecated)]
         env.events().publish(
-            (soroban_sdk::symbol_short!("vest"), soroban_sdk::symbol_short!("migrated")),
+            (
+                soroban_sdk::symbol_short!("vest"),
+                soroban_sdk::symbol_short!("migrated"),
+            ),
             (),
         );
         Ok(())

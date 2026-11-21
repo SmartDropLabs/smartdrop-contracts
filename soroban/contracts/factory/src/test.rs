@@ -163,6 +163,7 @@ fn setup_with_pool_records(count: u32) -> TestEnv {
                 daily_rate: (100 + pool_id as u128) * 17280,
                 wasm_hash: soroban_sdk::BytesN::from_array(&t.env, &[0; 32]),
                 deprecated: false,
+                version: 0,
             };
             t.env
                 .storage()
@@ -774,6 +775,7 @@ fn test_upgrade_pool_non_upgradable_pool_returns_pool_upgrade_failed() {
         daily_rate: 100 * 17280,
         wasm_hash: soroban_sdk::BytesN::from_array(&t.env, &[0; 32]),
         deprecated: false,
+        version: 0,
     };
     t.env.as_contract(&t.factory_addr, || {
         t.env
@@ -2257,6 +2259,7 @@ fn risk_pool_record(
         daily_rate: (credit_rate as u128) * 17_280,
         wasm_hash: wasm_hash.clone(),
         deprecated,
+        version: 0,
     }
 }
 
@@ -2438,6 +2441,97 @@ fn test_compare_pools_requires_initialization() {
     let (env, uninitialized) = setup_uninitialized();
     assert_eq!(
         uninitialized.try_compare_pools(&vec![&env, 0u32]),
+        Err(Ok(FactoryError::NotInitialized))
+    );
+}
+
+// ── pool dependency graph (#668) ────────────────────────────────────────────────
+
+#[test]
+fn test_set_and_get_pool_dependencies() {
+    let t = setup_with_pool_records(3);
+
+    t.client
+        .set_pool_dependencies(&2, &vec![&t.env, 0u32, 1u32]);
+
+    assert_eq!(t.client.get_pool_dependencies(&2), vec![&t.env, 0u32, 1u32]);
+    assert_eq!(t.client.get_pool_dependencies(&0), vec![&t.env]);
+}
+
+#[test]
+fn test_set_pool_dependencies_replaces_previous_list() {
+    let t = setup_with_pool_records(3);
+
+    t.client.set_pool_dependencies(&2, &vec![&t.env, 0u32]);
+    t.client.set_pool_dependencies(&2, &vec![&t.env, 1u32]);
+
+    assert_eq!(t.client.get_pool_dependencies(&2), vec![&t.env, 1u32]);
+}
+
+#[test]
+fn test_get_dependency_graph_includes_only_pools_with_dependencies_set() {
+    let t = setup_with_pool_records(3);
+
+    t.client.set_pool_dependencies(&1, &vec![&t.env, 0u32]);
+    t.client
+        .set_pool_dependencies(&2, &vec![&t.env, 0u32, 1u32]);
+
+    let graph = t.client.get_dependency_graph();
+    assert_eq!(graph.edges.len(), 2);
+    assert_eq!(graph.edges.get(0).unwrap(), (1u32, vec![&t.env, 0u32]));
+    assert_eq!(
+        graph.edges.get(1).unwrap(),
+        (2u32, vec![&t.env, 0u32, 1u32])
+    );
+}
+
+#[test]
+fn test_set_pool_dependencies_rejects_invalid_requests() {
+    let t = setup_with_pool_records(2);
+
+    assert_eq!(
+        t.client.try_set_pool_dependencies(&99, &vec![&t.env]),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
+    assert_eq!(
+        t.client.try_set_pool_dependencies(&0, &vec![&t.env, 99u32]),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
+    assert_eq!(
+        t.client.try_set_pool_dependencies(&0, &vec![&t.env, 0u32]),
+        Err(Ok(FactoryError::SelfDependency))
+    );
+
+    let mut too_many: Vec<u32> = Vec::new(&t.env);
+    for id in 0..11 {
+        too_many.push_back(id);
+    }
+    assert_eq!(
+        t.client.try_set_pool_dependencies(&0, &too_many),
+        Err(Ok(FactoryError::TooManyDependencies))
+    );
+}
+
+#[test]
+fn test_set_pool_dependencies_requires_admin_auth() {
+    let t = setup_with_pool_records(2);
+    t.env.mock_auths(&[]);
+
+    assert!(t
+        .client
+        .try_set_pool_dependencies(&0, &vec![&t.env, 1u32])
+        .is_err());
+}
+
+#[test]
+fn test_pool_dependencies_require_initialization() {
+    let (_env, uninitialized) = setup_uninitialized();
+    assert_eq!(
+        uninitialized.try_get_dependency_graph(),
+        Err(Ok(FactoryError::NotInitialized))
+    );
+    assert_eq!(
+        uninitialized.try_get_pool_dependencies(&0),
         Err(Ok(FactoryError::NotInitialized))
     );
 }

@@ -1200,3 +1200,131 @@ fn test_revoke_after_cliff_emits_cliff_end_event_once() {
     assert_cliff_end_payload(&t, &events[0]);
     assert!(t.client.cliff_end_notified());
 }
+
+// ── schedule versioning (#666) ─────────────────────────────────────────────────
+
+#[test]
+fn test_schedule_version_starts_at_one() {
+    let t = setup(0, 200, 1_000);
+    assert_eq!(t.client.schedule_version(), 1);
+}
+
+#[test]
+fn test_schedule_version_bumps_on_transfer_beneficiary() {
+    let t = setup(0, 200, 1_000);
+    let new_beneficiary = Address::generate(&t.env);
+
+    t.client.transfer_beneficiary(&new_beneficiary);
+
+    assert_eq!(t.client.schedule_version(), 2);
+}
+
+#[test]
+fn test_schedule_version_bumps_on_revoke() {
+    let t = setup_revocable(0, 200, 1_000);
+
+    t.client.revoke();
+
+    assert_eq!(t.client.schedule_version(), 2);
+}
+
+#[test]
+fn test_schedule_version_bumps_on_emergency_withdraw() {
+    let t = setup(0, 200, 1_000);
+
+    t.client.emergency_withdraw();
+
+    assert_eq!(t.client.schedule_version(), 2);
+}
+
+#[test]
+fn test_get_vesting_overview_reports_schedule_version() {
+    let t = setup(0, 200, 1_000);
+    let new_beneficiary = Address::generate(&t.env);
+
+    t.client.transfer_beneficiary(&new_beneficiary);
+
+    assert_eq!(t.client.get_vesting_overview().version, 2);
+}
+
+#[test]
+fn test_schedule_version_uninitialized_returns_not_initialized() {
+    let env = Env::default();
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    let result = client.try_schedule_version();
+    assert!(matches!(result, Err(Ok(VestingError::NotInitialized))));
+}
+
+// ── schedule sharing permissions (#669) ────────────────────────────────────────
+
+#[test]
+fn test_sharing_permissions_default_to_public() {
+    let t = setup(0, 200, 1_000);
+    let perms = t.client.get_sharing_permissions();
+    assert!(perms.public);
+    assert!(perms.allowed_viewers.is_empty());
+}
+
+#[test]
+fn test_beneficiary_can_always_view_own_schedule() {
+    let t = setup(0, 200, 1_000);
+
+    t.client.set_sharing_permissions(&SharingPermissions {
+        public: false,
+        allowed_viewers: vec![&t.env],
+    });
+
+    let overview = t.client.get_vesting_overview_for(&t.beneficiary);
+    assert_eq!(overview.total_amount, 1_000);
+}
+
+#[test]
+fn test_get_vesting_overview_for_rejects_unlisted_viewer_when_private() {
+    let t = setup(0, 200, 1_000);
+    let stranger = Address::generate(&t.env);
+
+    t.client.set_sharing_permissions(&SharingPermissions {
+        public: false,
+        allowed_viewers: vec![&t.env],
+    });
+
+    let result = t.client.try_get_vesting_overview_for(&stranger);
+    assert!(matches!(result, Err(Ok(VestingError::Unauthorized))));
+}
+
+#[test]
+fn test_get_vesting_overview_for_allows_explicitly_listed_viewer() {
+    let t = setup(0, 200, 1_000);
+    let viewer = Address::generate(&t.env);
+
+    t.client.set_sharing_permissions(&SharingPermissions {
+        public: false,
+        allowed_viewers: vec![&t.env, viewer.clone()],
+    });
+
+    let overview = t.client.get_vesting_overview_for(&viewer);
+    assert_eq!(overview.total_amount, 1_000);
+}
+
+#[test]
+fn test_get_vesting_overview_for_allows_anyone_when_public() {
+    let t = setup(0, 200, 1_000);
+    let stranger = Address::generate(&t.env);
+
+    let overview = t.client.get_vesting_overview_for(&stranger);
+    assert_eq!(overview.total_amount, 1_000);
+}
+
+#[test]
+fn test_set_sharing_permissions_requires_beneficiary_auth() {
+    let t = setup(0, 200, 1_000);
+    t.env.mock_auths(&[]);
+
+    let result = t.client.try_set_sharing_permissions(&SharingPermissions {
+        public: false,
+        allowed_viewers: vec![&t.env],
+    });
+    assert!(result.is_err());
+}

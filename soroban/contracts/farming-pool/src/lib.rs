@@ -13,11 +13,11 @@ use soroban_sdk::{
 use types::{
     AdminActionEvent, AdminActionHistoryPage, BankedCreditTotals, BoostConfig, BoostEvent,
     BoostHistoryPage, CreditRateEvent, CreditRateHistoryPage, DataKey, DistributionEvent,
-    DistributionHistoryPage, GlobalMultiplierEvent, GlobalMultiplierHistoryPage,
-    LeaderboardEntry, ListWhitelistedResponse, PoolAnalytics, Position, StakeEvent, StakeHistoryPage, TierInfo,
-    UserActivity, UserStake, WhitelistEvent, WhitelistHistoryPage,
+    DistributionHistoryPage, GlobalMultiplierEvent, GlobalMultiplierHistoryPage, LeaderboardEntry,
+    ListWhitelistedResponse, MultiplierSnapshot, PoolAnalytics, Position, StakeEvent,
+    StakeHistoryPage, TierInfo, UserActivity, UserStake, WhitelistEvent, WhitelistHistoryPage,
 };
-pub use types::{MultiplierBreakdown, PoolError, PoolInfo, UserSummary};
+pub use types::{MultiplierBreakdown, MultiplierSnapshotPage, PoolError, PoolInfo, UserSummary};
 
 // Expose compiled WASM bytes so sibling crates (e.g. `factory`) can upload the
 // real farming-pool contract in their integration tests via:
@@ -1691,14 +1691,13 @@ impl FarmingPool {
         let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
         let global_multiplier = read_global_multiplier(&env);
 
-        let (stake_amount, credit_rate, banked_credits) =
-            match get_user_stake(&env, &user) {
-                Some(stake) => (stake.amount, stake.credit_rate, stake.credits_banked),
-                None => match get_position(&env, &user) {
-                    Some(pos) => (pos.amount, pos.credit_rate, pos.total_credits),
-                    None => (0i128, read_credit_rate(&env), 0i128),
-                },
-            };
+        let (stake_amount, credit_rate, banked_credits) = match get_user_stake(&env, &user) {
+            Some(stake) => (stake.amount, stake.credit_rate, stake.credits_banked),
+            None => match get_position(&env, &user) {
+                Some(pos) => (pos.amount, pos.credit_rate, pos.total_credits),
+                None => (0i128, read_credit_rate(&env), 0i128),
+            },
+        };
 
         let effective_stake = compute_total_stake(stake_amount, allocation_pct, global_multiplier);
 
@@ -1710,6 +1709,89 @@ impl FarmingPool {
             credit_rate,
             banked_credits,
         })
+    }
+
+    /// Capture and persist `user`'s current reward multiplier state (#667).
+    ///
+    /// Carries the same fields as `get_multiplier_breakdown` plus the ledger
+    /// the snapshot was taken at, and appends it to the user's snapshot
+    /// history so later analytics can see how the breakdown evolved rather
+    /// than only ever reading the live value. Returns the snapshot just
+    /// taken; retrieve the full history via `get_multiplier_snapshots`.
+    pub fn take_multiplier_snapshot(
+        env: Env,
+        user: Address,
+    ) -> Result<MultiplierSnapshot, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let allocation_pct = get_user_boost(&env, &user).unwrap_or(0);
+        let global_multiplier = read_global_multiplier(&env);
+
+        let (stake_amount, credit_rate, banked_credits) = match get_user_stake(&env, &user) {
+            Some(stake) => (stake.amount, stake.credit_rate, stake.credits_banked),
+            None => match get_position(&env, &user) {
+                Some(pos) => (pos.amount, pos.credit_rate, pos.total_credits),
+                None => (0i128, read_credit_rate(&env), 0i128),
+            },
+        };
+
+        let effective_stake = compute_total_stake(stake_amount, allocation_pct, global_multiplier);
+
+        let snapshot = MultiplierSnapshot {
+            stake_amount,
+            allocation_pct,
+            global_multiplier,
+            effective_stake,
+            credit_rate,
+            banked_credits,
+            ledger: env.ledger().sequence(),
+        };
+
+        let count_key = DataKey::MultiplierSnapshotCount(user.clone());
+        let count: u32 = env.storage().instance().get(&count_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultiplierSnapshotHistory(user, count), &snapshot);
+        env.storage().instance().set(&count_key, &(count + 1));
+
+        Ok(snapshot)
+    }
+
+    /// Return a paginated history of `user`'s multiplier snapshots (#667).
+    ///
+    /// Snapshots are stored in the chronological order they were taken; pass
+    /// `offset = 0` and advance by `limit` to walk the whole history.
+    pub fn get_multiplier_snapshots(
+        env: Env,
+        user: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Result<MultiplierSnapshotPage, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiplierSnapshotCount(user.clone()))
+            .unwrap_or(0);
+        let mut snapshots: Vec<MultiplierSnapshot> = Vec::new(&env);
+        let mut i = offset;
+        let mut count = 0u32;
+        while i < total && count < limit {
+            if let Some(snapshot) = env
+                .storage()
+                .persistent()
+                .get::<_, MultiplierSnapshot>(&DataKey::MultiplierSnapshotHistory(user.clone(), i))
+            {
+                snapshots.push_back(snapshot);
+            }
+            i += 1;
+            count += 1;
+        }
+
+        Ok(MultiplierSnapshotPage { snapshots, total })
     }
 
     pub fn get_user_position(env: Env, user: Address) -> Result<Option<Position>, PoolError> {

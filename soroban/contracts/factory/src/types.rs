@@ -58,6 +58,13 @@ pub enum DataKey {
     PoolTvl(u32),
     /// Insurance fund balance for a specific pool.
     InsuranceFund(u32),
+    /// Pool IDs that a given pool depends on, as set by
+    /// `set_pool_dependencies` (#668).
+    PoolDependencies(u32),
+    /// Ordered list of pool IDs that currently have dependencies set, so
+    /// `get_dependency_graph` can be built without scanning every pool ID
+    /// up to `PoolCount` (#668).
+    PoolsWithDependencies,
 }
 
 /// On-chain record for a registered farming pool.
@@ -135,6 +142,19 @@ pub struct ListPoolsResponse {
     pub total: u32,
     /// Whether there are more records available beyond this page.
     pub has_more: bool,
+}
+
+/// Full pool dependency graph, returned by `get_dependency_graph` (#668).
+///
+/// `edges` holds one entry per pool that has explicit dependencies set via
+/// `set_pool_dependencies`, each pairing that pool's ID with the IDs it
+/// depends on. Pools with no dependencies configured are omitted rather than
+/// listed with an empty dependency list, so the graph stays proportional to
+/// how much of the registry actually declares dependencies.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DependencyGraph {
+    pub edges: Vec<(u32, Vec<u32>)>,
 }
 
 /// Result of a `refresh_pool_ttls` sweep (#393).
@@ -242,4 +262,10 @@ pub enum FactoryError {
     TooManyPools = 25,
     /// `compare_pools` was called with the same pool ID more than once.
     DuplicatePoolId = 26,
+    /// `set_pool_dependencies` was called with a pool listed as its own
+    /// dependency.
+    SelfDependency = 27,
+    /// `set_pool_dependencies` was called with more entries than
+    /// `MAX_POOL_DEPENDENCIES`.
+    TooManyDependencies = 28,
 }

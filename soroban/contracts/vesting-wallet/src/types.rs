@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address};
+use soroban_sdk::{contracterror, contracttype, Address, Vec};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -55,6 +55,12 @@ pub enum DataKey {
     Delegate,
     /// Set once the cliff has been reached and its notification emitted (#615).
     CliffEndNotified,
+    /// Monotonically increasing schedule version, bumped whenever the
+    /// schedule's effective state changes (#666).
+    ScheduleVersion,
+    /// Sharing permissions controlling who may read via
+    /// `get_vesting_overview_for` (#669).
+    SharingPermissions,
 }
 
 /// Emitted when admin rights are transferred.
@@ -104,4 +110,24 @@ pub struct VestingOverview {
     pub released_amount: i128,
     /// Vested but not yet claimed; the amount `release_all` would transfer.
     pub releasable_amount: i128,
+    /// Schedule version, bumped on beneficiary transfer, revocation,
+    /// emergency withdrawal, and migration (#666).
+    pub version: u32,
+}
+
+/// Controls who may read this wallet's vesting progress via
+/// `get_vesting_overview_for` (#669).
+///
+/// Defaults to fully public (`public: true`, no explicit viewers) when never
+/// set, matching the pre-existing unguarded behavior of
+/// `get_vesting_schedule` / `get_vesting_overview`, which remain available to
+/// any caller regardless of this setting. The beneficiary can always read
+/// their own schedule.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SharingPermissions {
+    /// When true, any caller may read via `get_vesting_overview_for`.
+    pub public: bool,
+    /// Addresses explicitly allowed to read when `public` is false.
+    pub allowed_viewers: Vec<Address>,
 }

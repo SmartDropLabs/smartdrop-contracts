@@ -225,6 +225,11 @@ pub enum DataKey {
     UniqueUserCount,
     /// Cached reward multiplier per user (issue #652).
     CachedMultiplier(Address),
+    // ── #667 — Per-user multiplier snapshots ─────────────────────────────────
+    /// Count of multiplier snapshots taken for a user.
+    MultiplierSnapshotCount(Address),
+    /// Multiplier snapshot for a user, by index.
+    MultiplierSnapshotHistory(Address, u32),
 }
 
 /// Paginated response for `get_whitelisted_users`.
@@ -313,6 +318,40 @@ pub struct MultiplierBreakdown {
     pub credit_rate: i128,
     /// Total accrued credits so far (before the current ledger's accrual).
     pub banked_credits: i128,
+}
+
+/// A point-in-time capture of a user's reward multiplier state, taken by
+/// `take_multiplier_snapshot` (#667).
+///
+/// Carries the same breakdown as `MultiplierBreakdown` plus the ledger the
+/// snapshot was taken at, so a sequence of snapshots lets dashboards and
+/// off-chain analytics reconstruct how a user's effective stake evolved,
+/// instead of only ever seeing the live value.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiplierSnapshot {
+    /// Raw stake amount the user had locked/staked at snapshot time.
+    pub stake_amount: i128,
+    /// Boost allocation percentage (0-100) at snapshot time.
+    pub allocation_pct: u32,
+    /// The global multiplier in effect at snapshot time.
+    pub global_multiplier: u32,
+    /// Effective total stake at snapshot time; see `MultiplierBreakdown`.
+    pub effective_stake: i128,
+    /// Per-ledger credit rate in effect at snapshot time.
+    pub credit_rate: i128,
+    /// Total accrued credits at snapshot time.
+    pub banked_credits: i128,
+    /// Ledger sequence the snapshot was taken at.
+    pub ledger: u32,
+}
+
+/// Paginated response for `get_multiplier_snapshots` (#667).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiplierSnapshotPage {
+    pub snapshots: Vec<MultiplierSnapshot>,
+    pub total: u32,
 }
 
 // ─── History / audit trail types ─────────────────────────────────────────────

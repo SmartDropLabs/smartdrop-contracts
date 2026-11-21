@@ -77,3 +77,36 @@ fn test_tier_multiplier_scales_accrued_credits() {
     assert_eq!(t.client.get_credits(&small), 1_000_000_000);
     assert_eq!(t.client.get_credits(&large), 40_000_000_000);
 }
+
+#[test]
+fn test_take_multiplier_snapshot_captures_state_and_persists_history() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    let token = StellarAssetClient::new(&t.env, &t.token_address);
+    token.mint(&user, &1_000);
+    t.client.stake(&user, &1_000);
+
+    let snap1 = t.client.take_multiplier_snapshot(&user);
+    assert_eq!(snap1.stake_amount, 1_000);
+    assert_eq!(snap1.global_multiplier, 1);
+
+    advance_ledgers(&t.env, 5);
+    let snap2 = t.client.take_multiplier_snapshot(&user);
+    assert_eq!(snap2.ledger, snap1.ledger + 5);
+
+    let page = t.client.get_multiplier_snapshots(&user, &0, &10);
+    assert_eq!(page.total, 2);
+    assert_eq!(page.snapshots.len(), 2);
+    assert_eq!(page.snapshots.get(0).unwrap().ledger, snap1.ledger);
+    assert_eq!(page.snapshots.get(1).unwrap().ledger, snap2.ledger);
+}
+
+#[test]
+fn test_take_multiplier_snapshot_for_user_with_no_stake_is_zero() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+
+    let snap = t.client.take_multiplier_snapshot(&user);
+    assert_eq!(snap.stake_amount, 0);
+    assert_eq!(snap.effective_stake, 0);
+}
