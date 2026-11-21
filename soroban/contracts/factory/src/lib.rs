@@ -7,8 +7,8 @@ use soroban_sdk::{
     Vec,
 };
 use types::{
-    DataKey, ListPoolsResponse, PoolComparison, PoolRecord, PoolSort, PoolStatus,
-    RefreshPoolTtlsResponse,
+    DataKey, ListPoolsResponse, PoolComparison, PoolConfigChangeEntry, PoolConfigHistoryPage,
+    PoolRecord, PoolSort, PoolStatus, RefreshPoolTtlsResponse,
 };
 
 pub use types::FactoryError;
@@ -406,6 +406,37 @@ fn validate_factory_admin(env: &Env, admin: &Address) -> Result<(), FactoryError
     Ok(())
 }
 
+fn read_pool_config_history_count(env: &Env, pool_id: u32) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PoolConfigHistoryCount(pool_id))
+        .unwrap_or(0)
+}
+
+fn record_config_change(
+    env: &Env,
+    pool_id: u32,
+    action: Symbol,
+    old_config: Option<PoolRecord>,
+    new_config: Option<PoolRecord>,
+) {
+    let count = read_pool_config_history_count(env, pool_id);
+    let ledger = env.ledger().sequence();
+    let entry = PoolConfigChangeEntry {
+        pool_id,
+        action,
+        old_config,
+        new_config,
+        ledger,
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::PoolConfigHistory(pool_id, count), &entry);
+    env.storage()
+        .persistent()
+        .set(&DataKey::PoolConfigHistoryCount(pool_id), &(count + 1));
+}
+
 fn create_pool_inner(
     env: Env,
     admin: Address,
@@ -563,6 +594,15 @@ fn create_pool_inner(
         .persistent()
         .set(&DataKey::Pool(pool_id), &record);
     bump_pool(&env, pool_id);
+
+    // Record pool creation in configuration history (#680)
+    record_config_change(
+        &env,
+        pool_id,
+        symbol_short!("created"),
+        None,
+        Some(record.clone()),
+    );
 
     // A freshly deployed pool holds nothing, so its contribution to
     // `total_tvl` starts at 0. Recording the baseline explicitly keeps the
@@ -1345,9 +1385,19 @@ impl Factory {
         }
 
         let old_hash = record.wasm_hash.clone();
+        let old_record = record.clone();
         record.wasm_hash = new_wasm_hash.clone();
         record.version = record.version.saturating_add(1);
         env.storage().persistent().set(&key, &record);
+
+        // Record upgrade in configuration history (#680)
+        record_config_change(
+            env,
+            pool_id,
+            symbol_short!("upgraded"),
+            Some(old_record),
+            Some(record.clone()),
+        );
 
         let old_wasm_key = DataKey::PoolsByWasmHash(old_hash.clone());
         if let Some(old_pool_ids) = env
@@ -1907,9 +1957,19 @@ impl Factory {
             return Err(FactoryError::AlreadyDeprecated);
         }
 
+        let old_record = record.clone();
         record.deprecated = true;
         env.storage().persistent().set(&key, &record);
         bump_pool(&env, pool_id);
+
+        // Record deprecation in configuration history (#680)
+        record_config_change(
+            &env,
+            pool_id,
+            symbol_short!("deprecate"),
+            Some(old_record),
+            Some(record),
+        );
 
         #[allow(deprecated)]
         env.events().publish(
@@ -2028,9 +2088,58 @@ impl Factory {
             return Ok(HealthStatus::Deprecated);
         }
 
-        match query_pool_tvl(&env, &record.pool) {
+        match query_pool_tvl(&env, &record.address) {
             Ok(_) => Ok(HealthStatus::Healthy),
             Err(_) => Ok(HealthStatus::Degraded),
         }
+    }
+
+    /// Returns the configuration change history for a pool (issue #680).
+    ///
+    /// Provides a paginated list of all configuration change events (creation,
+    /// upgrade, deprecation, etc.) for the specified pool in chronological order.
+    ///
+    /// ## Arguments
+    /// * `pool_id` - The pool ID to query
+    /// * `start` - Zero-based index to start reading from
+    /// * `limit` - Maximum number of events to return
+    ///
+    /// ## Returns
+    /// * `PoolConfigHistoryPage` containing the events and total count
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    /// * `PoolNotFound` - If no pool with the given ID exists
+    pub fn get_pool_config_history(
+        env: Env,
+        pool_id: u32,
+        start: u32,
+        limit: u32,
+    ) -> Result<PoolConfigHistoryPage, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        // Verify pool exists
+        let _record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+
+        let total = read_pool_config_history_count(&env, pool_id);
+        let mut events = Vec::new(&env);
+
+        let end = start.saturating_add(limit).min(total);
+        for i in start..end {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PoolConfigChangeEntry>(&DataKey::PoolConfigHistory(pool_id, i))
+            {
+                events.push_back(event);
+            }
+        }
+
+        Ok(PoolConfigHistoryPage { events, total })
     }
 }

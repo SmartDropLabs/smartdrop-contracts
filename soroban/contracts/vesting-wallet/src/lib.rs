@@ -6,7 +6,10 @@ mod types;
 
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
 use types::DataKey;
-pub use types::{AdminTransferred, VestingError, VestingOverview, VestingSchedule};
+pub use types::{
+    AdminTransferred, ScheduleHistoryEntry, ScheduleHistoryPage, VestingError, VestingOverview,
+    VestingSchedule,
+};
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5 s/ledger).
 const TTL_THRESHOLD: u32 = 518_400;
@@ -186,6 +189,35 @@ fn maybe_notify_cliff_end(env: &Env) {
     );
 }
 
+fn read_schedule_history_count(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ScheduleHistoryCount)
+        .unwrap_or(0)
+}
+
+fn record_schedule_event(
+    env: &Env,
+    action: soroban_sdk::Symbol,
+    old_schedule: Option<VestingSchedule>,
+    new_schedule: Option<VestingSchedule>,
+) {
+    let count = read_schedule_history_count(env);
+    let ledger = env.ledger().sequence();
+    let entry = ScheduleHistoryEntry {
+        action,
+        old_schedule,
+        new_schedule,
+        ledger,
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::ScheduleHistory(count), &entry);
+    env.storage()
+        .persistent()
+        .set(&DataKey::ScheduleHistoryCount, &(count + 1));
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -278,7 +310,24 @@ impl VestingWallet {
         #[allow(deprecated)]
         env.events().publish(
             (symbol_short!("vest"), symbol_short!("init")),
-            (beneficiary, token, total_amount, start_ledger, end_ledger),
+            (beneficiary.clone(), token.clone(), total_amount, start_ledger, end_ledger),
+        );
+
+        // Record initial schedule creation (#681)
+        let schedule = VestingSchedule {
+            beneficiary: beneficiary.clone(),
+            token: token.clone(),
+            total_amount,
+            start_ledger,
+            cliff_ledger,
+            end_ledger,
+            revocable,
+        };
+        record_schedule_event(
+            &env,
+            symbol_short!("created"),
+            None,
+            Some(schedule),
         );
 
         bump_instance(&env);
@@ -381,6 +430,23 @@ impl VestingWallet {
         env.events().publish(
             (symbol_short!("vest"), symbol_short!("revoked")),
             (admin, get_beneficiary(&env), vested, unvested),
+        );
+
+        // Record revoke in schedule history (#681)
+        let old_schedule = VestingSchedule {
+            beneficiary: get_beneficiary(&env),
+            token: get_token(&env),
+            total_amount: get_total_amount(&env),
+            start_ledger: get_start_ledger(&env),
+            cliff_ledger: get_cliff_ledger(&env),
+            end_ledger: get_end_ledger(&env),
+            revocable: true,
+        };
+        record_schedule_event(
+            &env,
+            symbol_short!("revoked"),
+            Some(old_schedule),
+            None,
         );
 
         Ok(())
@@ -866,5 +932,84 @@ impl VestingWallet {
             (),
         );
         Ok(())
+    }
+
+    /// Validates a vesting schedule before creation (issue #678).
+    ///
+    /// Checks that:
+    /// - start_ledger < cliff_ledger <= end_ledger
+    /// - total_amount > 0
+    /// - beneficiary is not the zero address
+    /// - token is not the zero address
+    ///
+    /// Returns `Ok(true)` if valid, or an error describing what failed.
+    /// This allows clients to validate parameters before calling `initialize`.
+    ///
+    /// ## Arguments
+    /// * `schedule` - The vesting schedule to validate
+    ///
+    /// ## Errors
+    /// * `InvalidInput` - If any validation check fails
+    pub fn validate_schedule(env: Env, schedule: VestingSchedule) -> Result<bool, VestingError> {
+        // Validate addresses are not zero
+        let zero = zero_address(&env);
+        if schedule.beneficiary == zero {
+            return Err(VestingError::InvalidInput);
+        }
+        if schedule.token == zero {
+            return Err(VestingError::InvalidInput);
+        }
+
+        // Validate total amount is positive
+        if schedule.total_amount <= 0 {
+            return Err(VestingError::InvalidInput);
+        }
+
+        // Validate ledger sequence: start < cliff <= end
+        if schedule.start_ledger >= schedule.cliff_ledger {
+            return Err(VestingError::InvalidInput);
+        }
+        if schedule.cliff_ledger > schedule.end_ledger {
+            return Err(VestingError::InvalidInput);
+        }
+
+        Ok(true)
+    }
+
+    /// Returns the vesting schedule history for this contract (issue #681).
+    ///
+    /// Provides a paginated list of all schedule change events (creation, revocation, etc.)
+    /// in chronological order.
+    ///
+    /// ## Arguments
+    /// * `start` - Zero-based index to start reading from
+    /// * `limit` - Maximum number of events to return
+    ///
+    /// ## Returns
+    /// * `ScheduleHistoryPage` containing the events and total count
+    pub fn get_schedule_history(
+        env: Env,
+        beneficiary: Address,
+        start: u32,
+        limit: u32,
+    ) -> Result<ScheduleHistoryPage, VestingError> {
+        require_initialized(&env)?;
+        beneficiary.require_auth();
+
+        let total = read_schedule_history_count(&env);
+        let mut events = soroban_sdk::Vec::new(&env);
+
+        let end = start.saturating_add(limit).min(total);
+        for i in start..end {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, ScheduleHistoryEntry>(&DataKey::ScheduleHistory(i))
+            {
+                events.push_back(event);
+            }
+        }
+
+        Ok(ScheduleHistoryPage { events, total })
     }
 }
