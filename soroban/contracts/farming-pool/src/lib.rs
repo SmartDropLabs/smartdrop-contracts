@@ -2490,6 +2490,57 @@ impl FarmingPool {
         Ok(read_total_credits(&env))
     }
 
+    /// Re-base one staker onto the current global multiplier and credit rate (#688).
+    ///
+    /// A `UserStake` keeps a snapshot of the global multiplier and credit rate,
+    /// refreshed only when that user next calls `stake`, `unstake` or has their
+    /// boost set (see `checkpoint`). Until then `get_boost_config` keeps
+    /// reporting the old multiplier, and accrual only accounts for the *latest*
+    /// multiplier change: if the multiplier changed twice since the user's last
+    /// checkpoint, the interval between the two changes is credited at the stale
+    /// snapshot instead of the multiplier that was live then.
+    ///
+    /// This runs the same `checkpoint` the user's next interaction would, without
+    /// the user having to act. Credits accrued so far are settled under the old
+    /// snapshot and banked, then the stake adopts the current multiplier and
+    /// credit rate for future accrual. The user's total credits at the moment of
+    /// the call are unchanged. Run it for a user *before* a further multiplier
+    /// change to stop the drift from compounding; it cannot recover credits
+    /// already mis-attributed by earlier changes.
+    ///
+    /// - Admin only. Allowed while the pool is paused: it moves no funds.
+    /// - Idempotent: a stake that is already current is left untouched and emits
+    ///   nothing, so keepers can call it blindly.
+    /// - `NoActiveStake` if `user` has no flexible `UserStake` (a time-locked
+    ///   `Position` has no multiplier snapshot to migrate).
+    ///
+    /// Emits `(boost, mult_mig)` with `(user, old_multiplier, new_multiplier,
+    /// credits_banked)`.
+    pub fn migrate_multiplier(env: Env, user: Address) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        let mut stake = get_user_stake(&env, &user).ok_or(PoolError::NoActiveStake)?;
+        let old_multiplier = stake.multiplier;
+        let new_multiplier = read_global_multiplier(&env);
+        if old_multiplier == new_multiplier && stake.credit_rate == read_credit_rate(&env) {
+            return Ok(());
+        }
+
+        checkpoint(&env, &user, &mut stake);
+        set_user_stake(&env, &user, &stake);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("boost"), symbol_short!("mult_mig")),
+            (user.clone(), old_multiplier, new_multiplier, stake.credits_banked),
+        );
+        record_admin_action(&env, symbol_short!("mult_mig"), &admin);
+        Ok(())
+    }
+
     /// Set the global credit multiplier. Rejects 0 and anything above
     /// `MAX_GLOBAL_MULTIPLIER` — see #89 for the overflow-safety derivation.
     /// Revert the global multiplier to its previous value (#664).

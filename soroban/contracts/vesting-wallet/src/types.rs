@@ -20,6 +20,9 @@ pub enum VestingError {
     TreasuryNotConfigured = 10,
     /// `withdraw_early` was called with a zero or negative amount. See #605.
     InvalidAmount = 11,
+    /// The vesting schedule is outside the supported limits: it runs for longer
+    /// than the maximum vesting duration (365 days of ledgers). See #684.
+    InvalidSchedule = 12,
 }
 
 /// Storage keys for all instance data in the vesting wallet.

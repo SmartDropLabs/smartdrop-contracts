@@ -50,6 +50,18 @@ $$\text{Credits} = \text{credits\_banked} + (\text{effective\_stake} \times \tex
 
 Where $\Delta\text{ledgers} = \text{current\_ledger} - \text{start\_ledger}$.
 
+### 3.3 Multiplier snapshots and `migrate_multiplier`
+
+A `UserStake` stores a snapshot of the global multiplier and credit rate (`multiplier`, `credit_rate`). The snapshot is refreshed by a *checkpoint*, which runs when that user calls `stake` or `unstake` or has their boost set. A user who does none of those keeps the old snapshot, and `get_boost_config` keeps reporting the old multiplier. Accrual also only knows about the **latest** multiplier change: if the multiplier changes twice between a user's checkpoints, the stretch between the two changes is credited at the stale snapshot instead of the multiplier that was live then.
+
+`migrate_multiplier(user)` (admin only, [#688](https://github.com/SmartDropLabs/smartdrop-contracts/issues/688)) runs that same checkpoint without the user acting:
+
+- Credits accrued so far are settled under the old snapshot and banked, then the stake adopts the current multiplier and credit rate. The user's total credits at the moment of the call do not change.
+- It is idempotent: a stake that already matches the current multiplier and credit rate is left untouched and emits nothing, so a keeper can call it blindly.
+- It needs an active `UserStake`; a user with only a time-locked `Position` gets `NoActiveStake`.
+- It moves no funds, so it is allowed while the pool is paused. It is recorded in the admin action log as `mult_mig` and emits `(boost, mult_mig)` ([events](events.md)).
+- It cannot repair credits already mis-attributed by earlier changes, so operators who want exact accrual should migrate affected users (for example large stakers) **before** the next multiplier change, one `migrate_multiplier` call per user.
+
 ---
 
 ## 4. Emergency Withdrawals & Pause Lifecycle
