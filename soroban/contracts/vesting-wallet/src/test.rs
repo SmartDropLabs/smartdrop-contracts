@@ -1430,3 +1430,111 @@ fn test_revoke_after_cliff_emits_cliff_end_event_once() {
     assert_cliff_end_payload(&t, &events[0]);
     assert!(t.client.cliff_end_notified());
 }
+
+// ── #693 — backup_schedule ────────────────────────────────────────────────────
+
+#[test]
+fn test_backup_schedule_captures_the_configured_schedule() {
+    let t = setup_revocable(10, 100, 1_000);
+
+    let backup = t.client.backup_schedule(&t.beneficiary);
+
+    assert_eq!(backup.version, 1);
+    assert_eq!(backup.backed_up_at_ledger, t.env.ledger().sequence());
+    assert_eq!(backup.schedule, t.client.get_vesting_schedule());
+    assert_eq!(backup.schedule.total_amount, 1_000);
+    assert!(backup.schedule.revocable);
+    assert_eq!(backup.admin, t.admin);
+    assert_eq!(backup.funder, t.admin);
+    assert_eq!(backup.treasury, None);
+    assert_eq!(backup.delegate, None);
+    assert_eq!(backup.released_amount, 0);
+    assert_eq!(backup.release_count, 0);
+    assert!(!backup.revoked);
+    assert_eq!(backup.revoked_vested, 0);
+}
+
+#[test]
+fn test_backup_schedule_records_release_progress() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+    let released = t.client.release_all();
+    assert!(released > 0);
+
+    let backup = t.client.backup_schedule(&t.beneficiary);
+
+    assert_eq!(backup.released_amount, released);
+    assert_eq!(backup.release_count, 1);
+    assert_eq!(backup.backed_up_at_ledger, t.env.ledger().sequence());
+}
+
+#[test]
+fn test_backup_schedule_records_revocation() {
+    let t = setup_revocable(0, 100, 1_000);
+    advance_ledgers(&t.env, 40);
+    t.client.revoke();
+
+    let backup = t.client.backup_schedule(&t.beneficiary);
+
+    assert!(backup.revoked);
+    assert_eq!(backup.revoked_vested, t.client.vested_amount());
+    assert!(backup.revoked_vested > 0);
+}
+
+#[test]
+fn test_backup_schedule_records_treasury_delegate_and_admin_transfer() {
+    let t = setup(0, 100, 1_000);
+    let treasury = Address::generate(&t.env);
+    let delegate = Address::generate(&t.env);
+    let new_admin = Address::generate(&t.env);
+    t.client.set_treasury(&treasury);
+    t.client.delegate(&delegate);
+    t.client.transfer_admin(&new_admin);
+
+    let backup = t.client.backup_schedule(&t.beneficiary);
+
+    assert_eq!(backup.treasury, Some(treasury));
+    assert_eq!(backup.delegate, Some(delegate));
+    assert_eq!(backup.admin, new_admin);
+    // The funder is fixed at initialization and survives an admin transfer.
+    assert_eq!(backup.funder, t.admin);
+}
+
+#[test]
+fn test_backup_schedule_rejects_a_different_beneficiary() {
+    let t = setup(0, 100, 1_000);
+    let stranger = Address::generate(&t.env);
+
+    assert_eq!(
+        t.client.try_backup_schedule(&stranger),
+        Err(Ok(VestingError::InvalidInput))
+    );
+}
+
+#[test]
+fn test_backup_schedule_rejects_an_uninitialized_wallet() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+    let anyone = Address::generate(&env);
+
+    assert_eq!(
+        client.try_backup_schedule(&anyone),
+        Err(Ok(VestingError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_backup_schedule_is_read_only_and_repeatable() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 10);
+    let overview_before = t.client.get_vesting_overview();
+
+    let first = t.client.backup_schedule(&t.beneficiary);
+    let second = t.client.backup_schedule(&t.beneficiary);
+
+    assert_eq!(first, second);
+    assert_eq!(t.client.get_vesting_overview(), overview_before);
+    assert_eq!(t.client.release_count(), 0);
+}
