@@ -20,6 +20,9 @@ pub enum VestingError {
     TreasuryNotConfigured = 10,
     /// `withdraw_early` was called with a zero or negative amount. See #605.
     InvalidAmount = 11,
+    /// The vesting schedule is outside the supported limits: it runs for longer
+    /// than the maximum vesting duration (365 days of ledgers). See #684.
+    InvalidSchedule = 12,
 }
 
 /// Storage keys for all instance data in the vesting wallet.
@@ -55,12 +58,10 @@ pub enum DataKey {
     Delegate,
     /// Set once the cliff has been reached and its notification emitted (#615).
     CliffEndNotified,
-    /// Monotonically increasing schedule version, bumped whenever the
-    /// schedule's effective state changes (#666).
-    ScheduleVersion,
-    /// Sharing permissions controlling who may read via
-    /// `get_vesting_overview_for` (#669).
-    SharingPermissions,
+    /// Global counter for schedule change events (#681).
+    ScheduleHistoryCount,
+    /// Schedule history event by index (#681).
+    ScheduleHistory(u32),
 }
 
 /// Emitted when admin rights are transferred.
@@ -130,4 +131,33 @@ pub struct SharingPermissions {
     pub public: bool,
     /// Addresses explicitly allowed to read when `public` is false.
     pub allowed_viewers: Vec<Address>,
+}
+
+/// A single schedule change event (#681).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleHistoryEntry {
+    pub action: soroban_sdk::Symbol,
+    pub old_schedule: Option<VestingSchedule>,
+    pub new_schedule: Option<VestingSchedule>,
+    pub ledger: u32,
+}
+
+/// Paginated response for schedule history queries (#681).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleHistoryPage {
+    pub events: soroban_sdk::Vec<ScheduleHistoryEntry>,
+    pub total: u32,
+}
+
+/// Vesting data for importing schedules (#702).
+/// This type bundles all the information needed to initialize a vesting wallet
+/// from external data, making it easier to import schedules from other sources.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingData {
+    pub schedule: VestingSchedule,
+    pub token: Address,
+    pub admin: Address,
 }

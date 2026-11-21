@@ -246,22 +246,252 @@ fn test_compute_vested_is_safe_at_maximum_duration_and_ceiling() {
     let token_sac = StellarAssetClient::new(&env, &asset.address());
     token_sac.mint(&admin, &MAX_TOTAL_AMOUNT);
 
+    // The longest schedule `initialize` accepts (#684), at the largest amount
+    // the formula supports. Just before the end the elapsed portion is at its
+    // largest, so `total * elapsed` is the biggest product the formula can see.
     client.initialize(
         &beneficiary,
         &asset.address(),
         &MAX_TOTAL_AMOUNT,
         &0u32,
         &0u32,
-        &u32::MAX,
+        &MAX_VESTING_DURATION_LEDGERS,
         &false,
         &admin,
     );
     env.ledger()
-        .with_mut(|ledger| ledger.sequence_number = 2_000_000_000);
+        .with_mut(|ledger| ledger.sequence_number = MAX_VESTING_DURATION_LEDGERS - 1);
 
     let vested = client.vested_amount();
     assert!(vested > 0);
     assert!(vested <= MAX_TOTAL_AMOUNT);
+}
+
+// ── Schedule length limit (#684) ──────────────────────────────────────────────
+
+/// A deployed but uninitialised wallet whose `admin` already holds `funds` tokens,
+/// for tests that call `initialize` with hand-picked ledgers.
+struct FundedWallet {
+    env: Env,
+    contract_id: Address,
+    token_address: Address,
+    admin: Address,
+    beneficiary: Address,
+}
+
+fn funded_uninitialised_wallet(funds: i128) -> FundedWallet {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin);
+    StellarAssetClient::new(&env, &asset.address()).mint(&admin, &funds);
+    let contract_id = env.register(VestingWallet, ());
+    FundedWallet {
+        env,
+        contract_id,
+        token_address: asset.address(),
+        admin,
+        beneficiary,
+    }
+}
+
+#[test]
+fn test_max_vesting_duration_is_one_year_of_ledgers() {
+    assert_eq!(MAX_VESTING_DURATION_SECS, 31_536_000);
+    assert_eq!(MAX_VESTING_DURATION_LEDGERS, 6_307_200);
+}
+
+#[test]
+fn test_invalid_schedule_error_code_is_stable() {
+    assert_eq!(VestingError::InvalidSchedule as u32, 12);
+}
+
+#[test]
+fn test_initialize_accepts_a_schedule_of_exactly_the_maximum_duration() {
+    let w = funded_uninitialised_wallet(1_000);
+    let client = VestingWalletClient::new(&w.env, &w.contract_id);
+    let start = w.env.ledger().sequence();
+
+    client.initialize(
+        &w.beneficiary,
+        &w.token_address,
+        &1_000i128,
+        &start,
+        &start,
+        &(start + MAX_VESTING_DURATION_LEDGERS),
+        &false,
+        &w.admin,
+    );
+
+    let schedule = client.get_vesting_schedule();
+    assert_eq!(
+        schedule.end_ledger - schedule.start_ledger,
+        MAX_VESTING_DURATION_LEDGERS
+    );
+}
+
+#[test]
+fn test_initialize_rejects_a_schedule_one_ledger_over_the_maximum() {
+    let w = funded_uninitialised_wallet(1_000);
+    let client = VestingWalletClient::new(&w.env, &w.contract_id);
+    let start = w.env.ledger().sequence();
+
+    let result = client.try_initialize(
+        &w.beneficiary,
+        &w.token_address,
+        &1_000i128,
+        &start,
+        &start,
+        &(start + MAX_VESTING_DURATION_LEDGERS + 1),
+        &false,
+        &w.admin,
+    );
+
+    assert!(matches!(result, Err(Ok(VestingError::InvalidSchedule))));
+}
+
+#[test]
+fn test_initialize_rejects_a_schedule_that_used_to_be_accepted_at_u32_max_duration() {
+    let w = funded_uninitialised_wallet(1_000);
+    let client = VestingWalletClient::new(&w.env, &w.contract_id);
+
+    let result = client.try_initialize(
+        &w.beneficiary,
+        &w.token_address,
+        &1_000i128,
+        &0u32,
+        &0u32,
+        &u32::MAX,
+        &false,
+        &w.admin,
+    );
+
+    assert!(matches!(result, Err(Ok(VestingError::InvalidSchedule))));
+}
+
+#[test]
+fn test_the_limit_is_measured_from_start_so_a_late_cliff_does_not_extend_it() {
+    let w = funded_uninitialised_wallet(1_000);
+    let client = VestingWalletClient::new(&w.env, &w.contract_id);
+    let start = w.env.ledger().sequence();
+
+    // The cliff sits at the maximum duration and the end one ledger later:
+    // only one ledger of linear vesting remains, but the schedule as a whole
+    // is one ledger over the limit.
+    let result = client.try_initialize(
+        &w.beneficiary,
+        &w.token_address,
+        &1_000i128,
+        &start,
+        &(start + MAX_VESTING_DURATION_LEDGERS),
+        &(start + MAX_VESTING_DURATION_LEDGERS + 1),
+        &false,
+        &w.admin,
+    );
+
+    assert!(matches!(result, Err(Ok(VestingError::InvalidSchedule))));
+}
+
+#[test]
+fn test_a_rejected_schedule_leaves_the_wallet_uninitialised_and_funds_untouched() {
+    let w = funded_uninitialised_wallet(1_000);
+    let client = VestingWalletClient::new(&w.env, &w.contract_id);
+    let token = TokenClient::new(&w.env, &w.token_address);
+    let start = w.env.ledger().sequence();
+
+    let rejected = client.try_initialize(
+        &w.beneficiary,
+        &w.token_address,
+        &1_000i128,
+        &start,
+        &start,
+        &(start + MAX_VESTING_DURATION_LEDGERS + 1),
+        &false,
+        &w.admin,
+    );
+    assert!(matches!(rejected, Err(Ok(VestingError::InvalidSchedule))));
+
+    // Nothing was stored and no tokens moved.
+    assert!(matches!(
+        client.try_beneficiary(),
+        Err(Ok(VestingError::NotInitialized))
+    ));
+    assert_eq!(token.balance(&w.admin), 1_000);
+    assert_eq!(token.balance(&w.contract_id), 0);
+
+    // The wallet is still free to be initialised with a valid schedule.
+    client.initialize(
+        &w.beneficiary,
+        &w.token_address,
+        &1_000i128,
+        &start,
+        &start,
+        &(start + MAX_VESTING_DURATION_LEDGERS),
+        &false,
+        &w.admin,
+    );
+    assert_eq!(token.balance(&w.contract_id), 1_000);
+}
+
+#[test]
+fn test_the_amount_ceiling_error_takes_precedence_over_the_duration_limit() {
+    let w = funded_uninitialised_wallet(1_000);
+    let client = VestingWalletClient::new(&w.env, &w.contract_id);
+
+    // Both limits are broken: the amount is above the ceiling and the duration
+    // is above the maximum. The amount error is reported, as before.
+    let result = client.try_initialize(
+        &w.beneficiary,
+        &w.token_address,
+        &(MAX_TOTAL_AMOUNT + 1),
+        &0u32,
+        &0u32,
+        &u32::MAX,
+        &false,
+        &w.admin,
+    );
+
+    assert!(matches!(result, Err(Ok(VestingError::TotalAmountTooLarge))));
+}
+
+#[test]
+fn test_import_vesting_enforces_the_same_duration_limit() {
+    let w = funded_uninitialised_wallet(1_000);
+    let client = VestingWalletClient::new(&w.env, &w.contract_id);
+    let start = w.env.ledger().sequence();
+
+    let too_long = VestingSchedule {
+        beneficiary: w.beneficiary.clone(),
+        token: w.token_address.clone(),
+        total_amount: 1_000,
+        start_ledger: start,
+        cliff_ledger: start,
+        end_ledger: start + MAX_VESTING_DURATION_LEDGERS + 1,
+        revocable: false,
+    };
+    let rejected = client.try_import_vesting(&too_long, &w.token_address, &w.admin);
+    assert!(matches!(rejected, Err(Ok(VestingError::InvalidSchedule))));
+
+    let at_limit = VestingSchedule {
+        end_ledger: start + MAX_VESTING_DURATION_LEDGERS,
+        ..too_long
+    };
+    client.import_vesting(&at_limit, &w.token_address, &w.admin);
+    assert_eq!(
+        client.get_vesting_schedule().end_ledger,
+        start + MAX_VESTING_DURATION_LEDGERS
+    );
+}
+
+#[test]
+fn test_ordinary_schedules_are_unaffected_by_the_limit() {
+    // Short schedules, with and without a cliff, still initialise and vest.
+    let t = setup(10, 90, 1_000);
+    advance_ledgers(&t.env, 50);
+
+    assert_eq!(t.client.vested_amount(), 500);
 }
 
 #[test]
@@ -1201,130 +1431,110 @@ fn test_revoke_after_cliff_emits_cliff_end_event_once() {
     assert!(t.client.cliff_end_notified());
 }
 
-// ── schedule versioning (#666) ─────────────────────────────────────────────────
+// ── #693 — backup_schedule ────────────────────────────────────────────────────
 
 #[test]
-fn test_schedule_version_starts_at_one() {
-    let t = setup(0, 200, 1_000);
-    assert_eq!(t.client.schedule_version(), 1);
+fn test_backup_schedule_captures_the_configured_schedule() {
+    let t = setup_revocable(10, 100, 1_000);
+
+    let backup = t.client.backup_schedule(&t.beneficiary);
+
+    assert_eq!(backup.version, 1);
+    assert_eq!(backup.backed_up_at_ledger, t.env.ledger().sequence());
+    assert_eq!(backup.schedule, t.client.get_vesting_schedule());
+    assert_eq!(backup.schedule.total_amount, 1_000);
+    assert!(backup.schedule.revocable);
+    assert_eq!(backup.admin, t.admin);
+    assert_eq!(backup.funder, t.admin);
+    assert_eq!(backup.treasury, None);
+    assert_eq!(backup.delegate, None);
+    assert_eq!(backup.released_amount, 0);
+    assert_eq!(backup.release_count, 0);
+    assert!(!backup.revoked);
+    assert_eq!(backup.revoked_vested, 0);
 }
 
 #[test]
-fn test_schedule_version_bumps_on_transfer_beneficiary() {
-    let t = setup(0, 200, 1_000);
-    let new_beneficiary = Address::generate(&t.env);
+fn test_backup_schedule_records_release_progress() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 50);
+    let released = t.client.release_all();
+    assert!(released > 0);
 
-    t.client.transfer_beneficiary(&new_beneficiary);
+    let backup = t.client.backup_schedule(&t.beneficiary);
 
-    assert_eq!(t.client.schedule_version(), 2);
+    assert_eq!(backup.released_amount, released);
+    assert_eq!(backup.release_count, 1);
+    assert_eq!(backup.backed_up_at_ledger, t.env.ledger().sequence());
 }
 
 #[test]
-fn test_schedule_version_bumps_on_revoke() {
-    let t = setup_revocable(0, 200, 1_000);
-
+fn test_backup_schedule_records_revocation() {
+    let t = setup_revocable(0, 100, 1_000);
+    advance_ledgers(&t.env, 40);
     t.client.revoke();
 
-    assert_eq!(t.client.schedule_version(), 2);
+    let backup = t.client.backup_schedule(&t.beneficiary);
+
+    assert!(backup.revoked);
+    assert_eq!(backup.revoked_vested, t.client.vested_amount());
+    assert!(backup.revoked_vested > 0);
 }
 
 #[test]
-fn test_schedule_version_bumps_on_emergency_withdraw() {
-    let t = setup(0, 200, 1_000);
+fn test_backup_schedule_records_treasury_delegate_and_admin_transfer() {
+    let t = setup(0, 100, 1_000);
+    let treasury = Address::generate(&t.env);
+    let delegate = Address::generate(&t.env);
+    let new_admin = Address::generate(&t.env);
+    t.client.set_treasury(&treasury);
+    t.client.delegate(&delegate);
+    t.client.transfer_admin(&new_admin);
 
-    t.client.emergency_withdraw();
+    let backup = t.client.backup_schedule(&t.beneficiary);
 
-    assert_eq!(t.client.schedule_version(), 2);
+    assert_eq!(backup.treasury, Some(treasury));
+    assert_eq!(backup.delegate, Some(delegate));
+    assert_eq!(backup.admin, new_admin);
+    // The funder is fixed at initialization and survives an admin transfer.
+    assert_eq!(backup.funder, t.admin);
 }
 
 #[test]
-fn test_get_vesting_overview_reports_schedule_version() {
-    let t = setup(0, 200, 1_000);
-    let new_beneficiary = Address::generate(&t.env);
+fn test_backup_schedule_rejects_a_different_beneficiary() {
+    let t = setup(0, 100, 1_000);
+    let stranger = Address::generate(&t.env);
 
-    t.client.transfer_beneficiary(&new_beneficiary);
-
-    assert_eq!(t.client.get_vesting_overview().version, 2);
+    assert_eq!(
+        t.client.try_backup_schedule(&stranger),
+        Err(Ok(VestingError::InvalidInput))
+    );
 }
 
 #[test]
-fn test_schedule_version_uninitialized_returns_not_initialized() {
+fn test_backup_schedule_rejects_an_uninitialized_wallet() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register(VestingWallet, ());
     let client = VestingWalletClient::new(&env, &contract_id);
+    let anyone = Address::generate(&env);
 
-    let result = client.try_schedule_version();
-    assert!(matches!(result, Err(Ok(VestingError::NotInitialized))));
-}
-
-// ── schedule sharing permissions (#669) ────────────────────────────────────────
-
-#[test]
-fn test_sharing_permissions_default_to_public() {
-    let t = setup(0, 200, 1_000);
-    let perms = t.client.get_sharing_permissions();
-    assert!(perms.public);
-    assert!(perms.allowed_viewers.is_empty());
+    assert_eq!(
+        client.try_backup_schedule(&anyone),
+        Err(Ok(VestingError::NotInitialized))
+    );
 }
 
 #[test]
-fn test_beneficiary_can_always_view_own_schedule() {
-    let t = setup(0, 200, 1_000);
+fn test_backup_schedule_is_read_only_and_repeatable() {
+    let t = setup(0, 100, 1_000);
+    advance_ledgers(&t.env, 10);
+    let overview_before = t.client.get_vesting_overview();
 
-    t.client.set_sharing_permissions(&SharingPermissions {
-        public: false,
-        allowed_viewers: vec![&t.env],
-    });
+    let first = t.client.backup_schedule(&t.beneficiary);
+    let second = t.client.backup_schedule(&t.beneficiary);
 
-    let overview = t.client.get_vesting_overview_for(&t.beneficiary);
-    assert_eq!(overview.total_amount, 1_000);
-}
-
-#[test]
-fn test_get_vesting_overview_for_rejects_unlisted_viewer_when_private() {
-    let t = setup(0, 200, 1_000);
-    let stranger = Address::generate(&t.env);
-
-    t.client.set_sharing_permissions(&SharingPermissions {
-        public: false,
-        allowed_viewers: vec![&t.env],
-    });
-
-    let result = t.client.try_get_vesting_overview_for(&stranger);
-    assert!(matches!(result, Err(Ok(VestingError::Unauthorized))));
-}
-
-#[test]
-fn test_get_vesting_overview_for_allows_explicitly_listed_viewer() {
-    let t = setup(0, 200, 1_000);
-    let viewer = Address::generate(&t.env);
-
-    t.client.set_sharing_permissions(&SharingPermissions {
-        public: false,
-        allowed_viewers: vec![&t.env, viewer.clone()],
-    });
-
-    let overview = t.client.get_vesting_overview_for(&viewer);
-    assert_eq!(overview.total_amount, 1_000);
-}
-
-#[test]
-fn test_get_vesting_overview_for_allows_anyone_when_public() {
-    let t = setup(0, 200, 1_000);
-    let stranger = Address::generate(&t.env);
-
-    let overview = t.client.get_vesting_overview_for(&stranger);
-    assert_eq!(overview.total_amount, 1_000);
-}
-
-#[test]
-fn test_set_sharing_permissions_requires_beneficiary_auth() {
-    let t = setup(0, 200, 1_000);
-    t.env.mock_auths(&[]);
-
-    let result = t.client.try_set_sharing_permissions(&SharingPermissions {
-        public: false,
-        allowed_viewers: vec![&t.env],
-    });
-    assert!(result.is_err());
+    assert_eq!(first, second);
+    assert_eq!(t.client.get_vesting_overview(), overview_before);
+    assert_eq!(t.client.release_count(), 0);
 }

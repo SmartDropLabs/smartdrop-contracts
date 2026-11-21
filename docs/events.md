@@ -186,6 +186,19 @@ Emitted by `set_global_multiplier`.
 * **Topics:** `(Symbol, Symbol)` -> `(symbol_short!("boost"), symbol_short!("mult_set"))`
 * **Payload:** `multiplier: u32` — bare value, not a tuple. The newly configured global multiplier.
 
+### `mult_mig` (boost)
+Emitted by `migrate_multiplier` when an admin re-bases a staker onto the current global multiplier and credit rate (#688). Not emitted when the stake is already current.
+
+* **Topics:** `(Symbol, Symbol)` -> `(symbol_short!("boost"), symbol_short!("mult_mig"))`
+* **Payload Structure (tuple order):**
+
+| Field | Rust Type | Description |
+| :--- | :--- | :--- |
+| `user` | `Address` | The staker whose snapshot was migrated. |
+| `old_multiplier` | `u32` | The multiplier the stake had been holding. |
+| `new_multiplier` | `u32` | The global multiplier now in effect for the stake. |
+| `credits_banked` | `i128` | The stake's banked credits after settling accrual under the old snapshot. |
+
 ---
 
 ## 3. VestingWallet Contract (`soroban/contracts/vesting-wallet`)

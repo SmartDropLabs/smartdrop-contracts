@@ -225,11 +225,10 @@ pub enum DataKey {
     UniqueUserCount,
     /// Cached reward multiplier per user (issue #652).
     CachedMultiplier(Address),
-    // ── #667 — Per-user multiplier snapshots ─────────────────────────────────
-    /// Count of multiplier snapshots taken for a user.
-    MultiplierSnapshotCount(Address),
-    /// Multiplier snapshot for a user, by index.
-    MultiplierSnapshotHistory(Address, u32),
+    /// User multiplier audit event counter (#679).
+    MultiplierAuditCount(Address),
+    /// User multiplier audit event by index (#679).
+    MultiplierAuditHistory(Address, u32),
 }
 
 /// Paginated response for `get_whitelisted_users`.
@@ -320,38 +319,39 @@ pub struct MultiplierBreakdown {
     pub banked_credits: i128,
 }
 
-/// A point-in-time capture of a user's reward multiplier state, taken by
-/// `take_multiplier_snapshot` (#667).
+/// Portable snapshot of one user's reward-multiplier state (#697).
 ///
-/// Carries the same breakdown as `MultiplierBreakdown` plus the ledger the
-/// snapshot was taken at, so a sequence of snapshots lets dashboards and
-/// off-chain analytics reconstruct how a user's effective stake evolved,
-/// instead of only ever seeing the live value.
+/// Returned by `export_multiplier` so integrators and migration tooling can
+/// read everything that determines a user's multiplier in a single call.
+/// Every field is a plain value, so the record can be serialised off-chain and
+/// compared against a later export.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub struct MultiplierSnapshot {
-    /// Raw stake amount the user had locked/staked at snapshot time.
-    pub stake_amount: i128,
-    /// Boost allocation percentage (0-100) at snapshot time.
-    pub allocation_pct: u32,
-    /// The global multiplier in effect at snapshot time.
+pub struct MultiplierData {
+    pub user: Address,
+    /// Contract schema version the export was taken under.
+    pub schema_version: u32,
+    /// Ledger sequence at which the export was read.
+    pub exported_at_ledger: u32,
+    /// Pool-wide multiplier currently in force.
     pub global_multiplier: u32,
-    /// Effective total stake at snapshot time; see `MultiplierBreakdown`.
+    /// Multiplier snapshotted on the user's stake at its last checkpoint, or
+    /// the current global multiplier when the user has no stake.
+    pub stake_multiplier: u32,
+    /// Percentage of the stake allocated to boosted staking (0-100).
+    pub allocation_pct: u32,
+    /// Stake-size tier multiplier in percent (#616).
+    pub tier_multiplier_pct: u32,
+    /// Raw staked (or locked) amount.
+    pub stake_amount: i128,
+    /// `amount * (100 - alloc + alloc * global_multiplier) / 100`.
     pub effective_stake: i128,
-    /// Per-ledger credit rate in effect at snapshot time.
+    /// Per-ledger credit rate in effect for this user.
     pub credit_rate: i128,
-    /// Total accrued credits at snapshot time.
+    /// Credits banked so far, before the current ledger's accrual.
     pub banked_credits: i128,
-    /// Ledger sequence the snapshot was taken at.
-    pub ledger: u32,
-}
-
-/// Paginated response for `get_multiplier_snapshots` (#667).
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct MultiplierSnapshotPage {
-    pub snapshots: Vec<MultiplierSnapshot>,
-    pub total: u32,
+    /// Whether the user has an active stake or locked position.
+    pub has_active_stake: bool,
 }
 
 // ─── History / audit trail types ─────────────────────────────────────────────
@@ -392,7 +392,8 @@ pub struct StakeEvent {
 pub struct AdminActionEvent {
     /// What was changed: "credit_rate", "multiplier", "pause", "unpause",
     /// "min_lock", "min_stake", "upgrade", "admin_transfer", "migrate",
-    /// "whitelist_enable", "whitelist_disable", "recover_credits"
+    /// "whitelist_enable", "whitelist_disable", "recover_credits", "mult_mig"
+    /// (`migrate_multiplier`)
     pub action: soroban_sdk::Symbol,
     pub admin: Address,
     pub ledger: u32,
@@ -463,6 +464,25 @@ pub struct GlobalMultiplierHistoryPage {
     pub events: Vec<GlobalMultiplierEvent>,
     pub total: u32,
 }
+
+/// A single user multiplier change event for audit trail (#679).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiplierAuditEntry {
+    pub user: Address,
+    pub old_multiplier: u32,
+    pub new_multiplier: u32,
+    pub ledger: u32,
+}
+
+/// Paginated response for user multiplier audit queries (#679).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiplierAuditPage {
+    pub events: Vec<MultiplierAuditEntry>,
+    pub total: u32,
+}
+
 
 // ── Feature 1: User Activity Tracking (Issue #554) ─────────────────────────
 

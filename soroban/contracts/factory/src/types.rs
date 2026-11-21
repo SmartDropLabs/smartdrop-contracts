@@ -58,13 +58,16 @@ pub enum DataKey {
     PoolTvl(u32),
     /// Insurance fund balance for a specific pool.
     InsuranceFund(u32),
-    /// Pool IDs that a given pool depends on, as set by
-    /// `set_pool_dependencies` (#668).
-    PoolDependencies(u32),
-    /// Ordered list of pool IDs that currently have dependencies set, so
-    /// `get_dependency_graph` can be built without scanning every pool ID
-    /// up to `PoolCount` (#668).
-    PoolsWithDependencies,
+    /// One recorded ballot per authenticated address and pool.
+    PoolVote(u32, Address),
+    /// Aggregate approval votes for a pool.
+    PoolYesVotes(u32),
+    /// Aggregate rejection votes for a pool.
+    PoolNoVotes(u32),
+    /// Global counter for pool configuration change events (#680).
+    PoolConfigHistoryCount(u32),
+    /// Pool configuration change event by index (#680).
+    PoolConfigHistory(u32, u32),
 }
 
 /// On-chain record for a registered farming pool.
@@ -262,10 +265,25 @@ pub enum FactoryError {
     TooManyPools = 25,
     /// `compare_pools` was called with the same pool ID more than once.
     DuplicatePoolId = 26,
-    /// `set_pool_dependencies` was called with a pool listed as its own
-    /// dependency.
-    SelfDependency = 27,
-    /// `set_pool_dependencies` was called with more entries than
-    /// `MAX_POOL_DEPENDENCIES`.
-    TooManyDependencies = 28,
+    /// A voter has already voted on a pool.
+    AlreadyVoted = 27,
+}
+
+/// A single pool configuration change event (#680).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolConfigChangeEntry {
+    pub pool_id: u32,
+    pub action: soroban_sdk::Symbol,
+    pub old_config: Option<PoolRecord>,
+    pub new_config: Option<PoolRecord>,
+    pub ledger: u32,
+}
+
+/// Paginated response for pool configuration history queries (#680).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolConfigHistoryPage {
+    pub events: Vec<PoolConfigChangeEntry>,
+    pub total: u32,
 }

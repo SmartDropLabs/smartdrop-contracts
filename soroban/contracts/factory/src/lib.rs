@@ -7,8 +7,8 @@ use soroban_sdk::{
     Vec,
 };
 use types::{
-    DataKey, ListPoolsResponse, PoolComparison, PoolRecord, PoolSort, PoolStatus,
-    RefreshPoolTtlsResponse,
+    DataKey, ListPoolsResponse, PoolComparison, PoolConfigChangeEntry, PoolConfigHistoryPage,
+    PoolRecord, PoolSort, PoolStatus, RefreshPoolTtlsResponse,
 };
 
 pub use types::DependencyGraph;
@@ -426,6 +426,37 @@ fn validate_factory_admin(env: &Env, admin: &Address) -> Result<(), FactoryError
     Ok(())
 }
 
+fn read_pool_config_history_count(env: &Env, pool_id: u32) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PoolConfigHistoryCount(pool_id))
+        .unwrap_or(0)
+}
+
+fn record_config_change(
+    env: &Env,
+    pool_id: u32,
+    action: Symbol,
+    old_config: Option<PoolRecord>,
+    new_config: Option<PoolRecord>,
+) {
+    let count = read_pool_config_history_count(env, pool_id);
+    let ledger = env.ledger().sequence();
+    let entry = PoolConfigChangeEntry {
+        pool_id,
+        action,
+        old_config,
+        new_config,
+        ledger,
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::PoolConfigHistory(pool_id, count), &entry);
+    env.storage()
+        .persistent()
+        .set(&DataKey::PoolConfigHistoryCount(pool_id), &(count + 1));
+}
+
 fn create_pool_inner(
     env: Env,
     admin: Address,
@@ -583,6 +614,15 @@ fn create_pool_inner(
         .persistent()
         .set(&DataKey::Pool(pool_id), &record);
     bump_pool(&env, pool_id);
+
+    // Record pool creation in configuration history (#680)
+    record_config_change(
+        &env,
+        pool_id,
+        symbol_short!("created"),
+        None,
+        Some(record.clone()),
+    );
 
     // A freshly deployed pool holds nothing, so its contribution to
     // `total_tvl` starts at 0. Recording the baseline explicitly keeps the
@@ -1474,9 +1514,19 @@ impl Factory {
         }
 
         let old_hash = record.wasm_hash.clone();
+        let old_record = record.clone();
         record.wasm_hash = new_wasm_hash.clone();
         record.version = record.version.saturating_add(1);
         env.storage().persistent().set(&key, &record);
+
+        // Record upgrade in configuration history (#680)
+        record_config_change(
+            env,
+            pool_id,
+            symbol_short!("upgraded"),
+            Some(old_record),
+            Some(record.clone()),
+        );
 
         let old_wasm_key = DataKey::PoolsByWasmHash(old_hash.clone());
         if let Some(old_pool_ids) = env
@@ -1545,6 +1595,90 @@ impl Factory {
         bump_instance(&env);
 
         Self::upgrade_pool_inner(&env, &admin, pool_id, &new_wasm_hash)
+    }
+
+    /// Record one authenticated, immutable ballot per wallet for a registered pool.
+    ///
+    /// Voting is advisory: it never directly changes pool parameters or grants
+    /// administrator privileges. One-wallet-one-vote is not stake-weighted and
+    /// must not be treated as Sybil-resistant governance.
+    pub fn vote_on_pool(
+        env: Env,
+        pool_id: u32,
+        voter: Address,
+        approve: bool,
+    ) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        voter.require_auth();
+        let pool_key = DataKey::Pool(pool_id);
+        if !env.storage().persistent().has(&pool_key) {
+            return Err(FactoryError::PoolNotFound);
+        }
+        bump_instance(&env);
+        bump_pool(&env, pool_id);
+        let ballot_key = DataKey::PoolVote(pool_id, voter.clone());
+        if env.storage().persistent().has(&ballot_key) {
+            return Err(FactoryError::AlreadyVoted);
+        }
+        let count_key = if approve {
+            DataKey::PoolYesVotes(pool_id)
+        } else {
+            DataKey::PoolNoVotes(pool_id)
+        };
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let next = count.checked_add(1).ok_or(FactoryError::PoolCountOverflow)?;
+        env.storage().persistent().set(&ballot_key, &approve);
+        env.storage().persistent().extend_ttl(&ballot_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage().persistent().set(&count_key, &next);
+        env.storage().persistent().extend_ttl(&count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        #[allow(deprecated)]
+        env.events().publish((symbol_short!("factory"), symbol_short!("pool_vote")), (pool_id, voter, approve));
+        Ok(())
+    }
+
+    /// Read approval and rejection totals for a registered pool.
+    pub fn pool_vote_totals(env: Env, pool_id: u32) -> Result<(u32, u32), FactoryError> {
+        require_initialized(&env)?;
+        let pool_key = DataKey::Pool(pool_id);
+        if !env.storage().persistent().has(&pool_key) {
+            return Err(FactoryError::PoolNotFound);
+        }
+        bump_instance(&env);
+        bump_pool(&env, pool_id);
+        let yes_key = DataKey::PoolYesVotes(pool_id);
+        let no_key = DataKey::PoolNoVotes(pool_id);
+        let yes = env.storage().persistent().get(&yes_key).unwrap_or(0);
+        let no = env.storage().persistent().get(&no_key).unwrap_or(0);
+        if env.storage().persistent().has(&yes_key) {
+            env.storage().persistent().extend_ttl(&yes_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        if env.storage().persistent().has(&no_key) {
+            env.storage().persistent().extend_ttl(&no_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        Ok((yes, no))
+    }
+
+    /// Read a wallet's ballot, or None if no ballot exists.
+    pub fn pool_vote_of(env: Env, pool_id: u32, voter: Address) -> Result<Option<bool>, FactoryError> {
+        require_initialized(&env)?;
+        if !env.storage().persistent().has(&DataKey::Pool(pool_id)) {
+            return Err(FactoryError::PoolNotFound);
+        }
+        bump_instance(&env);
+        bump_pool(&env, pool_id);
+        let key = DataKey::PoolVote(pool_id, voter);
+        let vote = env.storage().persistent().get(&key);
+        if vote.is_some() {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        Ok(vote)
+    }
+
+    /// In-place WASM migration: preserves the pool's address and persistent
+    /// storage. This is not a transfer of assets to a new contract address.
+    /// Uses the existing audited admin authorization and upgrade checks.
+    pub fn migrate_pool(env: Env, pool_id: u32, new_wasm_hash: BytesN<32>) -> Result<(), FactoryError> {
+        Self::upgrade_pool(env, pool_id, new_wasm_hash)
     }
 
     /// Upgrade multiple registered farming pools in batch. Admin-only.
@@ -1827,6 +1961,102 @@ impl Factory {
             .unwrap_or(false))
     }
 
+    /// Validate pool configuration parameters before creating a pool (issue #704).
+    ///
+    /// Performs all validation checks that `create_pool` would perform, but
+    /// without actually creating a pool. This allows callers to validate
+    /// configuration beforehand to improve UX and catch errors at the API
+    /// boundary rather than at runtime.
+    ///
+    /// Returns `Ok(true)` if all validations pass, or an appropriate
+    /// `FactoryError` if any check fails.
+    ///
+    /// ## Validations performed:
+    /// - Asset is not zero address
+    /// - Asset is not the factory contract itself
+    /// - Asset is not the same as the admin address
+    /// - Global multiplier is within bounds (1 to MAX_GLOBAL_MULTIPLIER)
+    /// - Daily rate is within bounds and converts to a valid credit rate
+    /// - Min lock period is within bounds (MIN_LOCK_PERIOD to MAX_MIN_LOCK_PERIOD)
+    /// - Min stake amount is within acceptable range
+    pub fn validate_config(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        daily_rate: u128,
+        global_multiplier: u32,
+        min_lock_period: u64,
+        min_stake_amount: i128,
+    ) -> Result<bool, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        validate_asset(&env, &asset)?;
+
+        // Validation: Ensure asset address is not zero/null
+        let zero_addr = Address::from_string(&String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        if asset == zero_addr {
+            return Err(FactoryError::InvalidAsset);
+        }
+
+        // Validation: Ensure the staking asset is not the factory contract itself
+        if asset == env.current_contract_address() {
+            return Err(FactoryError::InvalidAsset);
+        }
+
+        // Validation: Ensure the staking asset is not also the pool admin
+        if asset == admin {
+            return Err(FactoryError::InvalidAsset);
+        }
+
+        // Validation: Ensure global_multiplier is strictly within bounds
+        if global_multiplier < 1 {
+            return Err(FactoryError::InvalidGlobalMultiplier);
+        }
+        if global_multiplier > MAX_GLOBAL_MULTIPLIER {
+            return Err(FactoryError::InvalidGlobalMultiplier);
+        }
+
+        // Validation: Bound the caller-facing daily_rate directly
+        if daily_rate > MAX_DAILY_RATE {
+            return Err(FactoryError::InvalidCreditRate);
+        }
+
+        // Validation: Convert and validate daily_rate
+        let credit_rate = daily_rate_to_credit_rate(daily_rate)?;
+
+        if credit_rate <= 0 || credit_rate > MAX_CREDIT_RATE {
+            return Err(FactoryError::InvalidCreditRate);
+        }
+
+        // Validation: Reject a zero min_lock_period
+        if min_lock_period == 0 {
+            return Err(FactoryError::MinLockPeriodTooShort);
+        }
+        let min_lock_period_u32: u32 = min_lock_period
+            .try_into()
+            .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
+        if min_lock_period_u32 < MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodTooShort);
+        }
+        if min_lock_period_u32 > MAX_MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodAboveCeiling);
+        }
+
+        // Validation: Check min_stake_amount bounds
+        if min_stake_amount > MAX_STAKE_AMOUNT {
+            return Err(FactoryError::InvalidMinStakeAmount);
+        }
+        if min_stake_amount < -MAX_STAKE_AMOUNT {
+            return Err(FactoryError::InvalidMinStakeAmount);
+        }
+
+        Ok(true)
+    }
+
     /// Create, deploy, and initialize a new farming pool. Admin-only.
     ///
     /// Unlike the pre-#80 version of this function, the deployed pool is no
@@ -2036,9 +2266,19 @@ impl Factory {
             return Err(FactoryError::AlreadyDeprecated);
         }
 
+        let old_record = record.clone();
         record.deprecated = true;
         env.storage().persistent().set(&key, &record);
         bump_pool(&env, pool_id);
+
+        // Record deprecation in configuration history (#680)
+        record_config_change(
+            &env,
+            pool_id,
+            symbol_short!("deprecate"),
+            Some(old_record),
+            Some(record),
+        );
 
         #[allow(deprecated)]
         env.events().publish(
@@ -2162,5 +2402,116 @@ impl Factory {
             Ok(_) => Ok(HealthStatus::Healthy),
             Err(_) => Ok(HealthStatus::Degraded),
         }
+    }
+
+    /// Returns the configuration change history for a pool (issue #680).
+    ///
+    /// Provides a paginated list of all configuration change events (creation,
+    /// upgrade, deprecation, etc.) for the specified pool in chronological order.
+    ///
+    /// ## Arguments
+    /// * `pool_id` - The pool ID to query
+    /// * `start` - Zero-based index to start reading from
+    /// * `limit` - Maximum number of events to return
+    ///
+    /// ## Returns
+    /// * `PoolConfigHistoryPage` containing the events and total count
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    /// * `PoolNotFound` - If no pool with the given ID exists
+    pub fn get_pool_config_history(
+        env: Env,
+        pool_id: u32,
+        start: u32,
+        limit: u32,
+    ) -> Result<PoolConfigHistoryPage, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        // Verify pool exists
+        let _record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+
+        let total = read_pool_config_history_count(&env, pool_id);
+        let mut events = Vec::new(&env);
+
+        let end = start.saturating_add(limit).min(total);
+        for i in start..end {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PoolConfigChangeEntry>(&DataKey::PoolConfigHistory(pool_id, i))
+            {
+                events.push_back(event);
+            }
+        }
+
+        Ok(PoolConfigHistoryPage { events, total })
+    }
+
+    /// Export the pool configuration for a specific pool (issue #698).
+    ///
+    /// Returns the complete pool configuration data for external use or backup.
+    /// This is a read-only operation that does not require authorization.
+    ///
+    /// ## Arguments
+    /// * `pool_id` - The ID of the pool to export
+    ///
+    /// ## Returns
+    /// * `PoolRecord` containing all pool configuration parameters
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    /// * `PoolNotFound` - If no pool with the given ID exists
+    pub fn export_config(env: Env, pool_id: u32) -> Result<PoolRecord, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        
+        bump_pool(&env, pool_id);
+        Ok(record)
+    }
+
+    /// Import a pool configuration (issue #701).
+    ///
+    /// Creates a new pool from an existing PoolRecord configuration.
+    /// This allows migrating pools from other factories or restoring backed-up configurations.
+    /// Requires admin authorization.
+    ///
+    /// ## Arguments
+    /// * `config` - The PoolRecord containing the pool configuration to import
+    ///
+    /// ## Returns
+    /// * `u32` - The newly assigned pool ID
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    /// * `PoolCreationPaused` - If pool creation is currently paused
+    /// * Various validation errors if the configuration is invalid
+    pub fn import_config(env: Env, config: PoolRecord) -> Result<u32, FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        admin.require_auth();
+
+        // Use the existing internal pool creation logic
+        create_pool_inner(
+            env,
+            admin,
+            config.asset,
+            config.daily_rate,
+            config.global_multiplier,
+            config.min_lock_period as u64,
+            // min_stake_amount is not stored in PoolRecord, use default
+            MIN_STAKE_AMOUNT,
+        )
     }
 }
