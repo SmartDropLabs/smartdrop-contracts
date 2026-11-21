@@ -130,3 +130,14 @@ pub struct ScheduleHistoryPage {
     pub events: soroban_sdk::Vec<ScheduleHistoryEntry>,
     pub total: u32,
 }
+
+/// Vesting data for importing schedules (#702).
+/// This type bundles all the information needed to initialize a vesting wallet
+/// from external data, making it easier to import schedules from other sources.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingData {
+    pub schedule: VestingSchedule,
+    pub token: Address,
+    pub admin: Address,
+}
