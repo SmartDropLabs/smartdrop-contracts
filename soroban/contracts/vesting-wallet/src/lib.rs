@@ -7,9 +7,10 @@ mod types;
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Vec};
 use types::DataKey;
 pub use types::{
-    AdminTransferred, ScheduleBackup, ScheduleComparison, ScheduleHistoryEntry,
-    ScheduleHistoryPage, SharedScheduleTemplate, SharingPermissions, VestingData, VestingError,
-    VestingOverview, VestingSchedule, SCHEDULE_BACKUP_VERSION,
+    AdminTransferred, OptimizationSuggestion, ScheduleBackup, ScheduleComparison,
+    ScheduleHistoryEntry, ScheduleHistoryPage, SharedScheduleTemplate, SharingPermissions,
+    Suggestions, VestingData, VestingError, VestingOverview, VestingSchedule,
+    SCHEDULE_BACKUP_VERSION,
 };
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5 s/ledger).
@@ -1200,9 +1201,6 @@ impl VestingWallet {
 
 mod test;
 
-// Storage key for the cached optimization flag (issue #651).
-const SCHEDULE_OPTIMIZED_KEY: &str = "sched_opt";
-
 impl VestingWallet {
     /// Return a copy of the vesting schedule with any redundant or inefficient
     /// parameters collapsed (issue #651).
@@ -1394,6 +1392,95 @@ impl VestingWallet {
             cliff_ledger: get_cliff_ledger(&env),
             end_ledger: get_end_ledger(&env),
             revocable: is_revocable(&env),
+        })
+    }
+
+    /// Return optimization suggestions for the vesting schedule (#675).
+    ///
+    /// Analyzes the current schedule and provides recommendations to improve
+    /// efficiency, reduce risk, or better align with best practices. Suggestions
+    /// may include adjusting cliff periods, vesting duration, or total amounts
+    /// based on the schedule's current state and progress.
+    ///
+    /// This is a read-only query that does not modify the schedule.
+    ///
+    /// Returns `NotInitialized` if the wallet has not been initialized.
+    pub fn get_optimization_suggestions(
+        env: Env,
+        schedule: VestingSchedule,
+    ) -> Result<Suggestions, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let mut suggestions: Vec<OptimizationSuggestion> = Vec::new(&env);
+        let current_ledger = env.ledger().sequence();
+        
+        // Calculate duration
+        let duration = schedule.end_ledger - schedule.start_ledger;
+        let cliff_duration = schedule.cliff_ledger - schedule.start_ledger;
+        
+        // Suggest shorter cliff if cliff is more than 50% of duration
+        if cliff_duration > duration / 2 {
+            suggestions.push_back(OptimizationSuggestion {
+                suggestion_type: soroban_sdk::Symbol::new(&env, "cliff"),
+                reason: soroban_sdk::String::from_str(
+                    &env,
+                    "Cliff period is more than 50% of vesting duration",
+                ),
+                current_value: cliff_duration as i128,
+                suggested_value: (duration / 4) as i128,
+            });
+        }
+        
+        // Suggest adjusting if duration is very short (less than 30 days worth of ledgers)
+        // At ~5s per ledger, 30 days ≈ 518,400 ledgers
+        let min_duration = 518_400u32;
+        if duration < min_duration && current_ledger < schedule.start_ledger {
+            suggestions.push_back(OptimizationSuggestion {
+                suggestion_type: soroban_sdk::Symbol::new(&env, "duration"),
+                reason: soroban_sdk::String::from_str(
+                    &env,
+                    "Vesting duration shorter than recommended 30 days",
+                ),
+                current_value: duration as i128,
+                suggested_value: min_duration as i128,
+            });
+        }
+        
+        // Suggest revocability if not set and schedule hasn't started
+        if !schedule.revocable && current_ledger < schedule.start_ledger {
+            suggestions.push_back(OptimizationSuggestion {
+                suggestion_type: soroban_sdk::Symbol::new(&env, "revocable"),
+                reason: soroban_sdk::String::from_str(
+                    &env,
+                    "Consider making schedule revocable for flexibility",
+                ),
+                current_value: 0,
+                suggested_value: 1,
+            });
+        }
+
+        // Suggest consolidating if too many small releases
+        // If vesting period is very long (> 365 days) with small total amount
+        let max_duration = 6_307_200u32; // ~365 days
+        if duration > max_duration / 2 && schedule.total_amount < 1_000_000_000 {
+            suggestions.push_back(OptimizationSuggestion {
+                suggestion_type: soroban_sdk::Symbol::new(&env, "amount"),
+                reason: soroban_sdk::String::from_str(
+                    &env,
+                    "Long vesting period for small amount may incur high fees",
+                ),
+                current_value: schedule.total_amount,
+                suggested_value: schedule.total_amount * 10,
+            });
+        }
+
+        let is_optimal = suggestions.is_empty();
+        
+        Ok(Suggestions {
+            wallet: env.current_contract_address(),
+            suggestions,
+            is_optimal,
         })
     }
 }

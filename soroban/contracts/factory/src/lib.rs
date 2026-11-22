@@ -568,6 +568,41 @@ fn record_config_change(
         .set(&DataKey::PoolConfigHistoryCount(pool_id), &(count + 1));
 }
 
+/// Validate pool configuration parameters before deployment.
+///
+/// Ensures that reward_rate is non-zero and pool parameters meet basic
+/// integrity requirements. This function is called during pool creation
+/// to reject invalid configurations before deployment.
+fn validate_config(
+    daily_rate: u128,
+    global_multiplier: u32,
+    min_lock_period: u64,
+) -> Result<(), FactoryError> {
+    // Ensure daily_rate (which translates to reward_rate/credit_rate) is non-zero
+    if daily_rate == 0 {
+        return Err(FactoryError::InvalidCreditRate);
+    }
+    
+    // Validate global_multiplier is within bounds
+    if global_multiplier < 1 || global_multiplier > MAX_GLOBAL_MULTIPLIER {
+        return Err(FactoryError::InvalidGlobalMultiplier);
+    }
+    
+    // Validate min_lock_period
+    if min_lock_period == 0 {
+        return Err(FactoryError::MinLockPeriodTooShort);
+    }
+    
+    let min_lock_u32: u32 = min_lock_period
+        .try_into()
+        .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
+    if min_lock_u32 > MAX_MIN_LOCK_PERIOD {
+        return Err(FactoryError::MinLockPeriodAboveCeiling);
+    }
+    
+    Ok(())
+}
+
 fn create_pool_inner(
     env: Env,
     admin: Address,
@@ -587,6 +622,9 @@ fn create_pool_inner(
     if paused {
         return Err(FactoryError::PoolCreationPaused);
     }
+    
+    // Validate configuration before proceeding with pool creation
+    validate_config(daily_rate, global_multiplier, min_lock_period)?;
 
     validate_asset(&env, &asset)?;
 
@@ -2803,5 +2841,66 @@ impl Factory {
             // min_stake_amount is not stored in PoolRecord, use default
             MIN_STAKE_AMOUNT,
         )
+    }
+
+    /// Track pool performance metrics.
+    ///
+    /// Records performance data for a given pool including TVL, credit rate,
+    /// and global multiplier at the current ledger. This data can be used for
+    /// analytics, optimization, and monitoring pool health over time.
+    ///
+    /// Returns the pool's current metrics snapshot.
+    pub fn track_performance(env: Env, pool_id: u32) -> Result<PoolMetrics, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        // Get the pool record
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        // Sync TVL to get the latest value
+        let tvl = apply_tvl_sync(&env, pool_id, &record.address)?;
+
+        // Get snapshot count
+        let snapshot_count = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::PoolSnapshotCount(pool_id))
+            .unwrap_or(0);
+
+        // Get last snapshot ledger
+        let last_snapshot_ledger = if snapshot_count > 0 {
+            env.storage()
+                .persistent()
+                .get::<DataKey, Snapshot>(&DataKey::PoolSnapshot(
+                    pool_id,
+                    snapshot_count - 1,
+                ))
+                .map(|s| s.ledger)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Publish performance tracking event
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("perf_trk")),
+            (pool_id, tvl, record.credit_rate, record.global_multiplier),
+        );
+
+        Ok(PoolMetrics {
+            pool_id,
+            tvl,
+            snapshot_count,
+            last_snapshot_ledger,
+            global_multiplier: record.global_multiplier,
+            credit_rate: record.credit_rate,
+            deprecated: record.deprecated,
+        })
     }
 }

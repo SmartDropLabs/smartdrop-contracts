@@ -255,3 +255,32 @@ pub struct ScheduleComparison {
     /// Wallet whose cliff ledger is reached first; `None` on a tie.
     pub earlier_unlock: Option<Address>,
 }
+
+/// Optimization suggestion for a vesting schedule (#675).
+///
+/// Provides recommendations for improving schedule efficiency based on
+/// current market conditions and best practices.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptimizationSuggestion {
+    /// Type of optimization suggested
+    pub suggestion_type: soroban_sdk::Symbol,
+    /// Description of the optimization
+    pub reason: soroban_sdk::String,
+    /// Current value
+    pub current_value: i128,
+    /// Suggested value
+    pub suggested_value: i128,
+}
+
+/// Response containing optimization suggestions for a vesting schedule (#675).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Suggestions {
+    /// Address of the vesting wallet
+    pub wallet: Address,
+    /// List of optimization suggestions
+    pub suggestions: Vec<OptimizationSuggestion>,
+    /// Whether the schedule is already optimal
+    pub is_optimal: bool,
+}
