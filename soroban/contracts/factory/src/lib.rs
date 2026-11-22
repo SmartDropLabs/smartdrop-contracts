@@ -9,7 +9,7 @@ use soroban_sdk::{
 use types::{
     ConfigSuggestion, DataKey, ListPoolsResponse, OptimizationKind, PoolComparison,
     PoolConfigChangeEntry, PoolConfigHistoryPage, PoolRecord, PoolSort, PoolStatus,
-    RefreshPoolTtlsResponse,
+    RefreshPoolTtlsResponse, Snapshot,
 };
 
 pub use types::{ConfigComparison, ConfigSuggestions};
@@ -2268,15 +2268,25 @@ impl Factory {
         validate_factory_admin(&env, &admin)?;
         admin.require_auth();
 
-        create_pool_inner(
-            env,
+        // Emit a `pool_fail` event when validation fails so indexers can observe
+        // rejected creation attempts without having to parse error codes from
+        // the transaction's diagnostic events (#606).
+        let result = create_pool_inner(
+            env.clone(),
             admin,
             asset,
             daily_rate,
             global_multiplier,
             min_lock_period,
             min_stake_amount,
-        )
+        );
+        if let Err(ref e) = result {
+            env.events().publish(
+                (symbol_short!("factory"), symbol_short!("pool_fail")),
+                *e as u32,
+            );
+        }
+        result
     }
 
     /// Register an externally-deployed farming pool with the factory (#665).
@@ -2803,5 +2813,54 @@ impl Factory {
             // min_stake_amount is not stored in PoolRecord, use default
             MIN_STAKE_AMOUNT,
         )
+    }
+
+    /// Return factory-owned analytics for `pool_id` (#611).
+    ///
+    /// Returns the pool's current TVL, credit rate, global multiplier,
+    /// deprecation status, snapshot count and last snapshot ledger from the
+    /// factory's own persistent storage — no cross-contract calls are made.
+    pub fn get_pool_analytics(env: Env, pool_id: u32) -> Result<PoolMetrics, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        let tvl = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::PoolTvl(pool_id))
+            .unwrap_or(0);
+
+        let snapshot_count: u32 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::PoolSnapshotCount(pool_id))
+            .unwrap_or(0);
+
+        let last_snapshot_ledger: u32 = if snapshot_count > 0 {
+            env.storage()
+                .persistent()
+                .get::<DataKey, Snapshot>(&DataKey::PoolSnapshot(pool_id, snapshot_count - 1))
+                .map(|s| s.ledger)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        Ok(PoolMetrics {
+            pool_id,
+            tvl,
+            snapshot_count,
+            last_snapshot_ledger,
+            global_multiplier: record.global_multiplier,
+            credit_rate: record.credit_rate,
+            deprecated: record.deprecated,
+        })
     }
 }

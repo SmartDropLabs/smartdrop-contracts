@@ -1707,12 +1707,22 @@ impl FarmingPool {
             return Ok(0);
         };
 
-        let elapsed = env
-            .ledger()
-            .sequence()
-            .saturating_sub(position.checkpoint_ledger);
+        let current_ledger = env.ledger().sequence();
+        let elapsed = current_ledger.saturating_sub(position.checkpoint_ledger);
         let accrued = compute_credits(position.amount, 0, 1, position.credit_rate, elapsed);
-        Ok(position.total_credits + accrued)
+
+        // Apply a 50% lock bonus when the position is still within its lock
+        // period (#607). This aligns the display credit value with the economic
+        // incentive for locking: a user who locks earns more credits per ledger
+        // than one who has already unlocked their position.
+        let is_locked = current_ledger < position.unlock_ledger;
+        let total_raw = position.total_credits + accrued;
+        let total = if is_locked {
+            total_raw + total_raw / 2
+        } else {
+            total_raw
+        };
+        Ok(total)
     }
 
     /// Return current accrued credits for a user's time-locked `Position`.
@@ -4191,6 +4201,46 @@ impl FarmingPool {
 mod test;
 
 impl FarmingPool {
+    /// Compound a user's accrued position credits back into their stake (#610).
+    ///
+    /// Reads the caller's current accrued credits via `calculate_credits`,
+    /// banks them onto the position's `total_credits` (checkpointing the
+    /// position to the current ledger), and emits a `compound` event so
+    /// off-chain indexers can observe the operation.
+    ///
+    /// This function does **not** convert credits to tokens — credits are a
+    /// protocol-internal reward unit. It simply re-checkpoints the position so
+    /// future `calculate_credits` calls start from a clean baseline with the
+    /// accrued credits already counted, preventing integer-overflow drift on
+    /// long-running positions.
+    ///
+    /// Returns the total credits after compounding.
+    pub fn compound(env: Env, user: Address) -> Result<i128, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        user.require_auth();
+
+        let Some(mut position) = get_position(&env, &user) else {
+            return Err(PoolError::NoActivePosition);
+        };
+
+        let current_ledger = env.ledger().sequence();
+        let elapsed = current_ledger.saturating_sub(position.checkpoint_ledger);
+        let accrued = compute_credits(position.amount, 0, 1, position.credit_rate, elapsed);
+
+        // Bank accrued credits and reset checkpoint.
+        position.total_credits = position.total_credits.saturating_add(accrued);
+        position.checkpoint_ledger = current_ledger;
+        set_position(&env, &user, &position);
+
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("compound")),
+            (user, position.total_credits),
+        );
+
+        Ok(position.total_credits)
+    }
+
     /// Return the cached reward multiplier for `user`, recomputing and caching
     /// it if no valid cache entry exists (issue #652).
     ///
