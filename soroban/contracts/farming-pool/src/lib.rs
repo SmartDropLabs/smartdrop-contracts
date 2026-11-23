@@ -19,7 +19,8 @@ use types::{
     WhitelistEvent, WhitelistHistoryPage,
 };
 pub use types::{
-    MultiplierBreakdown, MultiplierData, MultiplierOptimization, PoolError, PoolInfo, UserSummary,
+    MultiplierBreakdown, MultiplierData, MultiplierOptimization, PoolError, PoolInfo,
+    Transparency, UserSummary,
 };
 
 // Expose compiled WASM bytes so sibling crates (e.g. `factory`) can upload the
@@ -4436,5 +4437,77 @@ impl FarmingPool {
         }
 
         Ok(())
+    }
+
+    /// Return detailed breakdown of multiplier calculation for transparency (#676).
+    ///
+    /// Provides a complete view of how a user's reward multiplier is calculated,
+    /// including all intermediate values and the formula used. This allows users
+    /// to understand exactly how their rewards are computed and verify the
+    /// calculations independently.
+    ///
+    /// Returns `NotInitialized` if the pool has not been initialized.
+    pub fn get_multiplier_transparency(
+        env: Env,
+        user: Address,
+    ) -> Result<Transparency, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let global_multiplier = read_global_multiplier(&env);
+        let credit_rate = read_credit_rate(&env);
+
+        // Try to get user stake first, then position
+        let (stake_amount, allocation_pct, stake_multiplier, banked_credits) =
+            if let Some(stake) = get_user_stake(&env, &user) {
+                let alloc = get_user_boost(&env, &user).unwrap_or(0);
+                (stake.amount, alloc, stake.multiplier, stake.credits_banked)
+            } else if let Some(position) = get_position(&env, &user) {
+                // Locked positions don't use boost allocation
+                (position.amount, 0, global_multiplier, position.total_credits)
+            } else {
+                // User has no active stake
+                (0, 0, global_multiplier, 0)
+            };
+
+        // Calculate effective stake using the same formula as compute_total_stake
+        let effective_stake = if allocation_pct == 0 {
+            stake_amount
+        } else {
+            let principal = stake_amount * (100 - allocation_pct as i128) / 100;
+            let boosted = stake_amount * (allocation_pct as i128) * (stake_multiplier as i128) / 100;
+            principal + boosted
+        };
+
+        // Calculate credits per ledger
+        let credits_per_ledger = effective_stake
+            .saturating_mul(credit_rate)
+            .saturating_div(1);
+
+        // Build calculation breakdown string
+        let breakdown = if allocation_pct == 0 {
+            soroban_sdk::String::from_str(
+                &env,
+                "stake * credit_rate = credits_per_ledger",
+            )
+        } else {
+            soroban_sdk::String::from_str(
+                &env,
+                "principal + boosted * multiplier * credit_rate = credits_per_ledger",
+            )
+        };
+
+        Ok(Transparency {
+            user,
+            stake_amount,
+            allocation_pct,
+            global_multiplier,
+            stake_multiplier,
+            credit_rate,
+            effective_stake,
+            credits_per_ledger,
+            banked_credits,
+            calculation_breakdown: breakdown,
+        })
     }
 }

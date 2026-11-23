@@ -603,6 +603,41 @@ fn record_config_change(
         .set(&DataKey::PoolConfigHistoryCount(pool_id), &(count + 1));
 }
 
+/// Validate pool configuration parameters before deployment.
+///
+/// Ensures that reward_rate is non-zero and pool parameters meet basic
+/// integrity requirements. This function is called during pool creation
+/// to reject invalid configurations before deployment.
+fn validate_config(
+    daily_rate: u128,
+    global_multiplier: u32,
+    min_lock_period: u64,
+) -> Result<(), FactoryError> {
+    // Ensure daily_rate (which translates to reward_rate/credit_rate) is non-zero
+    if daily_rate == 0 {
+        return Err(FactoryError::InvalidCreditRate);
+    }
+    
+    // Validate global_multiplier is within bounds
+    if global_multiplier < 1 || global_multiplier > MAX_GLOBAL_MULTIPLIER {
+        return Err(FactoryError::InvalidGlobalMultiplier);
+    }
+    
+    // Validate min_lock_period
+    if min_lock_period == 0 {
+        return Err(FactoryError::MinLockPeriodTooShort);
+    }
+    
+    let min_lock_u32: u32 = min_lock_period
+        .try_into()
+        .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
+    if min_lock_u32 > MAX_MIN_LOCK_PERIOD {
+        return Err(FactoryError::MinLockPeriodAboveCeiling);
+    }
+    
+    Ok(())
+}
+
 fn create_pool_inner(
     env: Env,
     admin: Address,
@@ -622,6 +657,9 @@ fn create_pool_inner(
     if paused {
         return Err(FactoryError::PoolCreationPaused);
     }
+    
+    // Validate configuration before proceeding with pool creation
+    validate_config(daily_rate, global_multiplier, min_lock_period)?;
 
     validate_asset(&env, &asset)?;
 
