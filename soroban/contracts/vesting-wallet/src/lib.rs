@@ -7,10 +7,26 @@ mod types;
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Vec};
 use types::DataKey;
 pub use types::{
-    AdminTransferred, ScheduleBackup, ScheduleComparison, ScheduleHistoryEntry,
-    ScheduleHistoryPage, SharedScheduleTemplate, SharingPermissions, VestingData, VestingError,
-    VestingOverview, VestingSchedule, SCHEDULE_BACKUP_VERSION,
+    AdminTransferred, OptimizationSuggestion, ScheduleBackup, ScheduleComparison,
+    ScheduleHistoryEntry, ScheduleHistoryPage, SharedScheduleTemplate, SharingPermissions,
+    Suggestions, VestingData, VestingError, VestingOverview, VestingSchedule,
+    SCHEDULE_BACKUP_VERSION,
 };
+
+fn is_locked(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::ScheduleLocked)
+        .unwrap_or(false)
+}
+
+fn require_not_locked(env: &Env) -> Result<(), VestingError> {
+    if is_locked(env) {
+        Err(VestingError::ScheduleIsLocked)
+    } else {
+        Ok(())
+    }
+}
 
 // Persistent-storage TTL: extend to ~60 days if below ~30 days (at ~5 s/ledger).
 const TTL_THRESHOLD: u32 = 518_400;
@@ -84,6 +100,39 @@ fn get_cliff_ledger(env: &Env) -> u32 {
 
 fn get_end_ledger(env: &Env) -> u32 {
     env.storage().instance().get(&DataKey::EndLedger).unwrap()
+}
+
+fn current_schedule(env: &Env) -> VestingSchedule {
+    VestingSchedule {
+        beneficiary: get_beneficiary(env),
+        token: get_token(env),
+        total_amount: get_total_amount(env),
+        start_ledger: get_start_ledger(env),
+        cliff_ledger: get_cliff_ledger(env),
+        end_ledger: get_end_ledger(env),
+        revocable: is_revocable(env),
+    }
+}
+
+fn calculate_vested_amount(
+    current: u32,
+    start: u32,
+    cliff: u32,
+    end: u32,
+    total: i128,
+) -> Result<i128, VestingError> {
+    if current < cliff {
+        return Ok(0);
+    }
+    if current >= end {
+        return Ok(total);
+    }
+
+    total
+        .checked_mul(i128::from(current) - i128::from(start))
+        .ok_or(VestingError::ArithmeticOverflow)?
+        .checked_div(i128::from(end) - i128::from(start))
+        .ok_or(VestingError::ArithmeticOverflow)
 }
 
 fn get_released(env: &Env) -> i128 {
@@ -186,24 +235,13 @@ fn compute_vested(env: &Env) -> Result<i128, VestingError> {
             .unwrap_or(0));
     }
 
-    let current = i128::from(env.ledger().sequence());
-    let cliff = i128::from(get_cliff_ledger(env));
-    let start = i128::from(get_start_ledger(env));
-    let end = i128::from(get_end_ledger(env));
-    let total = get_total_amount(env);
-
-    if current < cliff {
-        return Ok(0);
-    }
-    if current >= end {
-        return Ok(total);
-    }
-
-    total
-        .checked_mul(current - start)
-        .ok_or(VestingError::ArithmeticOverflow)?
-        .checked_div(end - start)
-        .ok_or(VestingError::ArithmeticOverflow)
+    calculate_vested_amount(
+        env.ledger().sequence(),
+        get_start_ledger(env),
+        get_cliff_ledger(env),
+        get_end_ledger(env),
+        get_total_amount(env),
+    )
 }
 
 /// Emit a one-time `vest/cliff_end` event once a real cliff has been reached (#615).
@@ -494,6 +532,7 @@ impl VestingWallet {
     /// funder still receives their unvested tokens.
     pub fn revoke(env: Env) -> Result<(), VestingError> {
         require_initialized(&env)?;
+        require_not_locked(&env)?;
         if !is_revocable(&env) {
             return Err(VestingError::NotRevocable);
         }
@@ -947,6 +986,34 @@ impl VestingWallet {
         Ok(template)
     }
 
+    /// Permanently lock this vesting schedule against admin modifications (#657).
+    ///
+    /// Beneficiary-only. Once locked:
+    /// - `revoke()` returns `ScheduleIsLocked` (the admin can no longer pull
+    ///   back the tokens).
+    /// - `emergency_withdraw()` returns `ScheduleIsLocked`.
+    ///
+    /// Normal beneficiary operations (`release`, `withdraw_early`) are
+    /// unaffected — locking restricts admin-initiated changes only.
+    /// Locking is permanent and cannot be undone.
+    pub fn lock_schedule(env: Env) -> Result<(), VestingError> {
+        require_initialized(&env)?;
+        let beneficiary = get_beneficiary(&env);
+        beneficiary.require_auth();
+        bump_instance(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::ScheduleLocked, &true);
+        Ok(())
+    }
+
+    /// Return whether the schedule has been permanently locked (#657).
+    pub fn is_schedule_locked(env: Env) -> Result<bool, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        Ok(is_locked(&env))
+    }
+
     /// Return the shared schedule template, or `NotInitialized` if none has
     /// been published yet (#648).
     ///
@@ -1019,6 +1086,7 @@ impl VestingWallet {
     /// schedule processing is unavailable.
     pub fn emergency_withdraw(env: Env) -> Result<i128, VestingError> {
         require_initialized(&env)?;
+        require_not_locked(&env)?;
         let admin = get_admin(&env);
         admin.require_auth();
         bump_instance(&env);
@@ -1055,10 +1123,175 @@ impl VestingWallet {
         admin.require_auth();
         bump_instance(&env);
 
+        let old_schedule = current_schedule(&env);
+        let mut new_schedule = old_schedule.clone();
+        new_schedule.beneficiary = new_beneficiary.clone();
         env.storage()
             .instance()
             .set(&DataKey::Beneficiary, &new_beneficiary);
         bump_schedule_version(&env);
+        record_schedule_event(
+            &env,
+            symbol_short!("xfr_ben"),
+            Some(old_schedule.clone()),
+            Some(new_schedule.clone()),
+        );
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("vest"), symbol_short!("ben_xfr")),
+            (old_schedule.beneficiary, new_beneficiary),
+        );
+
+        Ok(())
+    }
+
+    /// Update the vesting dates. The beneficiary, token, amount, and revocability
+    /// remain fixed; already-vested rights cannot be taken away by an update.
+    /// The administrator must authorise the change.
+    pub fn update_vesting_schedule(
+        env: Env,
+        new_schedule: VestingSchedule,
+    ) -> Result<(), VestingError> {
+        require_initialized(&env)?;
+        if is_revoked(&env) {
+            return Err(VestingError::AlreadyRevoked);
+        }
+
+        let admin = get_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+
+        let old_schedule = current_schedule(&env);
+        if new_schedule.beneficiary != old_schedule.beneficiary
+            || new_schedule.token != old_schedule.token
+            || new_schedule.total_amount != old_schedule.total_amount
+            || new_schedule.revocable != old_schedule.revocable
+        {
+            return Err(VestingError::InvalidInput);
+        }
+        if new_schedule.total_amount <= 0
+            || new_schedule.start_ledger > new_schedule.cliff_ledger
+            || new_schedule.cliff_ledger >= new_schedule.end_ledger
+        {
+            return Err(VestingError::InvalidSchedule);
+        }
+
+        let duration = new_schedule.end_ledger - new_schedule.start_ledger;
+        if new_schedule.total_amount > MAX_TOTAL_AMOUNT
+            || new_schedule
+                .total_amount
+                .checked_mul(i128::from(duration))
+                .is_none()
+        {
+            return Err(VestingError::TotalAmountTooLarge);
+        }
+        if i128::from(duration) > i128::from(MAX_VESTING_DURATION_LEDGERS) {
+            return Err(VestingError::InvalidSchedule);
+        }
+
+        let current_vested = compute_vested(&env)?;
+        let new_vested = calculate_vested_amount(
+            env.ledger().sequence(),
+            new_schedule.start_ledger,
+            new_schedule.cliff_ledger,
+            new_schedule.end_ledger,
+            new_schedule.total_amount,
+        )?;
+        if new_vested < current_vested || new_vested < get_released(&env) {
+            return Err(VestingError::InvalidSchedule);
+        }
+
+        let outstanding = new_vested - get_released(&env);
+        let token = token::TokenClient::new(&env, &get_token(&env));
+        if outstanding > token.balance(&env.current_contract_address()) {
+            return Err(VestingError::InsufficientBalance);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::StartLedger, &new_schedule.start_ledger);
+        env.storage()
+            .instance()
+            .set(&DataKey::CliffLedger, &new_schedule.cliff_ledger);
+        env.storage()
+            .instance()
+            .set(&DataKey::EndLedger, &new_schedule.end_ledger);
+        bump_schedule_version(&env);
+        record_schedule_event(
+            &env,
+            symbol_short!("updated"),
+            Some(old_schedule),
+            Some(new_schedule.clone()),
+        );
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("vest"), symbol_short!("sched_upd")),
+            new_schedule,
+        );
+
+        Ok(())
+    }
+
+    /// Accelerate vesting by moving its end ledger earlier. `new_end_time` is
+    /// a ledger sequence (not a Unix timestamp) and may be the current or a
+    /// past ledger later than the cliff to make all remaining tokens vested.
+    pub fn accelerate_vesting(env: Env, new_end_time: u64) -> Result<(), VestingError> {
+        require_initialized(&env)?;
+        if is_revoked(&env) {
+            return Err(VestingError::AlreadyRevoked);
+        }
+
+        let admin = get_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+
+        if new_end_time > u64::from(u32::MAX) {
+            return Err(VestingError::InvalidSchedule);
+        }
+        let new_end_ledger = new_end_time as u32;
+        let old_schedule = current_schedule(&env);
+        if new_end_ledger >= old_schedule.end_ledger
+            || new_end_ledger <= old_schedule.cliff_ledger
+        {
+            return Err(VestingError::InvalidSchedule);
+        }
+
+        let mut new_schedule = old_schedule.clone();
+        new_schedule.end_ledger = new_end_ledger;
+        let new_vested = calculate_vested_amount(
+            env.ledger().sequence(),
+            new_schedule.start_ledger,
+            new_schedule.cliff_ledger,
+            new_schedule.end_ledger,
+            new_schedule.total_amount,
+        )?;
+        if new_vested < get_released(&env) {
+            return Err(VestingError::InvalidSchedule);
+        }
+        let outstanding = new_vested - get_released(&env);
+        let token = token::TokenClient::new(&env, &get_token(&env));
+        if outstanding > token.balance(&env.current_contract_address()) {
+            return Err(VestingError::InsufficientBalance);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EndLedger, &new_end_ledger);
+        bump_schedule_version(&env);
+        record_schedule_event(
+            &env,
+            symbol_short!("accel"),
+            Some(old_schedule),
+            Some(new_schedule.clone()),
+        );
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("vest"), symbol_short!("vest_acc")),
+            new_schedule,
+        );
 
         Ok(())
     }
@@ -1245,9 +1478,6 @@ impl VestingWallet {
 }
 
 mod test;
-
-// Storage key for the cached optimization flag (issue #651).
-const SCHEDULE_OPTIMIZED_KEY: &str = "sched_opt";
 
 impl VestingWallet {
     /// Return a copy of the vesting schedule with any redundant or inefficient
@@ -1440,6 +1670,95 @@ impl VestingWallet {
             cliff_ledger: get_cliff_ledger(&env),
             end_ledger: get_end_ledger(&env),
             revocable: is_revocable(&env),
+        })
+    }
+
+    /// Return optimization suggestions for the vesting schedule (#675).
+    ///
+    /// Analyzes the current schedule and provides recommendations to improve
+    /// efficiency, reduce risk, or better align with best practices. Suggestions
+    /// may include adjusting cliff periods, vesting duration, or total amounts
+    /// based on the schedule's current state and progress.
+    ///
+    /// This is a read-only query that does not modify the schedule.
+    ///
+    /// Returns `NotInitialized` if the wallet has not been initialized.
+    pub fn get_optimization_suggestions(
+        env: Env,
+        schedule: VestingSchedule,
+    ) -> Result<Suggestions, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let mut suggestions: Vec<OptimizationSuggestion> = Vec::new(&env);
+        let current_ledger = env.ledger().sequence();
+        
+        // Calculate duration
+        let duration = schedule.end_ledger - schedule.start_ledger;
+        let cliff_duration = schedule.cliff_ledger - schedule.start_ledger;
+        
+        // Suggest shorter cliff if cliff is more than 50% of duration
+        if cliff_duration > duration / 2 {
+            suggestions.push_back(OptimizationSuggestion {
+                suggestion_type: soroban_sdk::Symbol::new(&env, "cliff"),
+                reason: soroban_sdk::String::from_str(
+                    &env,
+                    "Cliff period is more than 50% of vesting duration",
+                ),
+                current_value: cliff_duration as i128,
+                suggested_value: (duration / 4) as i128,
+            });
+        }
+        
+        // Suggest adjusting if duration is very short (less than 30 days worth of ledgers)
+        // At ~5s per ledger, 30 days ≈ 518,400 ledgers
+        let min_duration = 518_400u32;
+        if duration < min_duration && current_ledger < schedule.start_ledger {
+            suggestions.push_back(OptimizationSuggestion {
+                suggestion_type: soroban_sdk::Symbol::new(&env, "duration"),
+                reason: soroban_sdk::String::from_str(
+                    &env,
+                    "Vesting duration shorter than recommended 30 days",
+                ),
+                current_value: duration as i128,
+                suggested_value: min_duration as i128,
+            });
+        }
+        
+        // Suggest revocability if not set and schedule hasn't started
+        if !schedule.revocable && current_ledger < schedule.start_ledger {
+            suggestions.push_back(OptimizationSuggestion {
+                suggestion_type: soroban_sdk::Symbol::new(&env, "revocable"),
+                reason: soroban_sdk::String::from_str(
+                    &env,
+                    "Consider making schedule revocable for flexibility",
+                ),
+                current_value: 0,
+                suggested_value: 1,
+            });
+        }
+
+        // Suggest consolidating if too many small releases
+        // If vesting period is very long (> 365 days) with small total amount
+        let max_duration = 6_307_200u32; // ~365 days
+        if duration > max_duration / 2 && schedule.total_amount < 1_000_000_000 {
+            suggestions.push_back(OptimizationSuggestion {
+                suggestion_type: soroban_sdk::Symbol::new(&env, "amount"),
+                reason: soroban_sdk::String::from_str(
+                    &env,
+                    "Long vesting period for small amount may incur high fees",
+                ),
+                current_value: schedule.total_amount,
+                suggested_value: schedule.total_amount * 10,
+            });
+        }
+
+        let is_optimal = suggestions.is_empty();
+        
+        Ok(Suggestions {
+            wallet: env.current_contract_address(),
+            suggestions,
+            is_optimal,
         })
     }
 }

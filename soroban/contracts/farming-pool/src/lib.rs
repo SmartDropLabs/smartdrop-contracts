@@ -19,7 +19,8 @@ use types::{
     WhitelistEvent, WhitelistHistoryPage,
 };
 pub use types::{
-    MultiplierBreakdown, MultiplierData, MultiplierOptimization, PoolError, PoolInfo, UserSummary,
+    MultiplierBreakdown, MultiplierData, MultiplierOptimization, PoolError, PoolInfo,
+    Transparency, UserSummary,
 };
 
 // Expose compiled WASM bytes so sibling crates (e.g. `factory`) can upload the
@@ -1707,12 +1708,22 @@ impl FarmingPool {
             return Ok(0);
         };
 
-        let elapsed = env
-            .ledger()
-            .sequence()
-            .saturating_sub(position.checkpoint_ledger);
+        let current_ledger = env.ledger().sequence();
+        let elapsed = current_ledger.saturating_sub(position.checkpoint_ledger);
         let accrued = compute_credits(position.amount, 0, 1, position.credit_rate, elapsed);
-        Ok(position.total_credits + accrued)
+
+        // Apply a 50% lock bonus when the position is still within its lock
+        // period (#607). This aligns the display credit value with the economic
+        // incentive for locking: a user who locks earns more credits per ledger
+        // than one who has already unlocked their position.
+        let is_locked = current_ledger < position.unlock_ledger;
+        let total_raw = position.total_credits + accrued;
+        let total = if is_locked {
+            total_raw + total_raw / 2
+        } else {
+            total_raw
+        };
+        Ok(total)
     }
 
     /// Return current accrued credits for a user's time-locked `Position`.
@@ -2712,6 +2723,66 @@ impl FarmingPool {
         record_admin_action(&env, symbol_short!("mult"), &admin);
 
         Ok(())
+    }
+
+    /// Set the default reward multiplier for new users (#685).
+    ///
+    /// Stores a default multiplier value that can be applied to users when they
+    /// first stake. This provides flexibility for pool operators to configure
+    /// default multipliers without hardcoding them. Admin-only.
+    ///
+    /// # Arguments
+    /// * `multiplier` - The default multiplier value (must be between 1 and MAX_GLOBAL_MULTIPLIER)
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `NotInitialized` - If the pool has not been initialized
+    /// * `InvalidGlobalMultiplier` - If multiplier is out of bounds (< 1 or > MAX_GLOBAL_MULTIPLIER)
+    pub fn set_default_multiplier(env: Env, multiplier: u32) -> Result<(), PoolError> {
+        require_initialized(&env)?;
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        
+        if !(1..=MAX_GLOBAL_MULTIPLIER).contains(&multiplier) {
+            return Err(PoolError::InvalidGlobalMultiplier);
+        }
+        bump_instance(&env);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultMultiplier, &multiplier);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("def_mult")),
+            multiplier,
+        );
+
+        record_admin_action(&env, symbol_short!("def_mult"), &admin);
+
+        Ok(())
+    }
+
+    /// Get the default reward multiplier (#685).
+    ///
+    /// Returns the stored default multiplier value, or `None` if no default
+    /// has been set.
+    ///
+    /// # Returns
+    /// * `Option<u32>` - The default multiplier if set, None otherwise
+    ///
+    /// # Errors
+    /// * `NotInitialized` - If the pool has not been initialized
+    pub fn get_default_multiplier(env: Env) -> Result<Option<u32>, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        Ok(env
+            .storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::DefaultMultiplier))
     }
 
     /// Set the credit accrual rate. Rejects non-positive values and anything
@@ -4191,6 +4262,46 @@ impl FarmingPool {
 mod test;
 
 impl FarmingPool {
+    /// Compound a user's accrued position credits back into their stake (#610).
+    ///
+    /// Reads the caller's current accrued credits via `calculate_credits`,
+    /// banks them onto the position's `total_credits` (checkpointing the
+    /// position to the current ledger), and emits a `compound` event so
+    /// off-chain indexers can observe the operation.
+    ///
+    /// This function does **not** convert credits to tokens — credits are a
+    /// protocol-internal reward unit. It simply re-checkpoints the position so
+    /// future `calculate_credits` calls start from a clean baseline with the
+    /// accrued credits already counted, preventing integer-overflow drift on
+    /// long-running positions.
+    ///
+    /// Returns the total credits after compounding.
+    pub fn compound(env: Env, user: Address) -> Result<i128, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+        user.require_auth();
+
+        let Some(mut position) = get_position(&env, &user) else {
+            return Err(PoolError::NoActivePosition);
+        };
+
+        let current_ledger = env.ledger().sequence();
+        let elapsed = current_ledger.saturating_sub(position.checkpoint_ledger);
+        let accrued = compute_credits(position.amount, 0, 1, position.credit_rate, elapsed);
+
+        // Bank accrued credits and reset checkpoint.
+        position.total_credits = position.total_credits.saturating_add(accrued);
+        position.checkpoint_ledger = current_ledger;
+        set_position(&env, &user, &position);
+
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("compound")),
+            (user, position.total_credits),
+        );
+
+        Ok(position.total_credits)
+    }
+
     /// Return the cached reward multiplier for `user`, recomputing and caching
     /// it if no valid cache entry exists (issue #652).
     ///
@@ -4326,5 +4437,77 @@ impl FarmingPool {
         }
 
         Ok(())
+    }
+
+    /// Return detailed breakdown of multiplier calculation for transparency (#676).
+    ///
+    /// Provides a complete view of how a user's reward multiplier is calculated,
+    /// including all intermediate values and the formula used. This allows users
+    /// to understand exactly how their rewards are computed and verify the
+    /// calculations independently.
+    ///
+    /// Returns `NotInitialized` if the pool has not been initialized.
+    pub fn get_multiplier_transparency(
+        env: Env,
+        user: Address,
+    ) -> Result<Transparency, PoolError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let global_multiplier = read_global_multiplier(&env);
+        let credit_rate = read_credit_rate(&env);
+
+        // Try to get user stake first, then position
+        let (stake_amount, allocation_pct, stake_multiplier, banked_credits) =
+            if let Some(stake) = get_user_stake(&env, &user) {
+                let alloc = get_user_boost(&env, &user).unwrap_or(0);
+                (stake.amount, alloc, stake.multiplier, stake.credits_banked)
+            } else if let Some(position) = get_position(&env, &user) {
+                // Locked positions don't use boost allocation
+                (position.amount, 0, global_multiplier, position.total_credits)
+            } else {
+                // User has no active stake
+                (0, 0, global_multiplier, 0)
+            };
+
+        // Calculate effective stake using the same formula as compute_total_stake
+        let effective_stake = if allocation_pct == 0 {
+            stake_amount
+        } else {
+            let principal = stake_amount * (100 - allocation_pct as i128) / 100;
+            let boosted = stake_amount * (allocation_pct as i128) * (stake_multiplier as i128) / 100;
+            principal + boosted
+        };
+
+        // Calculate credits per ledger
+        let credits_per_ledger = effective_stake
+            .saturating_mul(credit_rate)
+            .saturating_div(1);
+
+        // Build calculation breakdown string
+        let breakdown = if allocation_pct == 0 {
+            soroban_sdk::String::from_str(
+                &env,
+                "stake * credit_rate = credits_per_ledger",
+            )
+        } else {
+            soroban_sdk::String::from_str(
+                &env,
+                "principal + boosted * multiplier * credit_rate = credits_per_ledger",
+            )
+        };
+
+        Ok(Transparency {
+            user,
+            stake_amount,
+            allocation_pct,
+            global_multiplier,
+            stake_multiplier,
+            credit_rate,
+            effective_stake,
+            credits_per_ledger,
+            banked_credits,
+            calculation_breakdown: breakdown,
+        })
     }
 }

@@ -229,6 +229,8 @@ pub enum DataKey {
     MultiplierAuditCount(Address),
     /// User multiplier audit event by index (#679).
     MultiplierAuditHistory(Address, u32),
+    /// Default reward multiplier for users (#685).
+    DefaultMultiplier,
 }
 
 /// Paginated response for `get_whitelisted_users`.
@@ -608,4 +610,34 @@ pub struct LeaderboardEntry {
     pub stake_balance: i128,
     /// Rank position in the leaderboard.
     pub rank: u32,
+}
+
+/// Detailed transparency breakdown of reward multiplier calculations (#676).
+///
+/// Returned by `get_multiplier_transparency` so users can see exactly how
+/// their effective reward rate is computed, including all intermediate values
+/// and the final multiplier applied.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Transparency {
+    /// User's address
+    pub user: Address,
+    /// Raw stake or locked amount
+    pub stake_amount: i128,
+    /// Boost allocation percentage (0-100)
+    pub allocation_pct: u32,
+    /// Global multiplier applied to allocated stake
+    pub global_multiplier: u32,
+    /// Stake multiplier snapshot from user's position
+    pub stake_multiplier: u32,
+    /// Per-ledger credit rate in effect
+    pub credit_rate: i128,
+    /// Effective stake used for credit computation
+    pub effective_stake: i128,
+    /// Credits earned per ledger at current rates
+    pub credits_per_ledger: i128,
+    /// Total banked credits
+    pub banked_credits: i128,
+    /// Formula breakdown as a human-readable string
+    pub calculation_breakdown: soroban_sdk::String,
 }

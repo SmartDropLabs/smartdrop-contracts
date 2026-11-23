@@ -23,11 +23,9 @@ pub enum VestingError {
     /// The vesting schedule is outside the supported limits: it runs for longer
     /// than the maximum vesting duration (365 days of ledgers). See #684.
     InvalidSchedule = 12,
-    /// `lock_schedule` was called but the schedule is already locked (issue #657).
-    ScheduleAlreadyLocked = 13,
-    /// An operation that would modify schedule parameters was attempted on a
-    /// locked schedule (issue #657).
-    ScheduleIsLocked = 14,
+    /// An operation that would modify the schedule was rejected because the
+    /// beneficiary has permanently locked it via `lock_schedule` (#657).
+    ScheduleIsLocked = 13,
 }
 
 /// Storage keys for all instance data in the vesting wallet.
@@ -75,8 +73,7 @@ pub enum DataKey {
     ScheduleHistory(u32),
     /// Publicly shared schedule template set by beneficiary (#648).
     SharedSchedule,
-    /// Set to true once admin calls lock_schedule() — no further parameter
-    /// changes are allowed after this point (issue #657).
+    /// Set to true once the beneficiary permanently locks the schedule (#657).
     ScheduleLocked,
 }
 
@@ -262,4 +259,33 @@ pub struct ScheduleComparison {
     pub faster_vesting: Option<Address>,
     /// Wallet whose cliff ledger is reached first; `None` on a tie.
     pub earlier_unlock: Option<Address>,
+}
+
+/// Optimization suggestion for a vesting schedule (#675).
+///
+/// Provides recommendations for improving schedule efficiency based on
+/// current market conditions and best practices.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptimizationSuggestion {
+    /// Type of optimization suggested
+    pub suggestion_type: soroban_sdk::Symbol,
+    /// Description of the optimization
+    pub reason: soroban_sdk::String,
+    /// Current value
+    pub current_value: i128,
+    /// Suggested value
+    pub suggested_value: i128,
+}
+
+/// Response containing optimization suggestions for a vesting schedule (#675).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Suggestions {
+    /// Address of the vesting wallet
+    pub wallet: Address,
+    /// List of optimization suggestions
+    pub suggestions: Vec<OptimizationSuggestion>,
+    /// Whether the schedule is already optimal
+    pub is_optimal: bool,
 }
