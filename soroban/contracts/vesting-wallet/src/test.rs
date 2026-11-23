@@ -1586,3 +1586,141 @@ fn test_compare_schedules_rejects_same_wallet_and_non_wallets() {
         Err(Ok(VestingError::InvalidInput))
     );
 }
+
+// ── Issue #657: lock_schedule prevents further modifications ──────────────────
+
+#[test]
+fn test_lock_schedule_sets_locked_flag() {
+    let w = setup_schedule(0, 1_000, 1_000, false);
+    assert_eq!(w.client.is_schedule_locked(), false);
+    w.client.lock_schedule();
+    assert_eq!(w.client.is_schedule_locked(), true);
+}
+
+#[test]
+fn test_lock_schedule_idempotent_error_on_second_call() {
+    let w = setup_schedule(0, 1_000, 1_000, false);
+    w.client.lock_schedule();
+    assert_eq!(
+        w.client.try_lock_schedule(),
+        Err(Ok(VestingError::ScheduleAlreadyLocked)),
+    );
+}
+
+#[test]
+fn test_lock_schedule_emits_locked_event() {
+    use soroban_sdk::{symbol_short, testutils::Events, IntoVal};
+
+    let w = setup_schedule(0, 1_000, 1_000, false);
+    w.client.lock_schedule();
+
+    let events = w.env.events().all();
+    let matched = events.iter().any(|(_, topics, _)| {
+        topics
+            == soroban_sdk::vec![
+                &w.env,
+                symbol_short!("vest").into_val(&w.env),
+                symbol_short!("locked").into_val(&w.env),
+            ]
+    });
+    assert!(matched, "vest/locked event was not published");
+}
+
+// ── Issue #642: vesting schedule parameters are validated on initialize ────────
+
+#[test]
+fn test_initialize_rejects_start_in_past() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin.clone());
+    soroban_sdk::token::StellarAssetClient::new(&env, &asset.address()).mint(&admin, &1_000i128);
+
+    let start = env.ledger().sequence();
+    // Advance so start is in the past.
+    advance_ledgers(&env, 10);
+
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    // Should panic with "start must be in the future"
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.initialize(
+            &beneficiary,
+            &asset.address(),
+            &1_000i128,
+            &start,       // in the past
+            &start,
+            &(start + 100),
+            &false,
+            &admin,
+        );
+    }));
+    assert!(result.is_err(), "expected panic for past start_ledger");
+}
+
+#[test]
+fn test_initialize_rejects_end_not_after_cliff() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin.clone());
+    soroban_sdk::token::StellarAssetClient::new(&env, &asset.address()).mint(&admin, &1_000i128);
+
+    let start = env.ledger().sequence();
+    let cliff = start + 100;
+    let end = cliff; // end == cliff, not strictly after
+
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.initialize(
+            &beneficiary,
+            &asset.address(),
+            &1_000i128,
+            &start,
+            &cliff,
+            &end,
+            &false,
+            &admin,
+        );
+    }));
+    assert!(result.is_err(), "expected panic for end_ledger == cliff_ledger");
+}
+
+#[test]
+fn test_initialize_rejects_schedule_exceeding_max_duration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin.clone());
+    soroban_sdk::token::StellarAssetClient::new(&env, &asset.address()).mint(&admin, &1_000i128);
+
+    let start = env.ledger().sequence();
+    // MAX_VESTING_DURATION_LEDGERS = 365 * 24 * 3600 / 5 = 6_307_200
+    let too_long_end = start + 6_307_201u32;
+
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    assert_eq!(
+        client.try_initialize(
+            &beneficiary,
+            &asset.address(),
+            &1_000i128,
+            &start,
+            &start,
+            &too_long_end,
+            &false,
+            &admin,
+        ),
+        Err(Ok(VestingError::InvalidSchedule)),
+    );
+}
