@@ -229,6 +229,8 @@ pub enum DataKey {
     MultiplierAuditCount(Address),
     /// User multiplier audit event by index (#679).
     MultiplierAuditHistory(Address, u32),
+    /// Default reward multiplier for users (#685).
+    DefaultMultiplier,
 }
 
 /// Paginated response for `get_whitelisted_users`.

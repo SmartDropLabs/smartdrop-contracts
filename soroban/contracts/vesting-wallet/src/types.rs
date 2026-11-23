@@ -23,6 +23,9 @@ pub enum VestingError {
     /// The vesting schedule is outside the supported limits: it runs for longer
     /// than the maximum vesting duration (365 days of ledgers). See #684.
     InvalidSchedule = 12,
+    /// An operation that would modify the schedule was rejected because the
+    /// beneficiary has permanently locked it via `lock_schedule` (#657).
+    ScheduleIsLocked = 13,
 }
 
 /// Storage keys for all instance data in the vesting wallet.
@@ -70,6 +73,8 @@ pub enum DataKey {
     ScheduleHistory(u32),
     /// Publicly shared schedule template set by beneficiary (#648).
     SharedSchedule,
+    /// Set to true once the beneficiary permanently locks the schedule (#657).
+    ScheduleLocked,
 }
 
 /// Emitted when admin rights are transferred.

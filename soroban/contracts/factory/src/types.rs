@@ -351,6 +351,9 @@ pub enum FactoryError {
     /// `set_pool_dependencies` was called with more entries than
     /// `MAX_POOL_DEPENDENCIES`.
     TooManyDependencies = 29,
+    /// Pool configuration exceeds limits (e.g., reward_rate > MAX_REWARD_RATE).
+    /// See #683.
+    InvalidConfig = 30,
 }
 
 /// Point-in-time snapshot of a pool's state (#647).
@@ -395,4 +398,14 @@ pub struct PoolConfigChangeEntry {
 pub struct PoolConfigHistoryPage {
     pub events: Vec<PoolConfigChangeEntry>,
     pub total: u32,
+}
+
+/// Default pool configuration for creating pools (#686).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DefaultPoolConfig {
+    pub daily_rate: u128,
+    pub global_multiplier: u32,
+    pub min_lock_period: u64,
+    pub min_stake_amount: i128,
 }
