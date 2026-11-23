@@ -9,7 +9,7 @@ use soroban_sdk::{
 use types::{
     ConfigSuggestion, DataKey, ListPoolsResponse, OptimizationKind, PoolComparison,
     PoolConfigChangeEntry, PoolConfigHistoryPage, PoolRecord, PoolSort, PoolStatus,
-    RefreshPoolTtlsResponse,
+    RefreshPoolTtlsResponse, Snapshot,
 };
 
 pub use types::{ConfigComparison, ConfigSuggestions};
@@ -2385,15 +2385,25 @@ impl Factory {
         validate_factory_admin(&env, &admin)?;
         admin.require_auth();
 
-        create_pool_inner(
-            env,
+        // Emit a `pool_fail` event when validation fails so indexers can observe
+        // rejected creation attempts without having to parse error codes from
+        // the transaction's diagnostic events (#606).
+        let result = create_pool_inner(
+            env.clone(),
             admin,
             asset,
             daily_rate,
             global_multiplier,
             min_lock_period,
             min_stake_amount,
-        )
+        );
+        if let Err(ref e) = result {
+            env.events().publish(
+                (symbol_short!("factory"), symbol_short!("pool_fail")),
+                *e as u32,
+            );
+        }
+        result
     }
 
     /// Register an externally-deployed farming pool with the factory (#665).
