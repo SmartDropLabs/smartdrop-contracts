@@ -19,6 +19,7 @@ pub use types::DependencyGraph;
 pub use types::FactoryError;
 pub use types::HealthStatus;
 pub use types::PoolParams;
+pub use types::{PoolMetrics, Snapshot};
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
 const TTL_THRESHOLD: u32 = 518_400;
@@ -2708,6 +2709,93 @@ impl Factory {
     /// * `NotInitialized` - If the factory has not been initialized
     /// * `PoolCreationPaused` - If pool creation is currently paused
     /// * Various validation errors if the configuration is invalid
+    /// Captures and stores a point-in-time snapshot of a pool's state (#647).
+    ///
+    /// Snapshots record TVL, global multiplier, credit rate, and deprecation
+    /// status at the current ledger so they can be replayed for analytics or
+    /// incident review without re-querying historical on-chain state.
+    ///
+    /// Returns `NotInitialized` or `PoolNotFound` on the usual error paths.
+    pub fn take_snapshot(env: Env, pool_id: u32) -> Result<Snapshot, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        let tvl = read_pool_tvl(&env, pool_id);
+        let ledger = env.ledger().sequence();
+
+        let snapshot = Snapshot {
+            pool_id,
+            ledger,
+            tvl,
+            global_multiplier: record.global_multiplier,
+            credit_rate: record.credit_rate,
+            deprecated: record.deprecated,
+        };
+
+        let count = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::PoolSnapshotCount(pool_id))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolSnapshot(pool_id, count), &snapshot);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolSnapshotCount(pool_id), &(count + 1));
+
+        Ok(snapshot)
+    }
+
+    /// Returns aggregated metrics for a pool, including live TVL, snapshot
+    /// count, and the ledger of the most recent snapshot (#650).
+    ///
+    /// Returns `NotInitialized` or `PoolNotFound` on the usual error paths.
+    pub fn get_pool_metrics(env: Env, pool_id: u32) -> Result<PoolMetrics, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        let tvl = read_pool_tvl(&env, pool_id);
+        let snapshot_count = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::PoolSnapshotCount(pool_id))
+            .unwrap_or(0);
+        let last_snapshot_ledger = if snapshot_count > 0 {
+            env.storage()
+                .persistent()
+                .get::<DataKey, Snapshot>(&DataKey::PoolSnapshot(pool_id, snapshot_count - 1))
+                .map(|s| s.ledger)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        Ok(PoolMetrics {
+            pool_id,
+            tvl,
+            snapshot_count,
+            last_snapshot_ledger,
+            global_multiplier: record.global_multiplier,
+            credit_rate: record.credit_rate,
+            deprecated: record.deprecated,
+        })
+    }
+
     pub fn import_config(env: Env, config: PoolRecord) -> Result<u32, FactoryError> {
         require_initialized(&env)?;
         let admin = load_admin(&env)?;
