@@ -591,6 +591,52 @@ impl VestingWallet {
         Ok(())
     }
 
+    /// Lock the vesting schedule so that its core parameters (amounts, ledger
+    /// boundaries, revocability) can never be changed again (issue #657).
+    ///
+    /// Once locked, any call to `revoke` on a non-revocable wallet, or any
+    /// future schedule-modification path, will return `ScheduleIsLocked`.
+    /// Locking is **irreversible** — there is intentionally no `unlock_schedule`.
+    ///
+    /// Only the admin may lock; calling twice returns `ScheduleAlreadyLocked`.
+    pub fn lock_schedule(env: Env) -> Result<(), VestingError> {
+        require_initialized(&env)?;
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::ScheduleLocked)
+            .unwrap_or(false)
+        {
+            return Err(VestingError::ScheduleAlreadyLocked);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        bump_instance(&env);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ScheduleLocked, &true);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("vest"), symbol_short!("locked")),
+            get_beneficiary(&env),
+        );
+
+        bump_schedule_version(&env);
+        Ok(())
+    }
+
+    /// Return `true` if the admin has called `lock_schedule` on this wallet.
+    pub fn is_schedule_locked(env: Env) -> Result<bool, VestingError> {
+        require_initialized(&env)?;
+        Ok(env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::ScheduleLocked)
+            .unwrap_or(false))
+    }
+
     /// Claim every currently-vested token in a single call.
     ///
     /// Convenience wrapper over {@link VestingWallet::release}, which already

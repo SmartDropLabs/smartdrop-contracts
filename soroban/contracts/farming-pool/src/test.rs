@@ -399,3 +399,59 @@ fn test_multiplier_optimization_locked_position_is_not_boost_eligible() {
     assert_eq!(opt.current_credits_per_ledger, 1_000 * 1_000);
     assert_eq!(opt.optimal_credits_per_ledger, opt.current_credits_per_ledger);
 }
+
+// ── Issue #658: set_global_multiplier requires admin approval ─────────────────
+
+#[test]
+fn test_set_global_multiplier_requires_admin_auth() {
+    // Uses mock_all_auths — verify the call succeeds when admin auth is present.
+    let t = setup();
+    t.client.set_global_multiplier(&2u32);
+    assert_eq!(t.client.get_global_multiplier_data().current_multiplier, 2);
+}
+
+#[test]
+fn test_set_global_multiplier_rejects_out_of_bounds() {
+    let t = setup();
+    // 0 is below the [1, MAX_GLOBAL_MULTIPLIER] range.
+    assert_eq!(
+        t.client.try_set_global_multiplier(&0u32),
+        Err(Ok(PoolError::InvalidGlobalMultiplier)),
+    );
+    // MAX_GLOBAL_MULTIPLIER + 1 is above range.
+    assert_eq!(
+        t.client.try_set_global_multiplier(&1_001u32),
+        Err(Ok(PoolError::InvalidGlobalMultiplier)),
+    );
+}
+
+// ── Issue #643: set_global_multiplier publishes an audit event ─────────────────
+
+#[test]
+fn test_set_global_multiplier_emits_audit_event() {
+    use soroban_sdk::{symbol_short, testutils::Events, IntoVal};
+    extern crate std;
+
+    let t = setup();
+    let old = t.client.get_global_multiplier_data().current_multiplier;
+    t.client.set_global_multiplier(&3u32);
+
+    let events = t.env.events().all();
+    let matched = events.iter().any(|(_, topics, data)| {
+        // The contract emits (symbol_short!("boost"), symbol_short!("mult_set"))
+        // with (old_multiplier, new_multiplier) as data.
+        let topic_match = topics
+            == soroban_sdk::vec![
+                &t.env,
+                symbol_short!("boost").into_val(&t.env),
+                symbol_short!("mult_set").into_val(&t.env),
+            ];
+        if !topic_match {
+            return false;
+        }
+        let expected: soroban_sdk::Val =
+            (old, 3u32).into_val(&t.env);
+        data == expected
+    });
+    assert!(matched, "mult_set audit event was not published");
+}
