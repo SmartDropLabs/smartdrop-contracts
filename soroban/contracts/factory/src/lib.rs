@@ -3,13 +3,13 @@
 mod types;
 
 use soroban_sdk::{
-    contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, String, Symbol, Val,
-    Vec,
+    contract, contractimpl, symbol_short, vec, Address, Bytes, BytesN, Env, IntoVal, String,
+    Symbol, Val, Vec,
 };
 use types::{
     ConfigSuggestion, DataKey, ListPoolsResponse, OptimizationKind, PoolComparison,
-    PoolConfigChangeEntry, PoolConfigHistoryPage, PoolRecord, PoolSort, PoolStatus,
-    RefreshPoolTtlsResponse,
+    PoolConfigChangeEntry, PoolConfigHistoryPage, PoolMetadata, PoolRecord, PoolSort, PoolStatus,
+    RefreshPoolTtlsResponse, MAX_POOL_DESCRIPTION_LEN, MAX_POOL_NAME_LEN,
 };
 
 pub use types::{ConfigComparison, ConfigSuggestions};
@@ -18,7 +18,7 @@ pub use types::DependencyGraph;
 pub use types::FactoryError;
 pub use types::HealthStatus;
 pub use types::PoolParams;
-pub use types::{PoolMetrics, Snapshot};
+pub use types::{PoolMetadata, PoolMetrics, Snapshot};
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
 const TTL_THRESHOLD: u32 = 518_400;
@@ -1136,6 +1136,72 @@ impl Factory {
             .unwrap_or_else(|| vec![&env]);
         bump_pool_dependencies(&env, pool_id);
         Ok(deps)
+    }
+
+    /// Attach human-readable metadata to an existing pool (#641).
+    ///
+    /// `name` must be 1–64 bytes; `description` may be empty but must not
+    /// exceed 256 bytes.  Returns `InvalidMetadata` if either constraint is
+    /// violated, `PoolNotFound` if the pool does not exist.  Admin auth is
+    /// required.
+    pub fn set_pool_metadata(
+        env: Env,
+        pool_id: u32,
+        name: Bytes,
+        description: Bytes,
+    ) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        // Reject the call before any storage touch if the pool does not exist.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Pool(pool_id))
+        {
+            return Err(FactoryError::PoolNotFound);
+        }
+
+        if name.len() == 0 || name.len() > MAX_POOL_NAME_LEN {
+            return Err(FactoryError::InvalidMetadata);
+        }
+        if description.len() > MAX_POOL_DESCRIPTION_LEN {
+            return Err(FactoryError::InvalidMetadata);
+        }
+
+        let metadata = PoolMetadata { name, description };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolMetadata(pool_id), &metadata);
+
+        Ok(())
+    }
+
+    /// Return the metadata attached to `pool_id` via `set_pool_metadata` (#641).
+    ///
+    /// Returns `None` when no metadata has been set, `PoolNotFound` when the
+    /// pool does not exist.
+    pub fn get_pool_metadata(
+        env: Env,
+        pool_id: u32,
+    ) -> Result<Option<PoolMetadata>, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Pool(pool_id))
+        {
+            return Err(FactoryError::PoolNotFound);
+        }
+
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolMetadata(pool_id)))
     }
 
     /// Return the full pool dependency graph (#668).

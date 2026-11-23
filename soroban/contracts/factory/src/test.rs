@@ -2621,3 +2621,76 @@ fn test_config_optimization_deprecated_pool_only_suggests_migration() {
     assert_eq!(opt.suggestions.get(0).unwrap().kind, OptimizationKind::MigrateDeprecated);
     assert_eq!(client.try_get_config_optimization(&5u32), Err(Ok(FactoryError::PoolNotFound)));
 }
+
+// ── Pool metadata (#641) ──────────────────────────────────────────────────────
+
+#[test]
+fn test_set_pool_metadata_stores_and_retrieves() {
+    let t = TestEnv::new();
+    let id = t.client.create_pool(&test_asset(&t.env), &1_728_000u128, &2u32, &10u64, &0i128);
+
+    let name = soroban_sdk::Bytes::from_slice(&t.env, b"My Pool");
+    let desc = soroban_sdk::Bytes::from_slice(&t.env, b"A test pool");
+    t.client.set_pool_metadata(&id, &name, &desc);
+
+    let meta = t.client.get_pool_metadata(&id).unwrap();
+    assert_eq!(meta.name, name);
+    assert_eq!(meta.description, desc);
+}
+
+#[test]
+fn test_set_pool_metadata_rejects_empty_name() {
+    let t = TestEnv::new();
+    let id = t.client.create_pool(&test_asset(&t.env), &1_728_000u128, &2u32, &10u64, &0i128);
+
+    let empty = soroban_sdk::Bytes::new(&t.env);
+    let desc = soroban_sdk::Bytes::from_slice(&t.env, b"desc");
+    assert_eq!(
+        t.client.try_set_pool_metadata(&id, &empty, &desc),
+        Err(Ok(FactoryError::InvalidMetadata)),
+    );
+}
+
+#[test]
+fn test_set_pool_metadata_rejects_name_too_long() {
+    let t = TestEnv::new();
+    let id = t.client.create_pool(&test_asset(&t.env), &1_728_000u128, &2u32, &10u64, &0i128);
+
+    // 65 bytes — one over the 64-byte limit.
+    let long_name = soroban_sdk::Bytes::from_slice(&t.env, &[b'x'; 65]);
+    let desc = soroban_sdk::Bytes::new(&t.env);
+    assert_eq!(
+        t.client.try_set_pool_metadata(&id, &long_name, &desc),
+        Err(Ok(FactoryError::InvalidMetadata)),
+    );
+}
+
+#[test]
+fn test_set_pool_metadata_rejects_description_too_long() {
+    let t = TestEnv::new();
+    let id = t.client.create_pool(&test_asset(&t.env), &1_728_000u128, &2u32, &10u64, &0i128);
+
+    let name = soroban_sdk::Bytes::from_slice(&t.env, b"name");
+    // 257 bytes — one over the 256-byte limit.
+    let long_desc = soroban_sdk::Bytes::from_slice(&t.env, &[b'd'; 257]);
+    assert_eq!(
+        t.client.try_set_pool_metadata(&id, &name, &long_desc),
+        Err(Ok(FactoryError::InvalidMetadata)),
+    );
+}
+
+#[test]
+fn test_get_pool_metadata_returns_none_before_set() {
+    let t = TestEnv::new();
+    let id = t.client.create_pool(&test_asset(&t.env), &1_728_000u128, &2u32, &10u64, &0i128);
+    assert_eq!(t.client.get_pool_metadata(&id), None);
+}
+
+#[test]
+fn test_get_pool_metadata_returns_pool_not_found_for_unknown_pool() {
+    let t = TestEnv::new();
+    assert_eq!(
+        t.client.try_get_pool_metadata(&999u32),
+        Err(Ok(FactoryError::PoolNotFound)),
+    );
+}

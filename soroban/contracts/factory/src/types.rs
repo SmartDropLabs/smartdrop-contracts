@@ -79,6 +79,8 @@ pub enum DataKey {
     PoolSnapshotCount(u32),
     /// A snapshot entry by (pool_id, snapshot_index) (#647).
     PoolSnapshot(u32, u32),
+    /// Optional human-readable metadata for a pool, keyed by pool ID (#641).
+    PoolMetadata(u32),
 }
 
 /// On-chain record for a registered farming pool.
@@ -351,6 +353,9 @@ pub enum FactoryError {
     /// `set_pool_dependencies` was called with more entries than
     /// `MAX_POOL_DEPENDENCIES`.
     TooManyDependencies = 29,
+    /// `set_pool_metadata` was called with an empty or oversized name string.
+    /// A pool name must be 1–64 bytes of valid UTF-8 (#641).
+    InvalidMetadata = 30,
 }
 
 /// Point-in-time snapshot of a pool's state (#647).
@@ -396,3 +401,20 @@ pub struct PoolConfigHistoryPage {
     pub events: Vec<PoolConfigChangeEntry>,
     pub total: u32,
 }
+
+/// Optional human-readable metadata attached to a pool via `set_pool_metadata` (#641).
+///
+/// Name is mandatory and must be 1–64 bytes. Description is optional and may
+/// be up to 256 bytes. Neither field is interpreted on-chain; they exist for
+/// off-chain tooling and dashboards.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolMetadata {
+    pub name: soroban_sdk::Bytes,
+    pub description: soroban_sdk::Bytes,
+}
+
+/// Maximum byte-length of a pool name passed to `set_pool_metadata` (#641).
+pub const MAX_POOL_NAME_LEN: u32 = 64;
+/// Maximum byte-length of a pool description passed to `set_pool_metadata` (#641).
+pub const MAX_POOL_DESCRIPTION_LEN: u32 = 256;
