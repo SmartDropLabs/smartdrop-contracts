@@ -77,13 +77,17 @@ clients already decoding it keep working. New consumers should prefer
 | `revoke()` | `admin` | Only when `revocable` and not already revoked. |
 | `emergency_withdraw()` | `admin` | Break-glass: drains the raw balance and marks the schedule revoked. |
 | `transfer_beneficiary(...)` | `admin` | Rejects the zero address. |
+| `update_vesting_schedule(...)` | `admin` | Changes ledger dates only; cannot reduce vested rights or change the beneficiary, token, amount, or revocability. |
+| `accelerate_vesting(new_end_time)` | `admin` | Moves the end earlier while keeping it after the cliff; the argument is a ledger sequence, not a Unix timestamp. |
 | `transfer_admin(...)` | `admin` | Current admin only. |
 
 ### Schedule limits
 
 `initialize` (and `import_vesting`, which calls it) bounds the schedule so a mistake cannot
-lock funds for an unreasonable time. Funds are pulled in at initialisation and the schedule
-cannot be changed afterwards, so the check happens before anything is stored or transferred.
+lock funds for an unreasonable time. `update_vesting_schedule` applies the same duration and
+arithmetic limits to date changes. The schedule's beneficiary, token, amount, and revocability
+cannot be changed through that entry point; updates also cannot reduce the amount already vested
+or make the vested-but-unreleased amount exceed the wallet balance.
 
 | Limit | Value | Error |
 | :--- | :--- | :--- |
@@ -96,6 +100,8 @@ cannot be changed afterwards, so the check happens before anything is stored or 
 - If both limits are broken, `TotalAmountTooLarge` is reported.
 - A rejected `initialize` changes nothing: the wallet stays uninitialised and no tokens move,
   so it can be initialised again with a valid schedule.
+- `accelerate_vesting` accepts only an end ledger earlier than the current end and later than the
+  cliff. An end ledger at or before the current ledger makes the remaining amount immediately vested.
 - Before this limit a schedule could run for up to `u32::MAX` ledgers (over 600 years). Any
   schedule longer than 365 days must now be split or shortened.
 - The other ordering rules are unchanged: `start_ledger` in the future, `cliff_ledger >=
@@ -196,6 +202,19 @@ Emitted by `transfer_admin`.
 | :--- | :--- | :--- |
 | `old_admin` | `Address` | The outgoing administrator. |
 | `new_admin` | `Address` | The incoming administrator. |
+
+### `ben_xfr`
+
+Emitted when the administrator transfers beneficiary rights.
+
+* **Topics:** `(Symbol, Symbol)` -> `(symbol_short!("vest"), symbol_short!("ben_xfr"))`
+* **Payload:** `(old_beneficiary: Address, new_beneficiary: Address)`
+
+### `sched_upd` and `vest_acc`
+
+Emitted after a successful vesting-date update or acceleration, respectively. Both carry the
+resulting `VestingSchedule` as the payload. The corresponding change is also recorded in schedule
+history as `updated` or `accel`.
 
 ## Errors
 

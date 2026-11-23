@@ -240,6 +240,24 @@ Emitted once when a schedule with a real cliff (`cliff_ledger > start_ledger`) f
 | `beneficiary` | `Address` | The schedule's beneficiary. |
 | `timestamp` | `u64` | Ledger timestamp at the moment the cliff was detected. |
 
+### `ben_xfr`
+Emitted when the administrator transfers beneficiary rights.
+
+* **Topics:** `(Symbol, Symbol)` -> `(symbol_short!("vest"), symbol_short!("ben_xfr"))`
+* **Payload Structure (tuple order):**
+
+| Field | Rust Type | Description |
+| :--- | :--- | :--- |
+| `old_beneficiary` | `Address` | Beneficiary before the transfer. |
+| `new_beneficiary` | `Address` | Beneficiary after the transfer. |
+
+### `sched_upd` and `vest_acc`
+Emitted after a successful vesting-date update or acceleration, respectively. Both carry the
+resulting `VestingSchedule` as the payload.
+
+* **Topics:** `(Symbol, Symbol)` -> `(symbol_short!("vest"), symbol_short!("sched_upd"))` or `(symbol_short!("vest"), symbol_short!("vest_acc"))`
+* **Payload:** `VestingSchedule`
+
 See [`vesting-api.md`](vesting-api.md) for the full VestingWallet entry-point reference.
 
 ### `revoked`

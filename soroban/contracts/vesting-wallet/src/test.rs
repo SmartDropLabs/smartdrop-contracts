@@ -792,6 +792,58 @@ fn test_beneficiary_getter_tracks_transfer_beneficiary() {
 }
 
 #[test]
+fn test_update_vesting_schedule_changes_dates_without_reducing_vested_amount() {
+    let t = setup(0, 200, 1_000);
+    let mut schedule = t.client.get_vesting_schedule();
+    schedule.end_ledger = t.start + 100;
+
+    t.client.update_vesting_schedule(&schedule);
+
+    let updated = t.client.get_vesting_schedule();
+    assert_eq!(updated.end_ledger, t.start + 100);
+    assert_eq!(t.client.schedule_version(), 2);
+}
+
+#[test]
+fn test_update_vesting_schedule_rejects_reducing_already_vested_amount() {
+    let t = setup(0, 200, 1_000);
+    advance_ledgers(&t.env, 50);
+    let mut schedule = t.client.get_vesting_schedule();
+    schedule.end_ledger = t.start + 300;
+
+    assert_eq!(
+        t.client.try_update_vesting_schedule(&schedule),
+        Err(Ok(VestingError::InvalidSchedule))
+    );
+    assert_eq!(t.client.get_vesting_schedule().end_ledger, t.start + 200);
+}
+
+#[test]
+fn test_accelerate_vesting_shortens_end_ledger_and_increases_vested_amount() {
+    let t = setup(0, 200, 1_000);
+    advance_ledgers(&t.env, 50);
+
+    t.client.accelerate_vesting(&u64::from(t.start + 100));
+
+    assert_eq!(
+        t.client.get_vesting_schedule().end_ledger,
+        t.start + 100
+    );
+    assert_eq!(t.client.vested_amount(), 500);
+}
+
+#[test]
+fn test_accelerate_vesting_rejects_non_accelerating_end_ledger() {
+    let t = setup(0, 200, 1_000);
+
+    assert_eq!(
+        t.client
+            .try_accelerate_vesting(&u64::from(t.start + 200)),
+        Err(Ok(VestingError::InvalidSchedule))
+    );
+}
+
+#[test]
 fn test_beneficiary_uninitialized_returns_not_initialized() {
     let env = Env::default();
     env.mock_all_auths();
