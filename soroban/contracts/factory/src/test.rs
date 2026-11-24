@@ -2714,3 +2714,64 @@ fn test_get_config_history_returns_paginated_entries() {
     assert_eq!(page.events.get(0).unwrap().action, symbol_short!("deprecate"));
     assert!(page.events.get(0).unwrap().new_config.unwrap().deprecated);
 }
+
+// ── Issue #695: restore_config ────────────────────────────────────────────────
+
+#[test]
+fn test_restore_config_restores_exported_backup_and_records_history() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let initial = risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, false);
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &[(initial.clone(), 1_000_000i128, 0i128)]);
+
+    // Take a backup via export_config, then mutate state (deprecate pool).
+    let backup = client.export_config(&0u32);
+    client.deprecate_pool(&0u32);
+    assert!(client.get_pool(&0u32).deprecated);
+
+    // Restore from backup.
+    client.restore_config(&0u32, &backup);
+    let restored = client.get_pool(&0u32);
+    assert_eq!(restored, initial);
+    assert!(!restored.deprecated);
+
+    // Verify restoration was recorded in pool configuration history.
+    let history = client.get_config_history(&0u32, &0u32, &10u32);
+    assert_eq!(history.total, 2);
+    let last_event = history.events.get(1).unwrap();
+    assert_eq!(last_event.action, symbol_short!("restored"));
+    assert!(last_event.old_config.unwrap().deprecated);
+    assert!(!last_event.new_config.unwrap().deprecated);
+}
+
+#[test]
+fn test_restore_config_rejects_invalid_backup_and_missing_pool() {
+    let (_env, uninitialized) = setup_uninitialized();
+    let dummy_env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&dummy_env);
+    let valid_record = risk_pool_record(&dummy_env, &wasm_hash, 1_000_000, 30 * 17_280, false);
+    assert_eq!(
+        uninitialized.try_restore_config(&0u32, &valid_record),
+        Err(Ok(FactoryError::NotInitialized))
+    );
+
+    let (client, _) = setup_risk_fixture(&dummy_env, &wasm_hash, &[(valid_record.clone(), 0i128, 0i128)]);
+    assert_eq!(
+        client.try_restore_config(&99u32, &valid_record),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
+
+    let mut bad_multiplier = valid_record.clone();
+    bad_multiplier.global_multiplier = 0;
+    assert_eq!(
+        client.try_restore_config(&0u32, &bad_multiplier),
+        Err(Ok(FactoryError::InvalidGlobalMultiplier))
+    );
+
+    let mut bad_wasm = valid_record.clone();
+    bad_wasm.wasm_hash = BytesN::from_array(&dummy_env, &[0u8; 32]);
+    assert_eq!(
+        client.try_restore_config(&0u32, &bad_wasm),
+        Err(Ok(FactoryError::InvalidWasmHash))
+    );
+}
