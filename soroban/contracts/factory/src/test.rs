@@ -2673,3 +2673,44 @@ fn test_config_optimization_deprecated_pool_only_suggests_migration() {
     assert_eq!(opt.suggestions.get(0).unwrap().kind, OptimizationKind::MigrateDeprecated);
     assert_eq!(client.try_get_config_optimization(&5u32), Err(Ok(FactoryError::PoolNotFound)));
 }
+
+// ── Issue #707: get_config_history ────────────────────────────────────────────
+
+#[test]
+fn test_get_config_history_rejects_uninitialized_and_missing_pool() {
+    let (_env, uninitialized) = setup_uninitialized();
+    assert_eq!(
+        uninitialized.try_get_config_history(&0u32, &0u32, &10u32),
+        Err(Ok(FactoryError::NotInitialized))
+    );
+
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &[]);
+    assert_eq!(
+        client.try_get_config_history(&99u32, &0u32, &10u32),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
+}
+
+#[test]
+fn test_get_config_history_returns_paginated_entries() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let record = risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, false);
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &[(record, 1_000_000i128, 0i128)]);
+
+    // Initially empty when no history entries have been recorded yet.
+    let empty = client.get_config_history(&0u32, &0u32, &10u32);
+    assert_eq!(empty.total, 0);
+    assert_eq!(empty.events.len(), 0);
+
+    // Deprecating the pool records a configuration change entry.
+    client.deprecate_pool(&0u32);
+    let page = client.get_config_history(&0u32, &0u32, &10u32);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events.get(0).unwrap().pool_id, 0);
+    assert_eq!(page.events.get(0).unwrap().action, symbol_short!("deprecate"));
+    assert!(page.events.get(0).unwrap().new_config.unwrap().deprecated);
+}

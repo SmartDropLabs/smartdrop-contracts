@@ -2785,6 +2785,31 @@ impl Factory {
         Ok(PoolConfigHistoryPage { events, total })
     }
 
+    /// Returns the configuration change history for a pool (issue #707).
+    ///
+    /// Provides a paginated list of all configuration change events for the
+    /// specified pool in chronological order.
+    ///
+    /// ## Arguments
+    /// * `pool_id` - The pool ID to query
+    /// * `start` - Zero-based index to start reading from
+    /// * `limit` - Maximum number of events to return
+    ///
+    /// ## Returns
+    /// * `PoolConfigHistoryPage` containing the events and total count
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    /// * `PoolNotFound` - If no pool with the given ID exists
+    pub fn get_config_history(
+        env: Env,
+        pool_id: u32,
+        start: u32,
+        limit: u32,
+    ) -> Result<PoolConfigHistoryPage, FactoryError> {
+        Self::get_pool_config_history(env, pool_id, start, limit)
+    }
+
     /// Export the pool configuration for a specific pool (issue #698).
     ///
     /// Returns the complete pool configuration data for external use or backup.
