@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address, BytesN, Vec};
+use soroban_sdk::{contracterror, contracttype, Address, BytesN, String, Vec};
 
 /// Health status returned by `check_pool_health` (issue #653).
 #[contracttype]
@@ -10,6 +10,20 @@ pub enum HealthStatus {
     Degraded,
     /// Pool is deprecated and no longer accepting new stakes.
     Deprecated,
+}
+
+/// Optional metadata attached to a pool at creation time.
+///
+/// Callers may supply a human-readable name and description for display in
+/// dashboards and indexers. The name must be non-empty; the description is
+/// optional. Both fields are advisory only and do not affect pool behaviour.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolMetadata {
+    /// Human-readable pool name. Must be non-empty.
+    pub name: String,
+    /// Optional longer description of the pool's purpose.
+    pub description: String,
 }
 
 /// Parameters for creating one farming pool through `create_pools_batch`.
@@ -68,6 +82,10 @@ pub enum DataKey {
     PoolConfigHistoryCount(u32),
     /// Pool configuration change event by index (#680).
     PoolConfigHistory(u32, u32),
+    /// Pool IDs that a given pool depends on (#668).
+    PoolDependencies(u32),
+    /// Set of pool IDs that have at least one dependency configured (#668).
+    PoolsWithDependencies,
 }
 
 /// On-chain record for a registered farming pool.
@@ -267,6 +285,9 @@ pub enum FactoryError {
     DuplicatePoolId = 26,
     /// A voter has already voted on a pool.
     AlreadyVoted = 27,
+    /// `create_pool` or `register_pool` was called with invalid metadata —
+    /// most commonly an empty pool name.
+    InvalidMetadata = 28,
 }
 
 /// A single pool configuration change event (#680).

@@ -8,12 +8,13 @@ use soroban_sdk::{
 };
 use types::{
     DataKey, ListPoolsResponse, PoolComparison, PoolConfigChangeEntry, PoolConfigHistoryPage,
-    PoolRecord, PoolSort, PoolStatus, RefreshPoolTtlsResponse,
+    PoolMetadata, PoolRecord, PoolSort, PoolStatus, RefreshPoolTtlsResponse,
 };
 
 pub use types::DependencyGraph;
 pub use types::FactoryError;
 pub use types::HealthStatus;
+pub use types::PoolMetadata;
 pub use types::PoolParams;
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
@@ -422,6 +423,18 @@ fn validate_factory_admin(env: &Env, admin: &Address) -> Result<(), FactoryError
     ));
     if admin == &zero_admin {
         return Err(FactoryError::InvalidAdmin);
+    }
+    Ok(())
+}
+
+/// Validate caller-supplied pool metadata before it is stored.
+///
+/// A non-empty `name` is the minimum required for a pool to be identifiable
+/// in dashboards and indexers. Returns `InvalidMetadata` when the name is
+/// empty so callers get a typed error rather than storing an unnamed pool.
+fn validate_metadata(metadata: &PoolMetadata) -> Result<(), FactoryError> {
+    if metadata.name.is_empty() {
+        return Err(FactoryError::InvalidMetadata);
     }
     Ok(())
 }
@@ -2095,11 +2108,14 @@ impl Factory {
         global_multiplier: u32,
         min_lock_period: u64,
         min_stake_amount: i128,
+        metadata: PoolMetadata,
     ) -> Result<u32, FactoryError> {
         require_initialized(&env)?;
         let admin = load_admin(&env)?;
         validate_factory_admin(&env, &admin)?;
         admin.require_auth();
+
+        validate_metadata(&metadata)?;
 
         create_pool_inner(
             env,
