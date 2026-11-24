@@ -1776,3 +1776,41 @@ fn test_initialize_rejects_schedule_exceeding_max_duration() {
         Err(Ok(VestingError::InvalidSchedule)),
     );
 }
+
+// ── Issue #708: get_vesting_schedule_history ──────────────────────────────────
+
+#[test]
+fn test_get_vesting_schedule_history_rejects_uninitialized() {
+    let env = Env::default();
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    assert_eq!(
+        client.try_get_vesting_schedule_history(&0u32, &10u32),
+        Err(Ok(VestingError::NotInitialized)),
+    );
+}
+
+#[test]
+fn test_get_vesting_schedule_history_tracks_lifecycle_and_paginates() {
+    let t = setup(0, 100, 1_000);
+
+    // Initialization records the initial creation event.
+    let initial = t.client.get_vesting_schedule_history(&0u32, &10u32);
+    assert_eq!(initial.total, 1);
+    assert_eq!(initial.events.len(), 1);
+    assert_eq!(initial.events.get(0).unwrap().action, symbol_short!("created"));
+
+    // Revoking records a second event.
+    t.client.revoke();
+    let full = t.client.get_vesting_schedule_history(&0u32, &10u32);
+    assert_eq!(full.total, 2);
+    assert_eq!(full.events.len(), 2);
+    assert_eq!(full.events.get(1).unwrap().action, symbol_short!("revoked"));
+
+    // Pagination slice: start=1, limit=1.
+    let page = t.client.get_vesting_schedule_history(&1u32, &1u32);
+    assert_eq!(page.total, 2);
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events.get(0).unwrap().action, symbol_short!("revoked"));
+}
