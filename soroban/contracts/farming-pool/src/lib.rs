@@ -4369,6 +4369,31 @@ impl FarmingPool {
         Ok(MultiplierAuditPage { events, total })
     }
 
+    /// Returns the reward multiplier change history for a user (issue #706).
+    ///
+    /// Provides a paginated list of all multiplier change events for `user` in
+    /// chronological order, recording the previous multiplier, new multiplier,
+    /// and ledger sequence at each checkpoint.
+    ///
+    /// ## Arguments
+    /// * `user` - The user address to query
+    /// * `start` - Zero-based index to start reading from
+    /// * `limit` - Maximum number of events to return
+    ///
+    /// ## Returns
+    /// * `MultiplierAuditPage` containing the events and total count
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the pool has not been initialized
+    pub fn get_multiplier_history(
+        env: Env,
+        user: Address,
+        start: u32,
+        limit: u32,
+    ) -> Result<MultiplierAuditPage, PoolError> {
+        Self::get_multiplier_audit(env, user, start, limit)
+    }
+
     /// Import multiplier data for a user (issue #700).
     ///
     /// Allows the admin to import multiplier data from an external source.
