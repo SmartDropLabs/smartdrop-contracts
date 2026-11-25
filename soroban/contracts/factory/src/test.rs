@@ -2455,6 +2455,58 @@ fn test_compare_pools_requires_initialization() {
     );
 }
 
+#[test]
+fn test_recommend_pools_uses_votes_and_ranks_eligible_pools() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let configs = [
+        (
+            risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, false),
+            10_000_000i128,
+            0i128,
+        ),
+        (
+            risk_pool_record(&env, &wasm_hash, 60_000_000, 1, false),
+            0i128,
+            0i128,
+        ),
+        (
+            risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, false),
+            10_000_000i128,
+            0i128,
+        ),
+        (
+            risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, true),
+            10_000_000i128,
+            0i128,
+        ),
+    ];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+    let user = Address::generate(&env);
+    client.vote_on_pool(&1, &user, &true);
+    client.vote_on_pool(&2, &user, &false);
+
+    assert_eq!(
+        client.recommend_pools(&user),
+        vec![&env, 1u32, 0u32]
+    );
+}
+
+#[test]
+fn test_recommend_pools_returns_empty_and_requires_initialization() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &[]);
+    let user = Address::generate(&env);
+    assert_eq!(client.recommend_pools(&user), vec![&env]);
+
+    let (_, uninitialized) = setup_uninitialized();
+    assert_eq!(
+        uninitialized.try_recommend_pools(&user),
+        Err(Ok(FactoryError::NotInitialized))
+    );
+}
+
 // ── pool dependency graph (#668) ────────────────────────────────────────────────
 
 #[test]
@@ -2543,5 +2595,193 @@ fn test_pool_dependencies_require_initialization() {
     assert_eq!(
         uninitialized.try_get_pool_dependencies(&0),
         Err(Ok(FactoryError::NotInitialized))
+    );
+}
+
+// ── compare_configs / get_config_optimization ─────────────────────────────────
+
+#[test]
+fn test_compare_configs_reports_deltas_and_winners() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let configs = [
+        (risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, false), 10_000_000i128, 0i128),
+        (risk_pool_record(&env, &wasm_hash, 60_000_000, 1, false), 0i128, 0i128),
+    ];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    let cmp = client.compare_configs(&0u32, &1u32);
+    assert_eq!(cmp.a.pool_id, 0);
+    assert_eq!(cmp.b.pool_id, 1);
+    assert_eq!(cmp.credit_rate_diff, 1_000_000 - 60_000_000);
+    assert_eq!(cmp.min_lock_period_diff, 30 * 17_280 - 1);
+    assert_eq!(cmp.tvl_diff, 10_000_000);
+    assert_eq!(cmp.global_multiplier_diff, 0);
+    assert!(!cmp.same_asset);
+    assert_eq!(cmp.higher_yield, Some(1));
+    assert_eq!(cmp.lower_risk, Some(0));
+    assert!(cmp.risk_score_diff < 0);
+}
+
+#[test]
+fn test_compare_configs_rejects_invalid_requests() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let configs = [(risk_pool_record(&env, &wasm_hash, 1_000, 100, false), 1_000_000i128, 0i128)];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    assert_eq!(client.try_compare_configs(&0u32, &0u32), Err(Ok(FactoryError::DuplicatePoolId)));
+    assert_eq!(client.try_compare_configs(&0u32, &9u32), Err(Ok(FactoryError::PoolNotFound)));
+}
+
+#[test]
+fn test_config_optimization_empty_for_healthy_pool() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let configs = [(risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, false), 10_000_000i128, 0i128)];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    let opt = client.get_config_optimization(&0u32);
+    assert_eq!(opt.risk_score, 0);
+    assert_eq!(opt.suggestions.len(), 0);
+}
+
+#[test]
+fn test_config_optimization_lists_every_firing_signal() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let outdated = BytesN::from_array(&env, &[9; 32]);
+    let configs = [(risk_pool_record(&env, &outdated, 60_000_000, 1, false), 0i128, 0i128)];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    let opt = client.get_config_optimization(&0u32);
+    let kinds: std::vec::Vec<OptimizationKind> = opt.suggestions.iter().map(|s| s.kind).collect();
+    assert_eq!(
+        kinds,
+        std::vec![
+            OptimizationKind::IncreaseMinLockPeriod,
+            OptimizationKind::ReduceCreditRate,
+            OptimizationKind::IncreaseTvl,
+            OptimizationKind::UpgradeWasm,
+            OptimizationKind::IncreaseInsurance,
+        ]
+    );
+    let rate = opt.suggestions.get(1).unwrap();
+    assert_eq!(rate.current, 60_000_000);
+    assert_eq!(rate.suggested, 9_999_999);
+}
+
+#[test]
+fn test_config_optimization_deprecated_pool_only_suggests_migration() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let configs = [(risk_pool_record(&env, &wasm_hash, 60_000_000, 1, true), 0i128, 0i128)];
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &configs);
+
+    let opt = client.get_config_optimization(&0u32);
+    assert_eq!(opt.suggestions.len(), 1);
+    assert_eq!(opt.suggestions.get(0).unwrap().kind, OptimizationKind::MigrateDeprecated);
+    assert_eq!(client.try_get_config_optimization(&5u32), Err(Ok(FactoryError::PoolNotFound)));
+}
+
+// ── Issue #707: get_config_history ────────────────────────────────────────────
+
+#[test]
+fn test_get_config_history_rejects_uninitialized_and_missing_pool() {
+    let (_env, uninitialized) = setup_uninitialized();
+    assert_eq!(
+        uninitialized.try_get_config_history(&0u32, &0u32, &10u32),
+        Err(Ok(FactoryError::NotInitialized))
+    );
+
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &[]);
+    assert_eq!(
+        client.try_get_config_history(&99u32, &0u32, &10u32),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
+}
+
+#[test]
+fn test_get_config_history_returns_paginated_entries() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let record = risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, false);
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &[(record, 1_000_000i128, 0i128)]);
+
+    // Initially empty when no history entries have been recorded yet.
+    let empty = client.get_config_history(&0u32, &0u32, &10u32);
+    assert_eq!(empty.total, 0);
+    assert_eq!(empty.events.len(), 0);
+
+    // Deprecating the pool records a configuration change entry.
+    client.deprecate_pool(&0u32);
+    let page = client.get_config_history(&0u32, &0u32, &10u32);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events.get(0).unwrap().pool_id, 0);
+    assert_eq!(page.events.get(0).unwrap().action, symbol_short!("deprecate"));
+    assert!(page.events.get(0).unwrap().new_config.unwrap().deprecated);
+}
+
+// ── Issue #695: restore_config ────────────────────────────────────────────────
+
+#[test]
+fn test_restore_config_restores_exported_backup_and_records_history() {
+    let env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&env);
+    let initial = risk_pool_record(&env, &wasm_hash, 1_000_000, 30 * 17_280, false);
+    let (client, _) = setup_risk_fixture(&env, &wasm_hash, &[(initial.clone(), 1_000_000i128, 0i128)]);
+
+    // Take a backup via export_config, then mutate state (deprecate pool).
+    let backup = client.export_config(&0u32);
+    client.deprecate_pool(&0u32);
+    assert!(client.get_pool(&0u32).deprecated);
+
+    // Restore from backup.
+    client.restore_config(&0u32, &backup);
+    let restored = client.get_pool(&0u32);
+    assert_eq!(restored, initial);
+    assert!(!restored.deprecated);
+
+    // Verify restoration was recorded in pool configuration history.
+    let history = client.get_config_history(&0u32, &0u32, &10u32);
+    assert_eq!(history.total, 2);
+    let last_event = history.events.get(1).unwrap();
+    assert_eq!(last_event.action, symbol_short!("restored"));
+    assert!(last_event.old_config.unwrap().deprecated);
+    assert!(!last_event.new_config.unwrap().deprecated);
+}
+
+#[test]
+fn test_restore_config_rejects_invalid_backup_and_missing_pool() {
+    let (_env, uninitialized) = setup_uninitialized();
+    let dummy_env = Env::default();
+    let wasm_hash = upload_replacement_wasm(&dummy_env);
+    let valid_record = risk_pool_record(&dummy_env, &wasm_hash, 1_000_000, 30 * 17_280, false);
+    assert_eq!(
+        uninitialized.try_restore_config(&0u32, &valid_record),
+        Err(Ok(FactoryError::NotInitialized))
+    );
+
+    let (client, _) = setup_risk_fixture(&dummy_env, &wasm_hash, &[(valid_record.clone(), 0i128, 0i128)]);
+    assert_eq!(
+        client.try_restore_config(&99u32, &valid_record),
+        Err(Ok(FactoryError::PoolNotFound))
+    );
+
+    let mut bad_multiplier = valid_record.clone();
+    bad_multiplier.global_multiplier = 0;
+    assert_eq!(
+        client.try_restore_config(&0u32, &bad_multiplier),
+        Err(Ok(FactoryError::InvalidGlobalMultiplier))
+    );
+
+    let mut bad_wasm = valid_record.clone();
+    bad_wasm.wasm_hash = BytesN::from_array(&dummy_env, &[0u8; 32]);
+    assert_eq!(
+        client.try_restore_config(&0u32, &bad_wasm),
+        Err(Ok(FactoryError::InvalidWasmHash))
     );
 }

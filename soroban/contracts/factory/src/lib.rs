@@ -3,19 +3,34 @@
 mod types;
 
 use soroban_sdk::{
-    contract, contractimpl, symbol_short, vec, Address, BytesN, Env, IntoVal, String, Symbol, Val,
-    Vec,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, IntoVal, String,
+    Symbol, Val, Vec,
 };
 use types::{
-    DataKey, ListPoolsResponse, PoolComparison, PoolConfigChangeEntry, PoolConfigHistoryPage,
-    PoolRecord, PoolSort, PoolStatus, RefreshPoolTtlsResponse,
+    ConfigSuggestion, DataKey, ListPoolsResponse, OptimizationKind, PoolComparison,
+    PoolConfigChangeEntry, PoolConfigHistoryPage, PoolRecord, PoolSort, PoolStatus,
+    RefreshPoolTtlsResponse, Snapshot,
 };
 
+pub use types::{ConfigComparison, ConfigSuggestions};
+
+pub use types::DefaultPoolConfig;
 pub use types::DependencyGraph;
 pub use types::FactoryError;
 pub use types::HealthStatus;
 pub use types::PoolMetadata;
 pub use types::PoolParams;
+pub use types::{PoolMetrics, Snapshot};
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+struct PoolRecommendationCandidate {
+    pool_id: u32,
+    preferred: bool,
+    risk_score: u32,
+    yield_score: i128,
+    tvl: i128,
+}
 
 // ~30 days at ~5 s/ledger; extend to ~60 days when below threshold.
 const TTL_THRESHOLD: u32 = 518_400;
@@ -50,6 +65,8 @@ const MAX_GLOBAL_MULTIPLIER: u32 = 1_000;
 // Maximum credit rate per ledger, mirroring the farming pool's own limit so an
 // excessive daily rate is caught before pool deployment (#495).
 const MAX_CREDIT_RATE: i128 = 100_000_000;
+// Maximum reward rate per pool, to prevent invalid configurations (#683).
+const MAX_REWARD_RATE: u32 = 10_000;
 // Maximum caller-facing daily rate, derived from the credit-rate ceiling so
 // `create_pool`'s public unit is bounded directly rather than only after
 // ledger conversion (#524-#527).
@@ -71,6 +88,9 @@ const MAX_COMPARE_POOLS: u32 = 10;
 // Upper bound for `set_pool_dependencies`: an unbounded dependency list would
 // let a single call exhaust the footprint budget (#668).
 const MAX_POOL_DEPENDENCIES: u32 = 10;
+// Keep recommendation scans within a predictable storage footprint.
+const MAX_RECOMMENDATION_SCAN: u32 = 20;
+const MAX_RECOMMENDATIONS: u32 = 10;
 
 /// Convert a "credits per day" figure into the deployed pool's native
 /// "credits per ledger" `credit_rate`.
@@ -409,6 +429,132 @@ fn compute_pool_risk_score(
     Ok(score.min(RISK_SCORE_MAX))
 }
 
+/// Load a pool and build its `PoolComparison` row, bumping the record TTL.
+/// Shared by `compare_pools` and `compare_configs`.
+fn build_pool_comparison(env: &Env, pool_id: u32) -> Result<PoolComparison, FactoryError> {
+    let record = env
+        .storage()
+        .persistent()
+        .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+        .ok_or(FactoryError::PoolNotFound)?;
+    bump_pool(env, pool_id);
+    let risk_score = compute_pool_risk_score(env, pool_id, &record)?;
+
+    Ok(PoolComparison {
+        pool_id,
+        address: record.address,
+        asset: record.asset,
+        daily_rate: record.daily_rate,
+        credit_rate: record.credit_rate,
+        global_multiplier: record.global_multiplier,
+        min_lock_period: record.min_lock_period,
+        tvl: read_pool_tvl(env, pool_id),
+        risk_score,
+        deprecated: record.deprecated,
+    })
+}
+
+fn recommendation_precedes(
+    left: &PoolRecommendationCandidate,
+    right: &PoolRecommendationCandidate,
+) -> bool {
+    if left.preferred != right.preferred {
+        return left.preferred;
+    }
+    if left.risk_score != right.risk_score {
+        return left.risk_score < right.risk_score;
+    }
+    if left.yield_score != right.yield_score {
+        return left.yield_score > right.yield_score;
+    }
+    if left.tvl != right.tvl {
+        return left.tvl > right.tvl;
+    }
+    left.pool_id < right.pool_id
+}
+
+/// Configuration changes that clear each risk signal `compute_pool_risk_score`
+/// fires for `record`. Thresholds are kept in lock-step with that function.
+fn config_suggestions(
+    env: &Env,
+    pool_id: u32,
+    record: &PoolRecord,
+) -> Result<Vec<ConfigSuggestion>, FactoryError> {
+    let mut out: Vec<ConfigSuggestion> = Vec::new(env);
+
+    if record.deprecated {
+        out.push_back(ConfigSuggestion {
+            kind: OptimizationKind::MigrateDeprecated,
+            current: 1,
+            suggested: 0,
+        });
+        // Tuning a decommissioned pool is pointless; migration is the advice.
+        return Ok(out);
+    }
+
+    let lowest_risk_lock = 30 * LEDGERS_PER_DAY as u32;
+    if record.min_lock_period < lowest_risk_lock {
+        out.push_back(ConfigSuggestion {
+            kind: OptimizationKind::IncreaseMinLockPeriod,
+            current: record.min_lock_period as i128,
+            suggested: lowest_risk_lock as i128,
+        });
+    }
+
+    // Risk fires at `credit_rate * 100 / MAX_CREDIT_RATE >= 10`, i.e. at or
+    // above MAX_CREDIT_RATE / 10; suggest the largest rate below that.
+    let high_rate_floor = MAX_CREDIT_RATE / 10;
+    if record.credit_rate >= high_rate_floor {
+        out.push_back(ConfigSuggestion {
+            kind: OptimizationKind::ReduceCreditRate,
+            current: record.credit_rate,
+            suggested: high_rate_floor - 1,
+        });
+    }
+
+    let tvl = read_pool_tvl(env, pool_id);
+    if tvl < RISK_SCORE_TVL_THRESHOLD {
+        out.push_back(ConfigSuggestion {
+            kind: OptimizationKind::IncreaseTvl,
+            current: tvl,
+            suggested: RISK_SCORE_TVL_THRESHOLD,
+        });
+    }
+
+    if load_wasm_hash(env)? != record.wasm_hash {
+        out.push_back(ConfigSuggestion {
+            kind: OptimizationKind::UpgradeWasm,
+            current: record.version as i128,
+            suggested: record.version as i128 + 1,
+        });
+    }
+
+    // Insurance only discounts other penalties, so it is advice only when at
+    // least one penalty above is firing.
+    let insurance = read_pool_insurance(env, pool_id);
+    let full_discount = 10 * RISK_SCORE_TVL_THRESHOLD;
+    if !out.is_empty() && insurance < full_discount {
+        out.push_back(ConfigSuggestion {
+            kind: OptimizationKind::IncreaseInsurance,
+            current: insurance,
+            suggested: full_discount,
+        });
+    }
+
+    Ok(out)
+}
+
+/// Pool ID that wins a strict comparison, or `None` on a tie.
+fn pick_winner(a_id: u32, a_wins: bool, b_id: u32, b_wins: bool) -> Option<u32> {
+    if a_wins {
+        Some(a_id)
+    } else if b_wins {
+        Some(b_id)
+    } else {
+        None
+    }
+}
+
 fn increment_admin_transfer_count(env: &Env) {
     let count = read_admin_transfer_count(env);
     env.storage()
@@ -465,6 +611,41 @@ fn record_config_change(
         .set(&DataKey::PoolConfigHistoryCount(pool_id), &(count + 1));
 }
 
+/// Validate pool configuration parameters before deployment.
+///
+/// Ensures that reward_rate is non-zero and pool parameters meet basic
+/// integrity requirements. This function is called during pool creation
+/// to reject invalid configurations before deployment.
+fn validate_config(
+    daily_rate: u128,
+    global_multiplier: u32,
+    min_lock_period: u64,
+) -> Result<(), FactoryError> {
+    // Ensure daily_rate (which translates to reward_rate/credit_rate) is non-zero
+    if daily_rate == 0 {
+        return Err(FactoryError::InvalidCreditRate);
+    }
+    
+    // Validate global_multiplier is within bounds
+    if global_multiplier < 1 || global_multiplier > MAX_GLOBAL_MULTIPLIER {
+        return Err(FactoryError::InvalidGlobalMultiplier);
+    }
+    
+    // Validate min_lock_period
+    if min_lock_period == 0 {
+        return Err(FactoryError::MinLockPeriodTooShort);
+    }
+    
+    let min_lock_u32: u32 = min_lock_period
+        .try_into()
+        .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
+    if min_lock_u32 > MAX_MIN_LOCK_PERIOD {
+        return Err(FactoryError::MinLockPeriodAboveCeiling);
+    }
+    
+    Ok(())
+}
+
 fn create_pool_inner(
     env: Env,
     admin: Address,
@@ -484,6 +665,9 @@ fn create_pool_inner(
     if paused {
         return Err(FactoryError::PoolCreationPaused);
     }
+    
+    // Validate configuration before proceeding with pool creation
+    validate_config(daily_rate, global_multiplier, min_lock_period)?;
 
     validate_asset(&env, &asset)?;
 
@@ -524,6 +708,12 @@ fn create_pool_inner(
     // oversized rate is rejected at the API boundary before ledger conversion.
     if daily_rate > MAX_DAILY_RATE {
         return Err(FactoryError::InvalidCreditRate);
+    }
+
+    // Validation: Enforce reward rate limit to prevent invalid pool configurations (#683).
+    let reward_rate = global_multiplier;
+    if reward_rate > MAX_REWARD_RATE {
+        return Err(FactoryError::InvalidConfig);
     }
 
     // Validation 25: Convert and validate daily_rate with strict bounds checking
@@ -875,30 +1065,162 @@ impl Factory {
                 return Err(FactoryError::DuplicatePoolId);
             }
             seen.push_back(pool_id);
-
-            let record = env
-                .storage()
-                .persistent()
-                .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
-                .ok_or(FactoryError::PoolNotFound)?;
-            bump_pool(&env, pool_id);
-            let risk_score = compute_pool_risk_score(&env, pool_id, &record)?;
-
-            comparisons.push_back(PoolComparison {
-                pool_id,
-                address: record.address,
-                asset: record.asset,
-                daily_rate: record.daily_rate,
-                credit_rate: record.credit_rate,
-                global_multiplier: record.global_multiplier,
-                min_lock_period: record.min_lock_period,
-                tvl: read_pool_tvl(&env, pool_id),
-                risk_score,
-                deprecated: record.deprecated,
-            });
+            comparisons.push_back(build_pool_comparison(&env, pool_id)?);
         }
 
         Ok(comparisons)
+    }
+
+    /// Recommend up to ten active pools for `user`.
+    ///
+    /// Existing user ballots act as preference signals: pools the user voted
+    /// against are omitted, and pools they approved rank ahead of unvoted
+    /// pools. Remaining ties are ranked by lower risk, higher reward rate,
+    /// higher synced TVL, then lower pool ID. To keep contract work bounded,
+    /// this scans only the first twenty registered IDs.
+    ///
+    /// Returns an empty vector when no eligible pools are found, and
+    /// `NotInitialized` before the factory has been initialized.
+    pub fn recommend_pools(env: Env, user: Address) -> Result<Vec<u32>, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
+        let scan_end = count.min(MAX_RECOMMENDATION_SCAN);
+        let mut ranked: Vec<PoolRecommendationCandidate> = Vec::new(&env);
+
+        for pool_id in 0..scan_end {
+            let key = DataKey::Pool(pool_id);
+            let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PoolRecord>(&key)
+            else {
+                publish_pool_gap(&env, pool_id);
+                continue;
+            };
+            if record.deprecated {
+                continue;
+            }
+
+            bump_pool(&env, pool_id);
+            let vote_key = DataKey::PoolVote(pool_id, user.clone());
+            let vote: Option<bool> = env.storage().persistent().get(&vote_key);
+            if vote == Some(false) {
+                continue;
+            }
+            if vote.is_some() {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&vote_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            }
+
+            let candidate = PoolRecommendationCandidate {
+                pool_id,
+                preferred: vote == Some(true),
+                risk_score: compute_pool_risk_score(&env, pool_id, &record)?,
+                yield_score: record.credit_rate * i128::from(record.global_multiplier),
+                tvl: read_pool_tvl(&env, pool_id),
+            };
+
+            let mut insert_at = ranked.len();
+            for (index, existing) in ranked.iter().enumerate() {
+                if recommendation_precedes(&candidate, &existing) {
+                    insert_at = index as u32;
+                    break;
+                }
+            }
+            ranked.insert(insert_at, candidate);
+            if ranked.len() > MAX_RECOMMENDATIONS {
+                let _ = ranked.pop_back();
+            }
+        }
+
+        let mut recommendations = Vec::new(&env);
+        for candidate in ranked.iter() {
+            recommendations.push_back(candidate.pool_id);
+        }
+        Ok(recommendations)
+    }
+
+    /// Compare two pool configurations head to head.
+    ///
+    /// Returns both pools' `PoolComparison` rows plus signed `a - b` deltas
+    /// for every tunable field, whether they stake the same asset, and which
+    /// pool wins on yield (`credit_rate * global_multiplier`) and on risk.
+    /// Use `compare_pools` for more than two pools without the deltas.
+    ///
+    /// Returns `NotInitialized` before `initialize`, `DuplicatePoolId` when
+    /// `a == b`, and `PoolNotFound` for an unknown ID.
+    pub fn compare_configs(env: Env, a: u32, b: u32) -> Result<ConfigComparison, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        if a == b {
+            return Err(FactoryError::DuplicatePoolId);
+        }
+
+        let pa = build_pool_comparison(&env, a)?;
+        let pb = build_pool_comparison(&env, b)?;
+
+        // Both factors are bounded (MAX_CREDIT_RATE, MAX_GLOBAL_MULTIPLIER),
+        // so the products cannot overflow i128.
+        let yield_a = pa.credit_rate * pa.global_multiplier as i128;
+        let yield_b = pb.credit_rate * pb.global_multiplier as i128;
+
+        Ok(ConfigComparison {
+            // daily_rate is capped at MAX_DAILY_RATE, which fits in i128.
+            daily_rate_diff: pa.daily_rate as i128 - pb.daily_rate as i128,
+            credit_rate_diff: pa.credit_rate - pb.credit_rate,
+            global_multiplier_diff: pa.global_multiplier as i64 - pb.global_multiplier as i64,
+            min_lock_period_diff: pa.min_lock_period as i64 - pb.min_lock_period as i64,
+            tvl_diff: pa.tvl.saturating_sub(pb.tvl),
+            risk_score_diff: pa.risk_score as i64 - pb.risk_score as i64,
+            same_asset: pa.asset == pb.asset,
+            higher_yield: pick_winner(a, yield_a > yield_b, b, yield_b > yield_a),
+            lower_risk: pick_winner(
+                a,
+                pa.risk_score < pb.risk_score,
+                b,
+                pb.risk_score < pa.risk_score,
+            ),
+            a: pa,
+            b: pb,
+        })
+    }
+
+    /// Suggest configuration changes that would lower a pool's risk score.
+    ///
+    /// Each suggestion corresponds to one signal in `get_pool_risk` and gives
+    /// the field's current value and the value that clears that signal. A
+    /// deprecated pool gets a single `MigrateDeprecated` suggestion. An empty
+    /// list means no risk signal is firing. Read-only: nothing is applied.
+    ///
+    /// Returns `NotInitialized` before `initialize`, or `PoolNotFound` for an
+    /// unknown `pool_id`. Extends the pool record TTL on success.
+    pub fn get_config_optimization(
+        env: Env,
+        pool_id: u32,
+    ) -> Result<ConfigSuggestions, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        Ok(ConfigSuggestions {
+            pool_id,
+            risk_score: compute_pool_risk_score(&env, pool_id, &record)?,
+            suggestions: config_suggestions(&env, pool_id, &record)?,
+        })
     }
 
     /// Set the pool IDs that `pool_id` depends on (#668). Admin-only.
@@ -2109,15 +2431,25 @@ impl Factory {
         validate_factory_admin(&env, &admin)?;
         admin.require_auth();
 
-        create_pool_inner(
-            env,
+        // Emit a `pool_fail` event when validation fails so indexers can observe
+        // rejected creation attempts without having to parse error codes from
+        // the transaction's diagnostic events (#606).
+        let result = create_pool_inner(
+            env.clone(),
             admin,
             asset,
             daily_rate,
             global_multiplier,
             min_lock_period,
             min_stake_amount,
-        )
+        );
+        if let Err(ref e) = result {
+            env.events().publish(
+                (symbol_short!("factory"), symbol_short!("pool_fail")),
+                *e as u32,
+            );
+        }
+        result
     }
 
     /// Register an externally-deployed farming pool with the factory (#665).
@@ -2462,6 +2794,31 @@ impl Factory {
         Ok(PoolConfigHistoryPage { events, total })
     }
 
+    /// Returns the configuration change history for a pool (issue #707).
+    ///
+    /// Provides a paginated list of all configuration change events for the
+    /// specified pool in chronological order.
+    ///
+    /// ## Arguments
+    /// * `pool_id` - The pool ID to query
+    /// * `start` - Zero-based index to start reading from
+    /// * `limit` - Maximum number of events to return
+    ///
+    /// ## Returns
+    /// * `PoolConfigHistoryPage` containing the events and total count
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    /// * `PoolNotFound` - If no pool with the given ID exists
+    pub fn get_config_history(
+        env: Env,
+        pool_id: u32,
+        start: u32,
+        limit: u32,
+    ) -> Result<PoolConfigHistoryPage, FactoryError> {
+        Self::get_pool_config_history(env, pool_id, start, limit)
+    }
+
     /// Export the pool configuration for a specific pool (issue #698).
     ///
     /// Returns the complete pool configuration data for external use or backup.
@@ -2497,6 +2854,42 @@ impl Factory {
     /// Requires admin authorization.
     ///
     /// ## Arguments
+    /// Return a snapshot of the pool's current configuration (#710).
+    ///
+    /// Captures the complete pool configuration including asset, credit rate,
+    /// global multiplier, min lock period, daily rate, WASM hash, deprecation
+    /// status, and TVL in a single query for analytics and state preservation.
+    ///
+    /// Returns `NotInitialized` if the factory has not been initialized, or
+    /// `PoolNotFound` if the pool ID does not exist.
+    pub fn get_config_snapshot(env: Env, pool_id: u32) -> Result<PoolComparison, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        let tvl = read_pool_tvl(&env, pool_id);
+        let risk_score = compute_pool_risk_score(&env, pool_id, &record)?;
+
+        Ok(PoolComparison {
+            pool_id,
+            address: record.address,
+            asset: record.asset,
+            daily_rate: record.daily_rate,
+            credit_rate: record.credit_rate,
+            global_multiplier: record.global_multiplier,
+            min_lock_period: record.min_lock_period,
+            tvl,
+            risk_score,
+            deprecated: record.deprecated,
+        })
+    }
+
     /// * `config` - The PoolRecord containing the pool configuration to import
     ///
     /// ## Returns
@@ -2506,6 +2899,93 @@ impl Factory {
     /// * `NotInitialized` - If the factory has not been initialized
     /// * `PoolCreationPaused` - If pool creation is currently paused
     /// * Various validation errors if the configuration is invalid
+    /// Captures and stores a point-in-time snapshot of a pool's state (#647).
+    ///
+    /// Snapshots record TVL, global multiplier, credit rate, and deprecation
+    /// status at the current ledger so they can be replayed for analytics or
+    /// incident review without re-querying historical on-chain state.
+    ///
+    /// Returns `NotInitialized` or `PoolNotFound` on the usual error paths.
+    pub fn take_snapshot(env: Env, pool_id: u32) -> Result<Snapshot, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        let tvl = read_pool_tvl(&env, pool_id);
+        let ledger = env.ledger().sequence();
+
+        let snapshot = Snapshot {
+            pool_id,
+            ledger,
+            tvl,
+            global_multiplier: record.global_multiplier,
+            credit_rate: record.credit_rate,
+            deprecated: record.deprecated,
+        };
+
+        let count = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::PoolSnapshotCount(pool_id))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolSnapshot(pool_id, count), &snapshot);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolSnapshotCount(pool_id), &(count + 1));
+
+        Ok(snapshot)
+    }
+
+    /// Returns aggregated metrics for a pool, including live TVL, snapshot
+    /// count, and the ledger of the most recent snapshot (#650).
+    ///
+    /// Returns `NotInitialized` or `PoolNotFound` on the usual error paths.
+    pub fn get_pool_metrics(env: Env, pool_id: u32) -> Result<PoolMetrics, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        let record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+        bump_pool(&env, pool_id);
+
+        let tvl = read_pool_tvl(&env, pool_id);
+        let snapshot_count = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::PoolSnapshotCount(pool_id))
+            .unwrap_or(0);
+        let last_snapshot_ledger = if snapshot_count > 0 {
+            env.storage()
+                .persistent()
+                .get::<DataKey, Snapshot>(&DataKey::PoolSnapshot(pool_id, snapshot_count - 1))
+                .map(|s| s.ledger)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        Ok(PoolMetrics {
+            pool_id,
+            tvl,
+            snapshot_count,
+            last_snapshot_ledger,
+            global_multiplier: record.global_multiplier,
+            credit_rate: record.credit_rate,
+            deprecated: record.deprecated,
+        })
+    }
+
     pub fn import_config(env: Env, config: PoolRecord) -> Result<u32, FactoryError> {
         require_initialized(&env)?;
         let admin = load_admin(&env)?;
@@ -2522,5 +3002,192 @@ impl Factory {
             // min_stake_amount is not stored in PoolRecord, use default
             MIN_STAKE_AMOUNT,
         )
+    }
+
+    /// Set default pool configuration for creating pools (#686).
+    ///
+    /// Stores a default configuration that can be used as a template when
+    /// creating new pools. Admin-only.
+    ///
+    /// # Arguments
+    /// * `config` - The default configuration to store
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    /// * `InvalidCreditRate` - If daily_rate is invalid
+    /// * `InvalidGlobalMultiplier` - If global_multiplier is out of bounds
+    /// * `MinLockPeriodTooShort` - If min_lock_period is too short
+    /// * `MinLockPeriodAboveCeiling` - If min_lock_period is too long
+    /// * `InvalidMinStakeAmount` - If min_stake_amount is out of range
+    /// * `InvalidConfig` - If reward_rate exceeds MAX_REWARD_RATE
+    pub fn set_default_config(
+        env: Env,
+        config: DefaultPoolConfig,
+    ) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        // Validate the configuration using the same rules as create_pool
+        if config.global_multiplier < 1 || config.global_multiplier > MAX_GLOBAL_MULTIPLIER {
+            return Err(FactoryError::InvalidGlobalMultiplier);
+        }
+
+        if config.daily_rate > MAX_DAILY_RATE {
+            return Err(FactoryError::InvalidCreditRate);
+        }
+
+        // Validate reward rate limit (#683)
+        let reward_rate = config.global_multiplier;
+        if reward_rate > MAX_REWARD_RATE {
+            return Err(FactoryError::InvalidConfig);
+        }
+
+        let credit_rate = daily_rate_to_credit_rate(config.daily_rate)?;
+        if credit_rate <= 0 || credit_rate > MAX_CREDIT_RATE {
+            return Err(FactoryError::InvalidCreditRate);
+        }
+
+        if config.min_lock_period == 0 {
+            return Err(FactoryError::MinLockPeriodTooShort);
+        }
+        let min_lock_period_u32: u32 = config
+            .min_lock_period
+            .try_into()
+            .map_err(|_| FactoryError::MinLockPeriodOutOfRange)?;
+        if min_lock_period_u32 < MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodTooShort);
+        }
+        if min_lock_period_u32 > MAX_MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodAboveCeiling);
+        }
+
+        if config.min_stake_amount > MAX_STAKE_AMOUNT {
+            return Err(FactoryError::InvalidMinStakeAmount);
+        }
+        if config.min_stake_amount < -MAX_STAKE_AMOUNT {
+            return Err(FactoryError::InvalidMinStakeAmount);
+        }
+
+        // Store the validated configuration
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultPoolConfig, &config);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("def_cfg")),
+            config,
+        );
+
+        Ok(())
+    }
+
+    /// Get the default pool configuration (#686).
+    ///
+    /// Returns the stored default configuration, or `None` if no default has
+    /// been set.
+    ///
+    /// # Returns
+    /// * `Option<DefaultPoolConfig>` - The default configuration if set
+    ///
+    /// # Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    pub fn get_default_config(env: Env) -> Result<Option<DefaultPoolConfig>, FactoryError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
+
+        Ok(env
+            .storage()
+            .instance()
+            .get::<DataKey, DefaultPoolConfig>(&DataKey::DefaultPoolConfig))
+    }
+
+    /// Restore a pool's configuration from a previously exported backup (issue #695).
+    ///
+    /// Validates the backup `PoolRecord` against protocol bounds, replaces the
+    /// stored pool record for `pool_id`, records the restoration in the pool's
+    /// configuration history, and emits an audit event. Admin-only.
+    ///
+    /// ## Arguments
+    /// * `pool_id` - ID of the existing pool whose configuration is being restored
+    /// * `backup` - The backed-up `PoolRecord` (e.g. from `export_config`)
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    /// * `PoolNotFound` - If no pool with `pool_id` exists
+    /// * `InvalidGlobalMultiplier` - If `backup.global_multiplier` is out of bounds
+    /// * `InvalidCreditRate` - If `backup.daily_rate` or `backup.credit_rate` is invalid
+    /// * `MinLockPeriodTooShort` - If `backup.min_lock_period` is below `MIN_LOCK_PERIOD`
+    /// * `MinLockPeriodAboveCeiling` - If `backup.min_lock_period` exceeds `MAX_MIN_LOCK_PERIOD`
+    /// * `InvalidWasmHash` - If `backup.wasm_hash` is all zeros
+    pub fn restore_config(
+        env: Env,
+        pool_id: u32,
+        backup: PoolRecord,
+    ) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        let old_record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+
+        if backup.global_multiplier < 1 || backup.global_multiplier > MAX_GLOBAL_MULTIPLIER {
+            return Err(FactoryError::InvalidGlobalMultiplier);
+        }
+
+        if backup.daily_rate > MAX_DAILY_RATE {
+            return Err(FactoryError::InvalidCreditRate);
+        }
+
+        let computed_credit_rate = daily_rate_to_credit_rate(backup.daily_rate)?;
+        if computed_credit_rate <= 0
+            || computed_credit_rate > MAX_CREDIT_RATE
+            || backup.credit_rate <= 0
+            || backup.credit_rate > MAX_CREDIT_RATE
+        {
+            return Err(FactoryError::InvalidCreditRate);
+        }
+
+        if backup.min_lock_period < MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodTooShort);
+        }
+        if backup.min_lock_period > MAX_MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodAboveCeiling);
+        }
+
+        if backup.wasm_hash == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(FactoryError::InvalidWasmHash);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pool(pool_id), &backup);
+        bump_pool(&env, pool_id);
+
+        record_config_change(
+            &env,
+            pool_id,
+            symbol_short!("restored"),
+            Some(old_record),
+            Some(backup.clone()),
+        );
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("restored")),
+            (pool_id, backup),
+        );
+
+        Ok(())
     }
 }

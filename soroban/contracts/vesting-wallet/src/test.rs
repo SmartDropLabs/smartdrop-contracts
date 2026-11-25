@@ -792,6 +792,58 @@ fn test_beneficiary_getter_tracks_transfer_beneficiary() {
 }
 
 #[test]
+fn test_update_vesting_schedule_changes_dates_without_reducing_vested_amount() {
+    let t = setup(0, 200, 1_000);
+    let mut schedule = t.client.get_vesting_schedule();
+    schedule.end_ledger = t.start + 100;
+
+    t.client.update_vesting_schedule(&schedule);
+
+    let updated = t.client.get_vesting_schedule();
+    assert_eq!(updated.end_ledger, t.start + 100);
+    assert_eq!(t.client.schedule_version(), 2);
+}
+
+#[test]
+fn test_update_vesting_schedule_rejects_reducing_already_vested_amount() {
+    let t = setup(0, 200, 1_000);
+    advance_ledgers(&t.env, 50);
+    let mut schedule = t.client.get_vesting_schedule();
+    schedule.end_ledger = t.start + 300;
+
+    assert_eq!(
+        t.client.try_update_vesting_schedule(&schedule),
+        Err(Ok(VestingError::InvalidSchedule))
+    );
+    assert_eq!(t.client.get_vesting_schedule().end_ledger, t.start + 200);
+}
+
+#[test]
+fn test_accelerate_vesting_shortens_end_ledger_and_increases_vested_amount() {
+    let t = setup(0, 200, 1_000);
+    advance_ledgers(&t.env, 50);
+
+    t.client.accelerate_vesting(&u64::from(t.start + 100));
+
+    assert_eq!(
+        t.client.get_vesting_schedule().end_ledger,
+        t.start + 100
+    );
+    assert_eq!(t.client.vested_amount(), 500);
+}
+
+#[test]
+fn test_accelerate_vesting_rejects_non_accelerating_end_ledger() {
+    let t = setup(0, 200, 1_000);
+
+    assert_eq!(
+        t.client
+            .try_accelerate_vesting(&u64::from(t.start + 200)),
+        Err(Ok(VestingError::InvalidSchedule))
+    );
+}
+
+#[test]
 fn test_beneficiary_uninitialized_returns_not_initialized() {
     let env = Env::default();
     env.mock_all_auths();
@@ -1537,4 +1589,228 @@ fn test_backup_schedule_is_read_only_and_repeatable() {
     assert_eq!(first, second);
     assert_eq!(t.client.get_vesting_overview(), overview_before);
     assert_eq!(t.client.release_count(), 0);
+}
+
+// ── compare_schedules ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_compare_schedules_reports_diffs_and_winners() {
+    let w = funded_uninitialised_wallet(3_000);
+    let start = w.env.ledger().sequence();
+
+    let a = VestingWalletClient::new(&w.env, &w.contract_id);
+    a.initialize(&w.beneficiary, &w.token_address, &1_000i128, &start, &(start + 10), &(start + 100), &false, &w.admin);
+
+    let b_id = w.env.register(VestingWallet, ());
+    let b = VestingWalletClient::new(&w.env, &b_id);
+    b.initialize(&w.beneficiary, &w.token_address, &2_000i128, &start, &(start + 50), &(start + 200), &false, &w.admin);
+
+    advance_ledgers(&w.env, 50);
+
+    // Called on wallet `a`, comparing itself (local read) with `b` (cross-contract).
+    let cmp = a.compare_schedules(&w.contract_id, &b_id);
+    assert_eq!(cmp.total_amount_diff, -1_000);
+    assert_eq!(cmp.duration_a, 100);
+    assert_eq!(cmp.duration_b, 200);
+    assert_eq!(cmp.cliff_a, 10);
+    assert_eq!(cmp.cliff_b, 50);
+    assert_eq!(cmp.vested_bps_a, 5_000);
+    assert_eq!(cmp.vested_bps_b, 2_500);
+    assert!(cmp.same_token);
+    assert_eq!(cmp.faster_vesting, Some(w.contract_id.clone()));
+    assert_eq!(cmp.earlier_unlock, Some(w.contract_id.clone()));
+}
+
+#[test]
+fn test_compare_schedules_rejects_same_wallet_and_non_wallets() {
+    let w = funded_uninitialised_wallet(1_000);
+    let start = w.env.ledger().sequence();
+    let a = VestingWalletClient::new(&w.env, &w.contract_id);
+    a.initialize(&w.beneficiary, &w.token_address, &1_000i128, &start, &start, &(start + 100), &false, &w.admin);
+
+    assert_eq!(
+        a.try_compare_schedules(&w.contract_id, &w.contract_id),
+        Err(Ok(VestingError::InvalidInput))
+    );
+    let uninitialised = w.env.register(VestingWallet, ());
+    assert_eq!(
+        a.try_compare_schedules(&w.contract_id, &uninitialised),
+        Err(Ok(VestingError::InvalidInput))
+    );
+}
+
+// ── Issue #657: lock_schedule prevents further modifications ──────────────────
+
+#[test]
+fn test_lock_schedule_sets_locked_flag() {
+    let w = setup_schedule(0, 1_000, 1_000, false);
+    assert_eq!(w.client.is_schedule_locked(), false);
+    w.client.lock_schedule();
+    assert_eq!(w.client.is_schedule_locked(), true);
+}
+
+#[test]
+fn test_lock_schedule_idempotent_error_on_second_call() {
+    let w = setup_schedule(0, 1_000, 1_000, false);
+    w.client.lock_schedule();
+    assert_eq!(
+        w.client.try_lock_schedule(),
+        Err(Ok(VestingError::ScheduleAlreadyLocked)),
+    );
+}
+
+#[test]
+fn test_lock_schedule_emits_locked_event() {
+    use soroban_sdk::{symbol_short, testutils::Events, IntoVal};
+
+    let w = setup_schedule(0, 1_000, 1_000, false);
+    w.client.lock_schedule();
+
+    let events = w.env.events().all();
+    let matched = events.iter().any(|(_, topics, _)| {
+        topics
+            == soroban_sdk::vec![
+                &w.env,
+                symbol_short!("vest").into_val(&w.env),
+                symbol_short!("locked").into_val(&w.env),
+            ]
+    });
+    assert!(matched, "vest/locked event was not published");
+}
+
+// ── Issue #642: vesting schedule parameters are validated on initialize ────────
+
+#[test]
+fn test_initialize_rejects_start_in_past() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin.clone());
+    soroban_sdk::token::StellarAssetClient::new(&env, &asset.address()).mint(&admin, &1_000i128);
+
+    let start = env.ledger().sequence();
+    // Advance so start is in the past.
+    advance_ledgers(&env, 10);
+
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    // Should panic with "start must be in the future"
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.initialize(
+            &beneficiary,
+            &asset.address(),
+            &1_000i128,
+            &start,       // in the past
+            &start,
+            &(start + 100),
+            &false,
+            &admin,
+        );
+    }));
+    assert!(result.is_err(), "expected panic for past start_ledger");
+}
+
+#[test]
+fn test_initialize_rejects_end_not_after_cliff() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin.clone());
+    soroban_sdk::token::StellarAssetClient::new(&env, &asset.address()).mint(&admin, &1_000i128);
+
+    let start = env.ledger().sequence();
+    let cliff = start + 100;
+    let end = cliff; // end == cliff, not strictly after
+
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.initialize(
+            &beneficiary,
+            &asset.address(),
+            &1_000i128,
+            &start,
+            &cliff,
+            &end,
+            &false,
+            &admin,
+        );
+    }));
+    assert!(result.is_err(), "expected panic for end_ledger == cliff_ledger");
+}
+
+#[test]
+fn test_initialize_rejects_schedule_exceeding_max_duration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let asset = env.register_stellar_asset_contract_v2(token_admin.clone());
+    soroban_sdk::token::StellarAssetClient::new(&env, &asset.address()).mint(&admin, &1_000i128);
+
+    let start = env.ledger().sequence();
+    // MAX_VESTING_DURATION_LEDGERS = 365 * 24 * 3600 / 5 = 6_307_200
+    let too_long_end = start + 6_307_201u32;
+
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    assert_eq!(
+        client.try_initialize(
+            &beneficiary,
+            &asset.address(),
+            &1_000i128,
+            &start,
+            &start,
+            &too_long_end,
+            &false,
+            &admin,
+        ),
+        Err(Ok(VestingError::InvalidSchedule)),
+    );
+}
+
+// ── Issue #708: get_vesting_schedule_history ──────────────────────────────────
+
+#[test]
+fn test_get_vesting_schedule_history_rejects_uninitialized() {
+    let env = Env::default();
+    let contract_id = env.register(VestingWallet, ());
+    let client = VestingWalletClient::new(&env, &contract_id);
+
+    assert_eq!(
+        client.try_get_vesting_schedule_history(&0u32, &10u32),
+        Err(Ok(VestingError::NotInitialized)),
+    );
+}
+
+#[test]
+fn test_get_vesting_schedule_history_tracks_lifecycle_and_paginates() {
+    let t = setup(0, 100, 1_000);
+
+    // Initialization records the initial creation event.
+    let initial = t.client.get_vesting_schedule_history(&0u32, &10u32);
+    assert_eq!(initial.total, 1);
+    assert_eq!(initial.events.len(), 1);
+    assert_eq!(initial.events.get(0).unwrap().action, symbol_short!("created"));
+
+    // Revoking records a second event.
+    t.client.revoke();
+    let full = t.client.get_vesting_schedule_history(&0u32, &10u32);
+    assert_eq!(full.total, 2);
+    assert_eq!(full.events.len(), 2);
+    assert_eq!(full.events.get(1).unwrap().action, symbol_short!("revoked"));
+
+    // Pagination slice: start=1, limit=1.
+    let page = t.client.get_vesting_schedule_history(&1u32, &1u32);
+    assert_eq!(page.total, 2);
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events.get(0).unwrap().action, symbol_short!("revoked"));
 }

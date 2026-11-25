@@ -308,3 +308,202 @@ fn test_a_no_op_migration_is_not_logged() {
         before
     );
 }
+
+// ── get_multiplier_optimization ───────────────────────────────────────────────
+
+#[test]
+fn test_multiplier_optimization_for_unknown_user_is_all_zero() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+
+    let opt = t.client.get_multiplier_optimization(&user);
+    assert!(!opt.has_active_stake);
+    assert!(!opt.boost_eligible);
+    assert_eq!(opt.stake_amount, 0);
+    assert_eq!(opt.optimal_allocation_pct, 0);
+    assert!(!opt.needs_migration);
+    assert_eq!(opt.tier_multiplier_pct, 100);
+    assert_eq!(opt.next_tier_multiplier_pct, 150);
+    assert_eq!(opt.additional_stake_for_next_tier, 100_001);
+    assert_eq!(opt.current_credits_per_ledger, 0);
+    assert_eq!(opt.optimal_credits_per_ledger, 0);
+}
+
+#[test]
+fn test_multiplier_optimization_suggests_full_boost_and_migration() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    StellarAssetClient::new(&t.env, &t.token_address).mint(&user, &STAKE_AMOUNT);
+    t.client.stake(&user, &STAKE_AMOUNT);
+    t.client.set_boost(&user, &50u32);
+    t.client.set_global_multiplier(&3u32);
+
+    let opt = t.client.get_multiplier_optimization(&user);
+    assert!(opt.has_active_stake);
+    assert!(opt.boost_eligible);
+    assert_eq!(opt.allocation_pct, 50);
+    assert_eq!(opt.optimal_allocation_pct, 100);
+    assert_eq!(opt.global_multiplier, 3);
+    // The stake still carries the 1x snapshot taken before the change.
+    assert_eq!(opt.stake_multiplier, 1);
+    assert!(opt.needs_migration);
+    assert_eq!(
+        opt.current_credits_per_ledger,
+        compute_credits(STAKE_AMOUNT, 50, 1, 1_000, 1)
+    );
+    assert_eq!(opt.optimal_credits_per_ledger, credits_at(3, 1));
+    assert!(opt.optimal_credits_per_ledger > opt.current_credits_per_ledger);
+    // 100_000 sits at the top of the base band.
+    assert_eq!(opt.next_tier_multiplier_pct, 150);
+    assert_eq!(opt.additional_stake_for_next_tier, 1);
+}
+
+#[test]
+fn test_multiplier_optimization_is_a_no_op_when_already_optimal() {
+    let t = setup();
+    let user = boosted_staker(&t);
+
+    // Global multiplier is 1x: allocation has no effect, so it is left alone.
+    let opt = t.client.get_multiplier_optimization(&user);
+    assert!(!opt.needs_migration);
+    assert_eq!(opt.optimal_allocation_pct, opt.allocation_pct);
+    assert_eq!(opt.optimal_credits_per_ledger, opt.current_credits_per_ledger);
+}
+
+#[test]
+fn test_multiplier_optimization_top_tier_has_no_next_step() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    StellarAssetClient::new(&t.env, &t.token_address).mint(&user, &2_000_000);
+    t.client.stake(&user, &2_000_000);
+
+    let opt = t.client.get_multiplier_optimization(&user);
+    assert_eq!(opt.tier_multiplier_pct, 200);
+    assert_eq!(opt.next_tier_multiplier_pct, 200);
+    assert_eq!(opt.additional_stake_for_next_tier, 0);
+}
+
+#[test]
+fn test_multiplier_optimization_locked_position_is_not_boost_eligible() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    StellarAssetClient::new(&t.env, &t.token_address).mint(&user, &1_000i128);
+    t.client.lock_assets(&user, &1_000i128);
+    t.client.set_global_multiplier(&5u32);
+
+    let opt = t.client.get_multiplier_optimization(&user);
+    assert!(opt.has_active_stake);
+    assert!(!opt.boost_eligible);
+    assert_eq!(opt.optimal_allocation_pct, 0);
+    assert!(!opt.needs_migration);
+    assert_eq!(opt.current_credits_per_ledger, 1_000 * 1_000);
+    assert_eq!(opt.optimal_credits_per_ledger, opt.current_credits_per_ledger);
+}
+
+// ── Issue #658: set_global_multiplier requires admin approval ─────────────────
+
+#[test]
+fn test_set_global_multiplier_requires_admin_auth() {
+    // Uses mock_all_auths — verify the call succeeds when admin auth is present.
+    let t = setup();
+    t.client.set_global_multiplier(&2u32);
+    assert_eq!(t.client.get_global_multiplier_data().current_multiplier, 2);
+}
+
+#[test]
+fn test_set_global_multiplier_rejects_out_of_bounds() {
+    let t = setup();
+    // 0 is below the [1, MAX_GLOBAL_MULTIPLIER] range.
+    assert_eq!(
+        t.client.try_set_global_multiplier(&0u32),
+        Err(Ok(PoolError::InvalidGlobalMultiplier)),
+    );
+    // MAX_GLOBAL_MULTIPLIER + 1 is above range.
+    assert_eq!(
+        t.client.try_set_global_multiplier(&1_001u32),
+        Err(Ok(PoolError::InvalidGlobalMultiplier)),
+    );
+}
+
+// ── Issue #643: set_global_multiplier publishes an audit event ─────────────────
+
+#[test]
+fn test_set_global_multiplier_emits_audit_event() {
+    use soroban_sdk::{symbol_short, testutils::Events, IntoVal};
+    extern crate std;
+
+    let t = setup();
+    let old = t.client.get_global_multiplier_data().current_multiplier;
+    t.client.set_global_multiplier(&3u32);
+
+    let events = t.env.events().all();
+    let matched = events.iter().any(|(_, topics, data)| {
+        // The contract emits (symbol_short!("boost"), symbol_short!("mult_set"))
+        // with (old_multiplier, new_multiplier) as data.
+        let topic_match = topics
+            == soroban_sdk::vec![
+                &t.env,
+                symbol_short!("boost").into_val(&t.env),
+                symbol_short!("mult_set").into_val(&t.env),
+            ];
+        if !topic_match {
+            return false;
+        }
+        let expected: soroban_sdk::Val =
+            (old, 3u32).into_val(&t.env);
+        data == expected
+    });
+    assert!(matched, "mult_set audit event was not published");
+}
+
+// ── Issue #706: get_multiplier_history ────────────────────────────────────────
+
+#[test]
+fn test_get_multiplier_history_rejects_uninitialized() {
+    let env = Env::default();
+    let contract_id = env.register(FarmingPool, ());
+    let client = FarmingPoolClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+
+    assert_eq!(
+        client.try_get_multiplier_history(&user, &0u32, &10u32),
+        Err(Ok(PoolError::NotInitialized)),
+    );
+}
+
+#[test]
+fn test_get_multiplier_history_records_and_paginates_changes() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    StellarAssetClient::new(&t.env, &t.token_address).mint(&user, &1_000_000i128);
+
+    // Initially empty before any multiplier change checkpoint.
+    let initial = t.client.get_multiplier_history(&user, &0u32, &10u32);
+    assert_eq!(initial.total, 0);
+    assert_eq!(initial.events.len(), 0);
+
+    // Stake at multiplier = 1, then update global multiplier and checkpoint twice.
+    t.client.stake(&user, &1_000i128);
+    t.client.set_global_multiplier(&3u32);
+    advance_ledgers(&t.env, 1);
+    t.client.stake(&user, &1_000i128);
+
+    t.client.set_global_multiplier(&5u32);
+    advance_ledgers(&t.env, 1);
+    t.client.stake(&user, &1_000i128);
+
+    let full = t.client.get_multiplier_history(&user, &0u32, &10u32);
+    assert_eq!(full.total, 2);
+    assert_eq!(full.events.len(), 2);
+    assert_eq!(full.events.get(0).unwrap().old_multiplier, 1);
+    assert_eq!(full.events.get(0).unwrap().new_multiplier, 3);
+    assert_eq!(full.events.get(1).unwrap().old_multiplier, 3);
+    assert_eq!(full.events.get(1).unwrap().new_multiplier, 5);
+
+    // Pagination slice: offset 1, limit 1.
+    let page = t.client.get_multiplier_history(&user, &1u32, &1u32);
+    assert_eq!(page.total, 2);
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events.get(0).unwrap().old_multiplier, 3);
+    assert_eq!(page.events.get(0).unwrap().new_multiplier, 5);
+}
