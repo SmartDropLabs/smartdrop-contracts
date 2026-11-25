@@ -2785,6 +2785,31 @@ impl Factory {
         Ok(PoolConfigHistoryPage { events, total })
     }
 
+    /// Returns the configuration change history for a pool (issue #707).
+    ///
+    /// Provides a paginated list of all configuration change events for the
+    /// specified pool in chronological order.
+    ///
+    /// ## Arguments
+    /// * `pool_id` - The pool ID to query
+    /// * `start` - Zero-based index to start reading from
+    /// * `limit` - Maximum number of events to return
+    ///
+    /// ## Returns
+    /// * `PoolConfigHistoryPage` containing the events and total count
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    /// * `PoolNotFound` - If no pool with the given ID exists
+    pub fn get_config_history(
+        env: Env,
+        pool_id: u32,
+        start: u32,
+        limit: u32,
+    ) -> Result<PoolConfigHistoryPage, FactoryError> {
+        Self::get_pool_config_history(env, pool_id, start, limit)
+    }
+
     /// Export the pool configuration for a specific pool (issue #698).
     ///
     /// Returns the complete pool configuration data for external use or backup.
@@ -3071,5 +3096,89 @@ impl Factory {
             .storage()
             .instance()
             .get::<DataKey, DefaultPoolConfig>(&DataKey::DefaultPoolConfig))
+    }
+
+    /// Restore a pool's configuration from a previously exported backup (issue #695).
+    ///
+    /// Validates the backup `PoolRecord` against protocol bounds, replaces the
+    /// stored pool record for `pool_id`, records the restoration in the pool's
+    /// configuration history, and emits an audit event. Admin-only.
+    ///
+    /// ## Arguments
+    /// * `pool_id` - ID of the existing pool whose configuration is being restored
+    /// * `backup` - The backed-up `PoolRecord` (e.g. from `export_config`)
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the factory has not been initialized
+    /// * `PoolNotFound` - If no pool with `pool_id` exists
+    /// * `InvalidGlobalMultiplier` - If `backup.global_multiplier` is out of bounds
+    /// * `InvalidCreditRate` - If `backup.daily_rate` or `backup.credit_rate` is invalid
+    /// * `MinLockPeriodTooShort` - If `backup.min_lock_period` is below `MIN_LOCK_PERIOD`
+    /// * `MinLockPeriodAboveCeiling` - If `backup.min_lock_period` exceeds `MAX_MIN_LOCK_PERIOD`
+    /// * `InvalidWasmHash` - If `backup.wasm_hash` is all zeros
+    pub fn restore_config(
+        env: Env,
+        pool_id: u32,
+        backup: PoolRecord,
+    ) -> Result<(), FactoryError> {
+        require_initialized(&env)?;
+        let admin = load_admin(&env)?;
+        admin.require_auth();
+        bump_instance(&env);
+
+        let old_record = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PoolRecord>(&DataKey::Pool(pool_id))
+            .ok_or(FactoryError::PoolNotFound)?;
+
+        if backup.global_multiplier < 1 || backup.global_multiplier > MAX_GLOBAL_MULTIPLIER {
+            return Err(FactoryError::InvalidGlobalMultiplier);
+        }
+
+        if backup.daily_rate > MAX_DAILY_RATE {
+            return Err(FactoryError::InvalidCreditRate);
+        }
+
+        let computed_credit_rate = daily_rate_to_credit_rate(backup.daily_rate)?;
+        if computed_credit_rate <= 0
+            || computed_credit_rate > MAX_CREDIT_RATE
+            || backup.credit_rate <= 0
+            || backup.credit_rate > MAX_CREDIT_RATE
+        {
+            return Err(FactoryError::InvalidCreditRate);
+        }
+
+        if backup.min_lock_period < MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodTooShort);
+        }
+        if backup.min_lock_period > MAX_MIN_LOCK_PERIOD {
+            return Err(FactoryError::MinLockPeriodAboveCeiling);
+        }
+
+        if backup.wasm_hash == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(FactoryError::InvalidWasmHash);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pool(pool_id), &backup);
+        bump_pool(&env, pool_id);
+
+        record_config_change(
+            &env,
+            pool_id,
+            symbol_short!("restored"),
+            Some(old_record),
+            Some(backup.clone()),
+        );
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (symbol_short!("factory"), symbol_short!("restored")),
+            (pool_id, backup),
+        );
+
+        Ok(())
     }
 }

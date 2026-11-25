@@ -455,3 +455,55 @@ fn test_set_global_multiplier_emits_audit_event() {
     });
     assert!(matched, "mult_set audit event was not published");
 }
+
+// ── Issue #706: get_multiplier_history ────────────────────────────────────────
+
+#[test]
+fn test_get_multiplier_history_rejects_uninitialized() {
+    let env = Env::default();
+    let contract_id = env.register(FarmingPool, ());
+    let client = FarmingPoolClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+
+    assert_eq!(
+        client.try_get_multiplier_history(&user, &0u32, &10u32),
+        Err(Ok(PoolError::NotInitialized)),
+    );
+}
+
+#[test]
+fn test_get_multiplier_history_records_and_paginates_changes() {
+    let t = setup();
+    let user = Address::generate(&t.env);
+    StellarAssetClient::new(&t.env, &t.token_address).mint(&user, &1_000_000i128);
+
+    // Initially empty before any multiplier change checkpoint.
+    let initial = t.client.get_multiplier_history(&user, &0u32, &10u32);
+    assert_eq!(initial.total, 0);
+    assert_eq!(initial.events.len(), 0);
+
+    // Stake at multiplier = 1, then update global multiplier and checkpoint twice.
+    t.client.stake(&user, &1_000i128);
+    t.client.set_global_multiplier(&3u32);
+    advance_ledgers(&t.env, 1);
+    t.client.stake(&user, &1_000i128);
+
+    t.client.set_global_multiplier(&5u32);
+    advance_ledgers(&t.env, 1);
+    t.client.stake(&user, &1_000i128);
+
+    let full = t.client.get_multiplier_history(&user, &0u32, &10u32);
+    assert_eq!(full.total, 2);
+    assert_eq!(full.events.len(), 2);
+    assert_eq!(full.events.get(0).unwrap().old_multiplier, 1);
+    assert_eq!(full.events.get(0).unwrap().new_multiplier, 3);
+    assert_eq!(full.events.get(1).unwrap().old_multiplier, 3);
+    assert_eq!(full.events.get(1).unwrap().new_multiplier, 5);
+
+    // Pagination slice: offset 1, limit 1.
+    let page = t.client.get_multiplier_history(&user, &1u32, &1u32);
+    assert_eq!(page.total, 2);
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events.get(0).unwrap().old_multiplier, 3);
+    assert_eq!(page.events.get(0).unwrap().new_multiplier, 5);
+}

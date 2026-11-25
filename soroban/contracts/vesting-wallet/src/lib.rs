@@ -306,6 +306,24 @@ fn record_schedule_event(
         .set(&DataKey::ScheduleHistoryCount, &(count + 1));
 }
 
+fn read_schedule_history_page(env: &Env, start: u32, limit: u32) -> ScheduleHistoryPage {
+    let total = read_schedule_history_count(env);
+    let mut events = soroban_sdk::Vec::new(env);
+
+    let end = start.saturating_add(limit).min(total);
+    for i in start..end {
+        if let Some(event) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ScheduleHistoryEntry>(&DataKey::ScheduleHistory(i))
+        {
+            events.push_back(event);
+        }
+    }
+
+    ScheduleHistoryPage { events, total }
+}
+
 /// Live overview of the vesting wallet at `wallet`. Reads locally when
 /// `wallet` is this contract (Soroban forbids self re-entry), otherwise calls
 /// the other wallet's `get_vesting_overview`.
@@ -1599,21 +1617,33 @@ impl VestingWallet {
         require_initialized(&env)?;
         beneficiary.require_auth();
 
-        let total = read_schedule_history_count(&env);
-        let mut events = soroban_sdk::Vec::new(&env);
+        Ok(read_schedule_history_page(&env, start, limit))
+    }
 
-        let end = start.saturating_add(limit).min(total);
-        for i in start..end {
-            if let Some(event) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, ScheduleHistoryEntry>(&DataKey::ScheduleHistory(i))
-            {
-                events.push_back(event);
-            }
-        }
+    /// Returns the vesting schedule history for this contract (issue #708).
+    ///
+    /// Read-only paginated query of all schedule change events (creation,
+    /// updates, acceleration, beneficiary transfers, revocation) in
+    /// chronological order without requiring beneficiary authorization.
+    ///
+    /// ## Arguments
+    /// * `start` - Zero-based index to start reading from
+    /// * `limit` - Maximum number of events to return
+    ///
+    /// ## Returns
+    /// * `ScheduleHistoryPage` containing the events and total count
+    ///
+    /// ## Errors
+    /// * `NotInitialized` - If the wallet has not been initialized
+    pub fn get_vesting_schedule_history(
+        env: Env,
+        start: u32,
+        limit: u32,
+    ) -> Result<ScheduleHistoryPage, VestingError> {
+        require_initialized(&env)?;
+        bump_instance(&env);
 
-        Ok(ScheduleHistoryPage { events, total })
+        Ok(read_schedule_history_page(&env, start, limit))
     }
 
     /// Export the vesting schedule for the specified beneficiary (issue #699).
